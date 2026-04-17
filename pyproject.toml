@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ns3-free5gc-integration"
+version = "0.1.0"
+description = "Orchestration and snapshot tooling for free5GC, UERANSIM, and ns-3 NR twin runs."
+requires-python = ">=3.10"
+dependencies = [
+  "PyYAML>=6.0",
+]
+
+[tool.setuptools]
+packages = [
+  "bridge",
+  "bridge.common",
+  "bridge.orchestrator",
+  "bridge.writer",
+  "adapters",
+  "adapters.free5gc_ueransim",
+]
