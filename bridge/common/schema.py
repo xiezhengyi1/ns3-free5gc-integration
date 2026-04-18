@@ -125,6 +125,13 @@ class FlowRecord:
     throughput_dl_mbps: float
     queue_bytes: int
     rlc_buffer_bytes: int
+    name: str | None = None
+    app_name: str | None = None
+    service: dict[str, Any] = field(default_factory=dict)
+    traffic: dict[str, Any] = field(default_factory=dict)
+    sla: dict[str, Any] = field(default_factory=dict)
+    allocation: dict[str, Any] = field(default_factory=dict)
+    telemetry: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "FlowRecord":
@@ -149,6 +156,13 @@ class FlowRecord:
             ),
             queue_bytes=int(_require(payload, "queue_bytes")),
             rlc_buffer_bytes=int(_require(payload, "rlc_buffer_bytes")),
+            name=(str(payload["name"]) if payload.get("name") is not None else None),
+            app_name=(str(payload["app_name"]) if payload.get("app_name") is not None else None),
+            service=dict(payload.get("service", {})),
+            traffic=dict(payload.get("traffic", {})),
+            sla=dict(payload.get("sla", {})),
+            allocation=dict(payload.get("allocation", {})),
+            telemetry=dict(payload.get("telemetry", {})),
         )
 
     def to_dict(self) -> dict[str, Any]:

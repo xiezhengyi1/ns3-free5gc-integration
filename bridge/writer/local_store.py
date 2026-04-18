@@ -22,7 +22,10 @@ class SnapshotStore:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.state_db)
+        connection = sqlite3.connect(self.state_db, timeout=30)
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=NORMAL")
+        connection.execute("PRAGMA busy_timeout=30000")
         try:
             yield connection
             connection.commit()
@@ -145,9 +148,9 @@ class SnapshotStore:
             "latest_path": str(latest_path),
         }
 
-    def append_event(self, event: SimEvent) -> None:
+    def append_event(self, event: SimEvent) -> dict[str, object]:
         with self._connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 INSERT INTO sim_event (run_id, tick_index, event_type, entity_type, entity_id, payload_json, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -162,3 +165,11 @@ class SnapshotStore:
                     event.created_at,
                 ),
             )
+        return {
+            "event_id": cursor.lastrowid,
+            "run_id": event.run_id,
+            "tick_index": event.tick_index,
+            "event_type": event.event_type,
+            "entity_type": event.entity_type,
+            "entity_id": event.entity_id,
+        }

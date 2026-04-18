@@ -1,7 +1,7 @@
-name: baseline-single-upf
-scenario_id: baseline-single-upf
+name: baseline-multi-ue
+scenario_id: baseline-multi-ue
 tick_ms: 1000
-seed: 7
+seed: 13
 
 slices:
   - sst: 1
@@ -35,7 +35,20 @@ ues:
         apn: internet
         slice_ref: slice-1-010203
         five_qi: 9
-        app_id: baseline-flow
+        app_id: baseline-flow-1
+  - name: ue2
+    supi: imsi-208930000000002
+    gnb: gnb1
+    key: 8baf473f2f8fd09487cccbd7097c6862
+    op: 8e27b6af0e692e750f32667a3b14605d
+    op_type: OPC
+    amf: "8000"
+    sessions:
+      - type: IPv4
+        apn: internet
+        slice_ref: slice-1-010203
+        five_qi: 9
+        app_id: baseline-flow-2
 
 free5gc:
   compose_file: /home/xiezhengyi/workspace/free5gc-compose/docker-compose.yaml

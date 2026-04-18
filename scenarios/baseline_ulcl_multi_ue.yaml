@@ -1,16 +1,19 @@
-name: baseline-single-upf
-scenario_id: baseline-single-upf
+name: baseline-ulcl-multi-ue
+scenario_id: baseline-ulcl-multi-ue
 tick_ms: 1000
-seed: 7
+seed: 17
 
 slices:
   - sst: 1
     sd: "010203"
-    label: embb
+    label: ulcl-primary
 
 upfs:
-  - name: upf
-    role: upf
+  - name: i-upf
+    role: branching-upf
+    dnn: internet
+  - name: psa-upf
+    role: anchor-upf
     dnn: internet
 
 gnbs:
@@ -20,7 +23,7 @@ gnbs:
     nci: "0x000000010"
     slices:
       - slice-1-010203
-    backhaul_upf: upf
+    backhaul_upf: i-upf
 
 ues:
   - name: ue1
@@ -35,14 +38,27 @@ ues:
         apn: internet
         slice_ref: slice-1-010203
         five_qi: 9
-        app_id: baseline-flow
+        app_id: ulcl-flow-1
+  - name: ue2
+    supi: imsi-208930000000002
+    gnb: gnb1
+    key: 8baf473f2f8fd09487cccbd7097c6862
+    op: 8e27b6af0e692e750f32667a3b14605d
+    op_type: OPC
+    amf: "8000"
+    sessions:
+      - type: IPv4
+        apn: internet
+        slice_ref: slice-1-010203
+        five_qi: 9
+        app_id: ulcl-flow-2
 
 free5gc:
-  compose_file: /home/xiezhengyi/workspace/free5gc-compose/docker-compose.yaml
+  compose_file: /home/xiezhengyi/workspace/free5gc-compose/docker-compose-ulcl.yaml
   config_root: /home/xiezhengyi/workspace/free5gc-compose/config
-  mode: single_upf
+  mode: ulcl
   bridge_name: br-free5gc
-  project_name: nrint
+  project_name: nrint-ulcl-multi-ue
 
 ns3:
   ns3_root: /home/xiezhengyi/workspace/ns-allinone-3.46.1/ns-3.46.1

@@ -57,6 +57,7 @@ ns3:
 writer:
   archive_dir: archive
   state_db: state/writer.db
+  graph_db_url: "postgresql://postgres:123456@localhost:5433/multiagents_db"
 
 bridge:
   enable_inline_harness: false

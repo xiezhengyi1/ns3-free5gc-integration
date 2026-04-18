@@ -8,13 +8,31 @@ from typing import Any
 
 import yaml
 
+from bridge.common.graph_adapter import load_graph_snapshot_payload, merge_semantic_graph_payload
+from bridge.common.topology import merge_topology_graph_payload
 
-def _resolve_path(value: str | Path) -> str:
-    return str(Path(value).expanduser().resolve())
+
+def _resolve_path(value: str | Path, base_dir: Path | None = None) -> str:
+    path = Path(value).expanduser()
+    if not path.is_absolute() and base_dir is not None:
+        path = base_dir / path
+    return str(path.resolve())
 
 
 def _coerce_slice_identifier(sst: int, sd: str) -> str:
     return f"slice-{sst}-{sd.lower()}"
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    return float(value)
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    return int(value)
 
 
 @dataclass(slots=True, frozen=True)
@@ -38,6 +56,49 @@ class SessionConfig:
 
 
 @dataclass(slots=True, frozen=True)
+class SlaTargetConfig:
+    latency_ms: float | None = None
+    jitter_ms: float | None = None
+    loss_rate: float | None = None
+    bandwidth_dl_mbps: float | None = None
+    bandwidth_ul_mbps: float | None = None
+    guaranteed_bandwidth_dl_mbps: float | None = None
+    guaranteed_bandwidth_ul_mbps: float | None = None
+    priority: int | None = None
+    processing_delay_ms: float | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class AppConfig:
+    app_id: str
+    name: str
+    supi: str
+    ue_name: str | None = None
+    flow_ids: tuple[str, ...] = ()
+
+
+@dataclass(slots=True, frozen=True)
+class FlowConfig:
+    flow_id: str
+    name: str
+    supi: str
+    app_id: str
+    slice_ref: str
+    ue_name: str | None = None
+    app_name: str | None = None
+    five_qi: int = 9
+    service_type: str | None = None
+    service_type_id: int | None = None
+    packet_size_bytes: float | None = None
+    arrival_rate_pps: float | None = None
+    current_slice_snssai: str | None = None
+    allocated_bandwidth_dl_mbps: float | None = None
+    allocated_bandwidth_ul_mbps: float | None = None
+    optimize_requested: bool | None = None
+    sla_target: SlaTargetConfig = field(default_factory=SlaTargetConfig)
+
+
+@dataclass(slots=True, frozen=True)
 class UpfConfig:
     name: str
     role: str = "upf"
@@ -58,12 +119,19 @@ class GnbConfig:
 class UeConfig:
     name: str
     supi: str
-    gnb: str
+    gnb: str | None
     key: str
     op: str
     op_type: str = "OPC"
     amf: str = "8000"
+    free5gc_policy: "Free5gcUePolicyConfig" = field(default_factory=lambda: Free5gcUePolicyConfig())
     sessions: tuple[SessionConfig, ...] = ()
+
+
+@dataclass(slots=True, frozen=True)
+class Free5gcUePolicyConfig:
+    target_gnb: str | None = None
+    preferred_gnbs: tuple[str, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -89,6 +157,14 @@ class WriterConfig:
     archive_dir: str = "artifacts/archive"
     state_db: str = "artifacts/state/writer.db"
     ingestion_url: str | None = None
+    graph_db_url: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class TopologyConfig:
+    graph_file: str | None = None
+    graph_snapshot_id: str | None = None
+    graph_db_url: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -113,7 +189,10 @@ class ScenarioConfig:
     free5gc: Free5gcConfig
     ns3: Ns3Config
     writer: WriterConfig = field(default_factory=WriterConfig)
+    topology: TopologyConfig = field(default_factory=TopologyConfig)
     bridge: BridgeHarnessConfig = field(default_factory=BridgeHarnessConfig)
+    apps: tuple[AppConfig, ...] = ()
+    flows: tuple[FlowConfig, ...] = ()
 
     def slice_map(self) -> dict[str, SliceConfig]:
         return {slice_config.slice_id: slice_config for slice_config in self.slices}
@@ -121,10 +200,24 @@ class ScenarioConfig:
     def gnb_map(self) -> dict[str, GnbConfig]:
         return {gnb.name: gnb for gnb in self.gnbs}
 
+    def app_map(self) -> dict[str, AppConfig]:
+        return {app.app_id: app for app in self.apps}
+
+    def flow_map(self) -> dict[str, FlowConfig]:
+        return {flow.flow_id: flow for flow in self.flows}
+
+    def flows_for_ue(self, ue_name: str) -> tuple[FlowConfig, ...]:
+        return tuple(flow for flow in self.flows if flow.ue_name == ue_name)
+
     def ue_groups(self) -> dict[str, list[UeConfig]]:
         grouped: dict[str, list[UeConfig]] = {gnb.name: [] for gnb in self.gnbs}
         for ue in self.ues:
-            grouped.setdefault(ue.gnb, []).append(ue)
+            target_gnb = ue.gnb or ue.free5gc_policy.target_gnb
+            if target_gnb is None and ue.free5gc_policy.preferred_gnbs:
+                target_gnb = ue.free5gc_policy.preferred_gnbs[0]
+            if target_gnb is None:
+                continue
+            grouped.setdefault(target_gnb, []).append(ue)
         return grouped
 
     def validate(self) -> None:
@@ -134,9 +227,36 @@ class ScenarioConfig:
             raise ValueError("scenario must define at least one gNB")
         if not self.ues:
             raise ValueError("scenario must define at least one UE")
+        if self.topology.graph_file and self.topology.graph_snapshot_id:
+            raise ValueError("topology.graph_file and topology.graph_snapshot_id are mutually exclusive")
+        if self.topology.graph_file and not Path(self.topology.graph_file).exists():
+            raise ValueError(f"topology graph file does not exist: {self.topology.graph_file}")
+        if self.topology.graph_snapshot_id and not (self.topology.graph_db_url or self.writer.graph_db_url):
+            raise ValueError("graph snapshot input requires topology.graph_db_url or writer.graph_db_url")
+
+        ue_by_name = {ue.name: ue for ue in self.ues}
+        ue_by_supi = {ue.supi: ue for ue in self.ues}
+        app_ids = {app.app_id for app in self.apps}
         for ue in self.ues:
-            if ue.gnb not in gnbs:
-                raise ValueError(f"UE {ue.name} references unknown gNB {ue.gnb}")
+            if (
+                ue.gnb is None
+                and ue.free5gc_policy.target_gnb is None
+                and not ue.free5gc_policy.preferred_gnbs
+                and not self.topology.graph_file
+                and not self.topology.graph_snapshot_id
+            ):
+                raise ValueError(
+                    f"UE {ue.name} must define gnb, free5gc_policy target/preference, or a topology graph"
+                )
+            gnb_references = []
+            if ue.gnb is not None:
+                gnb_references.append(ue.gnb)
+            if ue.free5gc_policy.target_gnb is not None:
+                gnb_references.append(ue.free5gc_policy.target_gnb)
+            gnb_references.extend(ue.free5gc_policy.preferred_gnbs)
+            for gnb_name in gnb_references:
+                if gnb_name not in gnbs:
+                    raise ValueError(f"UE {ue.name} references unknown gNB {gnb_name}")
             if not ue.sessions:
                 raise ValueError(f"UE {ue.name} must define at least one session")
             for session in ue.sessions:
@@ -144,9 +264,50 @@ class ScenarioConfig:
                     raise ValueError(
                         f"UE {ue.name} session references unknown slice {session.slice_ref}"
                     )
+        for app in self.apps:
+            if app.supi not in ue_by_supi:
+                raise ValueError(f"app {app.app_id} references unknown SUPI {app.supi}")
+            if app.ue_name is not None and app.ue_name not in ue_by_name:
+                raise ValueError(f"app {app.app_id} references unknown UE {app.ue_name}")
+        for flow in self.flows:
+            if flow.supi not in ue_by_supi:
+                raise ValueError(f"flow {flow.flow_id} references unknown SUPI {flow.supi}")
+            if flow.ue_name is not None and flow.ue_name not in ue_by_name:
+                raise ValueError(f"flow {flow.flow_id} references unknown UE {flow.ue_name}")
+            if flow.slice_ref not in slices:
+                raise ValueError(f"flow {flow.flow_id} references unknown slice {flow.slice_ref}")
+            if app_ids and flow.app_id not in app_ids:
+                raise ValueError(f"flow {flow.flow_id} references unknown app {flow.app_id}")
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ScenarioConfig":
+    def from_dict(
+        cls,
+        payload: dict[str, Any],
+        *,
+        base_dir: Path | None = None,
+    ) -> "ScenarioConfig":
+        writer_payload = payload.get("writer", {})
+        topology_payload = dict(payload.get("topology", {}))
+        resolved_graph_file = (
+            _resolve_path(topology_payload["graph_file"], base_dir)
+            if topology_payload.get("graph_file")
+            else None
+        )
+        resolved_graph_db_url = topology_payload.get("graph_db_url") or writer_payload.get("graph_db_url")
+        resolved_graph_snapshot_id = topology_payload.get("graph_snapshot_id")
+
+        if resolved_graph_snapshot_id is not None:
+            if resolved_graph_db_url is None:
+                raise ValueError("topology.graph_snapshot_id requires topology.graph_db_url or writer.graph_db_url")
+            payload = merge_semantic_graph_payload(
+                payload,
+                load_graph_snapshot_payload(resolved_graph_db_url, str(resolved_graph_snapshot_id)),
+            )
+            topology_payload = dict(payload.get("topology", {}))
+        if resolved_graph_file is not None:
+            payload = merge_topology_graph_payload(payload, resolved_graph_file)
+            topology_payload = dict(payload.get("topology", {}))
+
         slices = tuple(
             SliceConfig(
                 sst=int(item["sst"]),
@@ -181,6 +342,7 @@ class ScenarioConfig:
 
         ues = []
         for item in payload.get("ues", []):
+            free5gc_policy_payload = item.get("free5gc_policy", {})
             sessions = tuple(
                 SessionConfig(
                     apn=session.get("apn", "internet"),
@@ -195,19 +357,90 @@ class ScenarioConfig:
                 UeConfig(
                     name=item["name"],
                     supi=item["supi"],
-                    gnb=item["gnb"],
+                    gnb=item.get("gnb"),
                     key=item["key"],
                     op=item["op"],
                     op_type=item.get("op_type", "OPC"),
                     amf=str(item.get("amf", "8000")),
+                    free5gc_policy=Free5gcUePolicyConfig(
+                        target_gnb=free5gc_policy_payload.get("target_gnb"),
+                        preferred_gnbs=tuple(free5gc_policy_payload.get("preferred_gnbs", ())),
+                    ),
                     sessions=sessions,
                 )
             )
 
         free5gc_payload = payload["free5gc"]
         ns3_payload = payload["ns3"]
-        writer_payload = payload.get("writer", {})
         bridge_payload = payload.get("bridge", {})
+        apps = tuple(
+            AppConfig(
+                app_id=item["app_id"],
+                name=item.get("name", item["app_id"]),
+                supi=item["supi"],
+                ue_name=item.get("ue_name"),
+                flow_ids=tuple(item.get("flow_ids", ())),
+            )
+            for item in payload.get("apps", [])
+        )
+        flows = tuple(
+            FlowConfig(
+                flow_id=item["flow_id"],
+                name=item.get("name", item["flow_id"]),
+                supi=item["supi"],
+                app_id=item["app_id"],
+                slice_ref=item["slice_ref"],
+                ue_name=item.get("ue_name"),
+                app_name=item.get("app_name"),
+                five_qi=int(item.get("five_qi", 9)),
+                service_type=item.get("service_type"),
+                service_type_id=_optional_int(item.get("service_type_id")),
+                packet_size_bytes=_optional_float(item.get("packet_size_bytes")),
+                arrival_rate_pps=_optional_float(item.get("arrival_rate_pps")),
+                current_slice_snssai=item.get("current_slice_snssai"),
+                allocated_bandwidth_dl_mbps=_optional_float(item.get("allocated_bandwidth_dl_mbps")),
+                allocated_bandwidth_ul_mbps=_optional_float(item.get("allocated_bandwidth_ul_mbps")),
+                optimize_requested=(
+                    bool(item["optimize_requested"])
+                    if item.get("optimize_requested") is not None
+                    else None
+                ),
+                sla_target=SlaTargetConfig(
+                    latency_ms=_optional_float(item.get("sla_target", {}).get("latency_ms"))
+                    if isinstance(item.get("sla_target"), dict)
+                    else None,
+                    jitter_ms=_optional_float(item.get("sla_target", {}).get("jitter_ms"))
+                    if isinstance(item.get("sla_target"), dict)
+                    else None,
+                    loss_rate=_optional_float(item.get("sla_target", {}).get("loss_rate"))
+                    if isinstance(item.get("sla_target"), dict)
+                    else None,
+                    bandwidth_dl_mbps=_optional_float(item.get("sla_target", {}).get("bandwidth_dl_mbps"))
+                    if isinstance(item.get("sla_target"), dict)
+                    else None,
+                    bandwidth_ul_mbps=_optional_float(item.get("sla_target", {}).get("bandwidth_ul_mbps"))
+                    if isinstance(item.get("sla_target"), dict)
+                    else None,
+                    guaranteed_bandwidth_dl_mbps=_optional_float(
+                        item.get("sla_target", {}).get("guaranteed_bandwidth_dl_mbps")
+                    )
+                    if isinstance(item.get("sla_target"), dict)
+                    else None,
+                    guaranteed_bandwidth_ul_mbps=_optional_float(
+                        item.get("sla_target", {}).get("guaranteed_bandwidth_ul_mbps")
+                    )
+                    if isinstance(item.get("sla_target"), dict)
+                    else None,
+                    priority=_optional_int(item.get("sla_target", {}).get("priority"))
+                    if isinstance(item.get("sla_target"), dict)
+                    else None,
+                    processing_delay_ms=_optional_float(item.get("sla_target", {}).get("processing_delay_ms"))
+                    if isinstance(item.get("sla_target"), dict)
+                    else None,
+                ),
+            )
+            for item in payload.get("flows", [])
+        )
 
         scenario = cls(
             name=payload["name"],
@@ -218,15 +451,17 @@ class ScenarioConfig:
             upfs=upfs,
             gnbs=tuple(gnbs),
             ues=tuple(ues),
+            apps=apps,
+            flows=flows,
             free5gc=Free5gcConfig(
-                compose_file=_resolve_path(free5gc_payload["compose_file"]),
-                config_root=_resolve_path(free5gc_payload["config_root"]),
+                compose_file=_resolve_path(free5gc_payload["compose_file"], base_dir),
+                config_root=_resolve_path(free5gc_payload["config_root"], base_dir),
                 bridge_name=free5gc_payload.get("bridge_name", "br-free5gc"),
                 mode=free5gc_payload.get("mode", "single_upf"),
                 project_name=free5gc_payload.get("project_name", "ns3int"),
             ),
             ns3=Ns3Config(
-                ns3_root=_resolve_path(ns3_payload["ns3_root"]),
+                ns3_root=_resolve_path(ns3_payload["ns3_root"], base_dir),
                 scratch_name=ns3_payload.get("scratch_name", "nr_multignb_multiupf"),
                 output_subdir=ns3_payload.get("output_subdir", "ns3"),
                 simulator=ns3_payload.get("simulator", "RealtimeSimulatorImpl"),
@@ -236,6 +471,12 @@ class ScenarioConfig:
                 archive_dir=writer_payload.get("archive_dir", "artifacts/archive"),
                 state_db=writer_payload.get("state_db", "artifacts/state/writer.db"),
                 ingestion_url=writer_payload.get("ingestion_url"),
+                graph_db_url=writer_payload.get("graph_db_url"),
+            ),
+            topology=TopologyConfig(
+                graph_file=resolved_graph_file,
+                graph_snapshot_id=(str(resolved_graph_snapshot_id) if resolved_graph_snapshot_id is not None else None),
+                graph_db_url=resolved_graph_db_url,
             ),
             bridge=BridgeHarnessConfig(
                 enable_inline_harness=bool(
@@ -252,8 +493,9 @@ class ScenarioConfig:
 
 
 def load_scenario(path: str | Path) -> ScenarioConfig:
-    with Path(path).expanduser().resolve().open("r", encoding="utf-8") as handle:
+    resolved_path = Path(path).expanduser().resolve()
+    with resolved_path.open("r", encoding="utf-8") as handle:
         payload = yaml.safe_load(handle)
     if not isinstance(payload, dict):
         raise ValueError("scenario YAML root must be a mapping")
-    return ScenarioConfig.from_dict(payload)
+    return ScenarioConfig.from_dict(payload, base_dir=resolved_path.parent)

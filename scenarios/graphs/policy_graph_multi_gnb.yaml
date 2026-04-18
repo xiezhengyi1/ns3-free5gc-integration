@@ -1,0 +1,126 @@
+nodes:
+  - id: slice-node-1
+    type: slice
+    label: embb
+    attributes:
+      sst: 1
+      sd: "010203"
+      label: embb
+
+  - id: core-node-1
+    type: core_node
+    label: upf
+    attributes:
+      name: upf
+      role: upf
+      dnn: internet
+
+  - id: ran-node-1
+    type: ran_node
+    label: gnb1
+    attributes:
+      name: gnb1
+      alias: gnb.free5gc.org
+      tac: 1
+      nci: "0x000000010"
+      position:
+        x: 0
+        y: 0
+        z: 10
+
+  - id: ran-node-2
+    type: ran_node
+    label: gnb2
+    attributes:
+      name: gnb2
+      alias: gnb2.free5gc.org
+      tac: 2
+      nci: "0x000000020"
+      position:
+        x: 200
+        y: 0
+        z: 10
+
+  - id: ue-node-1
+    type: ue
+    label: ue1
+    attributes:
+      name: ue1
+      supi: imsi-208930000000001
+      key: 8baf473f2f8fd09487cccbd7097c6862
+      op: 8e27b6af0e692e750f32667a3b14605d
+      op_type: OPC
+      amf: "8000"
+      free5gc_policy:
+        target_gnb: gnb2
+        preferred_gnbs:
+          - gnb2
+          - gnb1
+      position:
+        x: 190
+        y: 0
+        z: 1.5
+
+  - id: ue-node-2
+    type: ue
+    label: ue2
+    attributes:
+      name: ue2
+      supi: imsi-208930000000002
+      key: 8baf473f2f8fd09487cccbd7097c6862
+      op: 8e27b6af0e692e750f32667a3b14605d
+      op_type: OPC
+      amf: "8000"
+      position:
+        x: 10
+        y: 0
+        z: 1.5
+
+links:
+  - source: ran-node-1
+    target: slice-node-1
+    type: serves_slice
+    attributes: {}
+
+  - source: ran-node-2
+    target: slice-node-1
+    type: serves_slice
+    attributes: {}
+
+  - source: ue-node-1
+    target: slice-node-1
+    type: uses_slice
+    attributes:
+      apn: internet
+      type: IPv4
+      five_qi: 9
+      app_id: policy-flow-1
+
+  - source: ue-node-2
+    target: slice-node-1
+    type: uses_slice
+    attributes:
+      apn: internet
+      type: IPv4
+      five_qi: 9
+      app_id: policy-flow-2
+
+  - source: ue-node-1
+    target: ran-node-1
+    type: attached_to
+    attributes: {}
+
+  - source: ue-node-2
+    target: ran-node-1
+    type: attached_to
+    attributes: {}
+
+  - source: ran-node-1
+    target: core-node-1
+    type: tunneled_via
+    attributes: {}
+
+  - source: ran-node-2
+    target: core-node-1
+    type: tunneled_via
+    attributes: {}

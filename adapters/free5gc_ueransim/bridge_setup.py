@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from bridge.common.scenario import ScenarioConfig
+from bridge.common.topology import ResolvedScenarioTopology, resolve_scenario_topology
 
 
 @dataclass(slots=True)
@@ -37,15 +38,18 @@ def _short_ifname(prefix: str, index: int) -> str:
 def build_bridge_plan(
     scenario: ScenarioConfig,
     service_map: dict[str, dict[str, str]],
+    resolved_topology: ResolvedScenarioTopology | None = None,
 ) -> list[BridgeInterfacePlan]:
+    resolved_topology = resolved_topology or resolve_scenario_topology(scenario)
     plans: list[BridgeInterfacePlan] = []
     for index, ue in enumerate(scenario.ues, start=1):
-        gnb_service = service_map["gnb"][ue.gnb]
+        target_gnb = resolved_topology.ue_to_gnb[ue.name]
+        gnb_service = service_map["gnb"][target_gnb]
         ue_service = service_map["ue"][ue.name]
         plans.append(
             BridgeInterfacePlan(
                 link_index=index,
-                gnb_name=ue.gnb,
+                gnb_name=target_gnb,
                 gnb_service=gnb_service,
                 ue_name=ue.name,
                 ue_service=ue_service,

@@ -9,6 +9,8 @@ description = "Orchestration and snapshot tooling for free5GC, UERANSIM, and ns-
 requires-python = ">=3.10"
 dependencies = [
   "PyYAML>=6.0",
+  "SQLAlchemy>=2.0",
+  "psycopg[binary]>=3.1",
 ]
 
 [tool.setuptools]
