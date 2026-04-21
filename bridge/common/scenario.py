@@ -10,6 +10,7 @@ import yaml
 
 from bridge.common.graph_adapter import load_graph_snapshot_payload, merge_semantic_graph_payload
 from bridge.common.topology import merge_topology_graph_payload
+from bridge.common.ue_context_adapter import load_ue_context_rows, merge_ue_context_payload
 
 
 def _resolve_path(value: str | Path, base_dir: Path | None = None) -> str:
@@ -35,6 +36,10 @@ def _optional_int(value: object) -> int | None:
     return int(value)
 
 
+def _default_session_ref(ue_name: str, app_id: str, slice_ref: str, apn: str) -> str:
+    return f"{ue_name}:{app_id}:{slice_ref}:{apn}"
+
+
 @dataclass(slots=True, frozen=True)
 class SliceConfig:
     sst: int
@@ -50,6 +55,7 @@ class SliceConfig:
 class SessionConfig:
     apn: str
     slice_ref: str
+    session_ref: str
     session_type: str = "IPv4"
     five_qi: int = 9
     app_id: str = "default-app"
@@ -84,8 +90,10 @@ class FlowConfig:
     supi: str
     app_id: str
     slice_ref: str
+    session_ref: str | None = None
     ue_name: str | None = None
     app_name: str | None = None
+    dnn: str | None = None
     five_qi: int = 9
     service_type: str | None = None
     service_type_id: int | None = None
@@ -95,6 +103,12 @@ class FlowConfig:
     allocated_bandwidth_dl_mbps: float | None = None
     allocated_bandwidth_ul_mbps: float | None = None
     optimize_requested: bool | None = None
+    policy_filter: str | None = None
+    precedence: int | None = None
+    qos_ref: int | None = None
+    charging_method: str | None = None
+    quota: str | None = None
+    unit_cost: str | None = None
     sla_target: SlaTargetConfig = field(default_factory=SlaTargetConfig)
 
 
@@ -150,6 +164,9 @@ class Ns3Config:
     output_subdir: str = "ns3"
     simulator: str = "RealtimeSimulatorImpl"
     sim_time_ms: int = 30000
+    bridge_link_rate_mbps: float = 1000.0
+    bridge_link_delay_ms: float = 1.0
+    policy_reload_ms: int = 1000
 
 
 @dataclass(slots=True, frozen=True)
@@ -171,9 +188,16 @@ class TopologyConfig:
 class BridgeHarnessConfig:
     enable_inline_harness: bool = False
     gnb_prefix: str = "tap-gnb"
-    ue_prefix: str = "tap-ue"
+    upf_prefix: str = "tap-upf"
     bridge_prefix: str = "br-ran"
     host_veth_prefix: str = "veth-ran"
+
+
+@dataclass(slots=True, frozen=True)
+class PolicyConfig:
+    db_url: str | None = None
+    ue_context_table: str | None = None
+    ue_context_query: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -191,6 +215,7 @@ class ScenarioConfig:
     writer: WriterConfig = field(default_factory=WriterConfig)
     topology: TopologyConfig = field(default_factory=TopologyConfig)
     bridge: BridgeHarnessConfig = field(default_factory=BridgeHarnessConfig)
+    policy: PolicyConfig = field(default_factory=PolicyConfig)
     apps: tuple[AppConfig, ...] = ()
     flows: tuple[FlowConfig, ...] = ()
 
@@ -208,6 +233,59 @@ class ScenarioConfig:
 
     def flows_for_ue(self, ue_name: str) -> tuple[FlowConfig, ...]:
         return tuple(flow for flow in self.flows if flow.ue_name == ue_name)
+
+    def resolve_flow_session(self, ue: UeConfig, flow: FlowConfig) -> SessionConfig:
+        if flow.session_ref is not None:
+            for session in ue.sessions:
+                if session.session_ref == flow.session_ref:
+                    if session.slice_ref != flow.slice_ref:
+                        raise ValueError(
+                            f"flow {flow.flow_id} session {flow.session_ref} uses slice {session.slice_ref}, "
+                            f"not {flow.slice_ref}"
+                        )
+                    if flow.dnn is not None and session.apn != flow.dnn:
+                        raise ValueError(
+                            f"flow {flow.flow_id} session {flow.session_ref} uses DNN {session.apn}, not {flow.dnn}"
+                        )
+                    return session
+            raise ValueError(f"flow {flow.flow_id} references unknown session {flow.session_ref} for UE {ue.name}")
+
+        app_matches = [session for session in ue.sessions if session.app_id == flow.app_id]
+        if len(app_matches) == 1:
+            session = app_matches[0]
+            if session.slice_ref != flow.slice_ref:
+                raise ValueError(
+                    f"flow {flow.flow_id} app {flow.app_id} resolves to session slice {session.slice_ref}, "
+                    f"not {flow.slice_ref}"
+                )
+            if flow.dnn is not None and session.apn != flow.dnn:
+                raise ValueError(
+                    f"flow {flow.flow_id} app {flow.app_id} resolves to DNN {session.apn}, not {flow.dnn}"
+                )
+            return session
+
+        candidate_sessions = [session for session in ue.sessions if session.slice_ref == flow.slice_ref]
+        if flow.dnn is not None:
+            candidate_sessions = [session for session in candidate_sessions if session.apn == flow.dnn]
+        if len(candidate_sessions) == 1:
+            return candidate_sessions[0]
+
+        if len(ue.sessions) == 1:
+            session = ue.sessions[0]
+            if session.slice_ref != flow.slice_ref:
+                raise ValueError(
+                    f"flow {flow.flow_id} uses slice {flow.slice_ref}, but UE {ue.name} only has {session.slice_ref}"
+                )
+            if flow.dnn is not None and session.apn != flow.dnn:
+                raise ValueError(
+                    f"flow {flow.flow_id} uses DNN {flow.dnn}, but UE {ue.name} only has {session.apn}"
+                )
+            return session
+
+        raise ValueError(
+            f"flow {flow.flow_id} cannot be mapped unambiguously to a session on UE {ue.name}; "
+            f"set flow.session_ref explicitly"
+        )
 
     def ue_groups(self) -> dict[str, list[UeConfig]]:
         grouped: dict[str, list[UeConfig]] = {gnb.name: [] for gnb in self.gnbs}
@@ -233,6 +311,8 @@ class ScenarioConfig:
             raise ValueError(f"topology graph file does not exist: {self.topology.graph_file}")
         if self.topology.graph_snapshot_id and not (self.topology.graph_db_url or self.writer.graph_db_url):
             raise ValueError("graph snapshot input requires topology.graph_db_url or writer.graph_db_url")
+        if (self.policy.ue_context_table or self.policy.ue_context_query) and not self.policy.db_url:
+            raise ValueError("ue_context policy loading requires policy.db_url or writer.graph_db_url")
 
         ue_by_name = {ue.name: ue for ue in self.ues}
         ue_by_supi = {ue.supi: ue for ue in self.ues}
@@ -259,11 +339,15 @@ class ScenarioConfig:
                     raise ValueError(f"UE {ue.name} references unknown gNB {gnb_name}")
             if not ue.sessions:
                 raise ValueError(f"UE {ue.name} must define at least one session")
+            seen_session_refs: set[str] = set()
             for session in ue.sessions:
                 if session.slice_ref not in slices:
                     raise ValueError(
                         f"UE {ue.name} session references unknown slice {session.slice_ref}"
                     )
+                if session.session_ref in seen_session_refs:
+                    raise ValueError(f"UE {ue.name} defines duplicate session_ref {session.session_ref}")
+                seen_session_refs.add(session.session_ref)
         for app in self.apps:
             if app.supi not in ue_by_supi:
                 raise ValueError(f"app {app.app_id} references unknown SUPI {app.supi}")
@@ -274,10 +358,16 @@ class ScenarioConfig:
                 raise ValueError(f"flow {flow.flow_id} references unknown SUPI {flow.supi}")
             if flow.ue_name is not None and flow.ue_name not in ue_by_name:
                 raise ValueError(f"flow {flow.flow_id} references unknown UE {flow.ue_name}")
+            if flow.ue_name is not None and ue_by_name[flow.ue_name].supi != flow.supi:
+                raise ValueError(
+                    f"flow {flow.flow_id} references UE {flow.ue_name} and SUPI {flow.supi}, but they do not match"
+                )
             if flow.slice_ref not in slices:
                 raise ValueError(f"flow {flow.flow_id} references unknown slice {flow.slice_ref}")
             if app_ids and flow.app_id not in app_ids:
                 raise ValueError(f"flow {flow.flow_id} references unknown app {flow.app_id}")
+            target_ue = ue_by_name[flow.ue_name] if flow.ue_name is not None else ue_by_supi[flow.supi]
+            self.resolve_flow_session(target_ue, flow)
 
     @classmethod
     def from_dict(
@@ -288,6 +378,7 @@ class ScenarioConfig:
     ) -> "ScenarioConfig":
         writer_payload = payload.get("writer", {})
         topology_payload = dict(payload.get("topology", {}))
+        policy_payload = dict(payload.get("policy", {}))
         resolved_graph_file = (
             _resolve_path(topology_payload["graph_file"], base_dir)
             if topology_payload.get("graph_file")
@@ -295,6 +386,7 @@ class ScenarioConfig:
         )
         resolved_graph_db_url = topology_payload.get("graph_db_url") or writer_payload.get("graph_db_url")
         resolved_graph_snapshot_id = topology_payload.get("graph_snapshot_id")
+        resolved_policy_db_url = policy_payload.get("db_url") or writer_payload.get("graph_db_url")
 
         if resolved_graph_snapshot_id is not None:
             if resolved_graph_db_url is None:
@@ -307,6 +399,18 @@ class ScenarioConfig:
         if resolved_graph_file is not None:
             payload = merge_topology_graph_payload(payload, resolved_graph_file)
             topology_payload = dict(payload.get("topology", {}))
+        if policy_payload.get("ue_context_table") or policy_payload.get("ue_context_query"):
+            if resolved_policy_db_url is None:
+                raise ValueError("ue_context policy loading requires policy.db_url or writer.graph_db_url")
+            payload = merge_ue_context_payload(
+                payload,
+                load_ue_context_rows(
+                    resolved_policy_db_url,
+                    table_name=policy_payload.get("ue_context_table", "ue_context"),
+                    query=policy_payload.get("ue_context_query"),
+                ),
+            )
+            policy_payload = dict(payload.get("policy", policy_payload))
 
         slices = tuple(
             SliceConfig(
@@ -347,6 +451,15 @@ class ScenarioConfig:
                 SessionConfig(
                     apn=session.get("apn", "internet"),
                     slice_ref=session["slice_ref"],
+                    session_ref=session.get(
+                        "session_ref",
+                        _default_session_ref(
+                            item["name"],
+                            session.get("app_id", f"app-{item['name']}"),
+                            session["slice_ref"],
+                            session.get("apn", "internet"),
+                        ),
+                    ),
                     session_type=session.get("type", "IPv4"),
                     five_qi=int(session.get("five_qi", 9)),
                     app_id=session.get("app_id", f"app-{item['name']}"),
@@ -390,8 +503,10 @@ class ScenarioConfig:
                 supi=item["supi"],
                 app_id=item["app_id"],
                 slice_ref=item["slice_ref"],
+                session_ref=item.get("session_ref"),
                 ue_name=item.get("ue_name"),
                 app_name=item.get("app_name"),
+                dnn=item.get("dnn"),
                 five_qi=int(item.get("five_qi", 9)),
                 service_type=item.get("service_type"),
                 service_type_id=_optional_int(item.get("service_type_id")),
@@ -405,6 +520,12 @@ class ScenarioConfig:
                     if item.get("optimize_requested") is not None
                     else None
                 ),
+                policy_filter=item.get("policy_filter") or item.get("filter"),
+                precedence=_optional_int(item.get("precedence")),
+                qos_ref=_optional_int(item.get("qos_ref") or item.get("qosRef") or item.get("qfi")),
+                charging_method=item.get("charging_method") or item.get("chargingMethod"),
+                quota=item.get("quota"),
+                unit_cost=item.get("unit_cost") or item.get("unitCost"),
                 sla_target=SlaTargetConfig(
                     latency_ms=_optional_float(item.get("sla_target", {}).get("latency_ms"))
                     if isinstance(item.get("sla_target"), dict)
@@ -466,6 +587,9 @@ class ScenarioConfig:
                 output_subdir=ns3_payload.get("output_subdir", "ns3"),
                 simulator=ns3_payload.get("simulator", "RealtimeSimulatorImpl"),
                 sim_time_ms=int(ns3_payload.get("sim_time_ms", 30000)),
+                bridge_link_rate_mbps=float(ns3_payload.get("bridge_link_rate_mbps", 1000.0)),
+                bridge_link_delay_ms=float(ns3_payload.get("bridge_link_delay_ms", 1.0)),
+                policy_reload_ms=int(ns3_payload.get("policy_reload_ms", 1000)),
             ),
             writer=WriterConfig(
                 archive_dir=writer_payload.get("archive_dir", "artifacts/archive"),
@@ -483,9 +607,14 @@ class ScenarioConfig:
                     bridge_payload.get("enable_inline_harness", False)
                 ),
                 gnb_prefix=bridge_payload.get("gnb_prefix", "tap-gnb"),
-                ue_prefix=bridge_payload.get("ue_prefix", "tap-ue"),
+                upf_prefix=bridge_payload.get("upf_prefix", "tap-upf"),
                 bridge_prefix=bridge_payload.get("bridge_prefix", "br-ran"),
                 host_veth_prefix=bridge_payload.get("host_veth_prefix", "veth-ran"),
+            ),
+            policy=PolicyConfig(
+                db_url=resolved_policy_db_url,
+                ue_context_table=policy_payload.get("ue_context_table"),
+                ue_context_query=policy_payload.get("ue_context_query"),
             ),
         )
         scenario.validate()

@@ -48,6 +48,10 @@ def _flow_node_key(flow: FlowRecord) -> str:
     return f"flow:{flow.supi}:{flow.app_id}:{flow.flow_id}"
 
 
+def _session_node_key(supi: str, session_ref: str) -> str:
+    return f"session:{supi}:{session_ref}"
+
+
 def _average(values: list[float]) -> float | None:
     if not values:
         return None
@@ -148,6 +152,28 @@ def _flow_traffic_properties(flow: FlowRecord) -> dict[str, object]:
     return _dict_properties(flow.traffic)
 
 
+def _flow_dnn(flow: FlowRecord) -> str | None:
+    service = _flow_service_properties(flow)
+    for key in ("dnn", "apn"):
+        value = service.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _flow_session_ref(flow: FlowRecord) -> str | None:
+    if flow.session_ref:
+        return flow.session_ref
+    for container in (flow.traffic, flow.service, flow.allocation):
+        if not isinstance(container, dict):
+            continue
+        for key in ("session_ref", "sessionRef"):
+            value = container.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
 def _flow_sla_properties(flow: FlowRecord, *, include_observed_fallback: bool = True) -> dict[str, object]:
     properties = _dict_properties(flow.sla)
     if include_observed_fallback:
@@ -189,12 +215,13 @@ def _flow_telemetry_properties(flow: FlowRecord) -> dict[str, object]:
 
 
 def _flow_node_properties(flow: FlowRecord, slice_node_key: str) -> dict[str, object]:
-    return {
+    properties = {
         "id": flow.flow_id,
         "name": flow.name or flow.flow_id,
         "supi": flow.supi,
         "app_id": flow.app_id,
         "app_name": flow.app_name or flow.app_id,
+        "slice_ref": flow.slice_id,
         "service": _flow_service_properties(flow),
         "traffic": _flow_traffic_properties(flow),
         "sla": _flow_sla_properties(flow, include_observed_fallback=False),
@@ -204,6 +231,13 @@ def _flow_node_properties(flow: FlowRecord, slice_node_key: str) -> dict[str, ob
             include_observed_fallback=False,
         ),
     }
+    session_ref = _flow_session_ref(flow)
+    if session_ref is not None:
+        properties["session_ref"] = session_ref
+    dnn = _flow_dnn(flow)
+    if dnn is not None:
+        properties["dnn"] = dnn
+    return properties
 
 
 def _summary_flow_properties(flow: FlowRecord, slice_node_key: str) -> dict[str, object]:
@@ -518,12 +552,16 @@ def build_graph_snapshot_bundle(
         core_node_keys[name] = node_key
 
     flows_by_app: dict[tuple[str, str], list[FlowRecord]] = defaultdict(list)
+    flows_by_session: dict[tuple[str, str], list[FlowRecord]] = defaultdict(list)
     flows_by_slice: dict[str, list[FlowRecord]] = defaultdict(list)
     hosted_slices_by_ran: dict[str, set[str]] = defaultdict(set)
     hosted_slices_by_core: dict[str, set[str]] = defaultdict(set)
 
     for flow in snapshot.flows:
         flows_by_app[(flow.supi, flow.app_id)].append(flow)
+        session_ref = _flow_session_ref(flow)
+        if session_ref is not None:
+            flows_by_session[(flow.supi, session_ref)].append(flow)
         flows_by_slice[flow.slice_id].append(flow)
         slice_node_key = slice_node_keys.get(flow.slice_id)
         if slice_node_key is None:
@@ -616,6 +654,40 @@ def build_graph_snapshot_bundle(
             }
             add_node(node_key, "core_node", flow.dst_upf, properties)
             add_summary_node(node_key, "core_node", flow.dst_upf, {**properties, "telemetry": {}})
+
+    for (supi, session_ref), session_flows in sorted(flows_by_session.items()):
+        session_node_key = _session_node_key(supi, session_ref)
+        primary_flow = sorted(session_flows, key=lambda item: item.flow_id)[0]
+        slice_node_key = slice_node_keys.get(primary_flow.slice_id)
+        session_properties: dict[str, object] = {
+            "id": session_ref,
+            "session_ref": session_ref,
+            "supi": supi,
+            "slice_ref": primary_flow.slice_id,
+            "flow_ids": [flow.flow_id for flow in sorted(session_flows, key=lambda item: item.flow_id)],
+            "app_ids": sorted({flow.app_id for flow in session_flows}),
+            "five_qi": primary_flow.five_qi,
+        }
+        if len(session_properties["app_ids"]) == 1:
+            session_properties["app_id"] = session_properties["app_ids"][0]
+        dnn = _flow_dnn(primary_flow)
+        if dnn is not None:
+            session_properties["dnn"] = dnn
+        if slice_node_key is not None:
+            session_properties["snssai"] = slice_node_key.split(":", 1)[1]
+
+        add_node(session_node_key, "session", session_ref, session_properties)
+        add_summary_node(session_node_key, "session", session_ref, dict(session_properties))
+        add_edge("uses_session", _ue_node_key(supi), session_node_key, {"supi": supi})
+        if slice_node_key is not None:
+            add_edge("uses_slice", session_node_key, slice_node_key, {"slice": slice_node_key.split(":", 1)[1]})
+        for flow in sorted(session_flows, key=lambda item: item.flow_id):
+            add_edge(
+                "runs_on_session",
+                _flow_node_key(flow),
+                session_node_key,
+                {"session_ref": session_ref},
+            )
 
     app_keys: set[str] = set()
     for (supi, app_id), flows in sorted(flows_by_app.items()):

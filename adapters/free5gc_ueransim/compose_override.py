@@ -152,9 +152,19 @@ def render_compose_for_run(
         _replace_volume_source(amf_service, "/free5gc/config/amfcfg.yaml", generated_config_dir / "amfcfg.yaml")
         _ensure_network_entry(amf_service, "privnet")["ipv4_address"] = AMF_CONTROL_IP
 
+    if "free5gc-nssf" in services:
+        nssf_service = services["free5gc-nssf"]
+        _replace_volume_source(nssf_service, "/free5gc/config/nssfcfg.yaml", generated_config_dir / "nssfcfg.yaml")
+
     if "free5gc-smf" in services:
         smf_service = services["free5gc-smf"]
         _replace_volume_source(smf_service, "/free5gc/config/smfcfg.yaml", generated_config_dir / "smfcfg.yaml")
+        if scenario.free5gc.mode == "ulcl":
+            _replace_volume_source(
+                smf_service,
+                "/free5gc/config/uerouting.yaml",
+                generated_config_dir / "uerouting.yaml",
+            )
         _ensure_network_entry(smf_service, "privnet")["ipv4_address"] = SMF_CONTROL_IP
 
     if scenario.free5gc.mode == "single_upf" and "free5gc-upf" in services:
@@ -177,7 +187,15 @@ def render_compose_for_run(
     gnb_template = deepcopy(services["ueransim"])
     gnb_template["volumes"] = []
 
-    service_map = {"gnb": {}, "ue": {}}
+    service_map = {"gnb": {}, "ue": {}, "upf": {}}
+
+    if scenario.free5gc.mode == "single_upf" and scenario.upfs and "free5gc-upf" in services:
+        service_map["upf"][scenario.upfs[0].name] = "free5gc-upf"
+    elif scenario.free5gc.mode == "ulcl":
+        for upf in scenario.upfs:
+            service_name = _upf_service_name(upf.name)
+            if service_name in services:
+                service_map["upf"][upf.name] = service_name
 
     for index, gnb in enumerate(scenario.gnbs, start=1):
         service_name = _gnb_service_name(index, gnb.name)
@@ -211,16 +229,23 @@ def render_compose_for_run(
         gnb_depends_on = list(gnb_depends_on)
     gnb_depends_on = [item for item in gnb_depends_on if item in known_services]
 
+    ue_start_offsets: dict[str, int] = {}
+
     for index, ue in enumerate(scenario.ues, start=1):
         service_name = _ue_service_name(ue.name)
         target_gnb = resolved_topology.ue_to_gnb[ue.name]
+        start_offset = ue_start_offsets.get(target_gnb, 0)
+        ue_start_offsets[target_gnb] = start_offset + 1
         aliases = [f"{safe_name(ue.name)}.ue.free5gc.org"]
         if index == 1:
             aliases.append("ue.free5gc.org")
+        command = "./nr-ue -c ./config/uecfg.yaml"
+        if start_offset > 0:
+            command = f"sh -c 'sleep {start_offset} && ./nr-ue -c ./config/uecfg.yaml'"
         service = {
             "container_name": service_name,
             "image": gnb_template["image"],
-            "command": "./nr-ue -c ./config/uecfg.yaml",
+            "command": command,
             "restart": "unless-stopped",
             "volumes": [
                 f"{generated_config_dir / f'{ue.name}-uecfg.yaml'}:/ueransim/config/uecfg.yaml"

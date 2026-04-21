@@ -26,7 +26,7 @@ _PDU_SESSION_TYPE_MAP = {
     "unstructured": "UNSTRUCTURED",
     "ethernet": "ETHERNET",
 }
-_LOCAL_ONLY_PAYLOAD_KEYS = {"LocalPolicyData", "FlowRules", "QosFlows", "ChargingDatas"}
+_LOCAL_ONLY_PAYLOAD_KEYS = {"LocalPolicyData"}
 
 
 @dataclass(slots=True)
@@ -172,60 +172,101 @@ def _sla_target_payload(flow: FlowConfig) -> dict[str, object]:
     }
 
 
-def _build_flow_rule_payload(scenario: ScenarioConfig, flow: FlowConfig) -> dict[str, object]:
-    return {
-        "flowId": flow.flow_id,
-        "appId": flow.app_id,
-        "flowName": flow.name,
-        "snssai": _slice_snssai_payload(scenario, flow.slice_ref),
-        "service": {
-            key: value
-            for key, value in {
-                "serviceType": flow.service_type,
-                "serviceTypeId": flow.service_type_id,
-            }.items()
-            if value is not None
-        },
-        "traffic": {
-            key: value
-            for key, value in {
-                "packetSizeBytes": flow.packet_size_bytes,
-                "arrivalRatePps": flow.arrival_rate_pps,
-            }.items()
-            if value is not None
-        },
-        "allocation": {
-            key: value
-            for key, value in {
-                "currentSliceSnssai": flow.current_slice_snssai,
-                "allocatedBandwidthDlMbps": flow.allocated_bandwidth_dl_mbps,
-                "allocatedBandwidthUlMbps": flow.allocated_bandwidth_ul_mbps,
-                "optimizeRequested": flow.optimize_requested,
-            }.items()
-            if value is not None
-        },
-    }
+def _slice_snssai_string(scenario: ScenarioConfig, slice_ref: str) -> str:
+    slice_config = scenario.slice_map()[slice_ref]
+    return f"{slice_config.sst:02d}{slice_config.sd.lower()}"
 
 
-def _build_qos_flow_payload(flow: FlowConfig) -> dict[str, object]:
+def _resolve_flow_session(scenario: ScenarioConfig, ue: UeConfig, flow: FlowConfig) -> SessionConfig:
+    return scenario.resolve_flow_session(ue, flow)
+
+
+def _format_bandwidth_string(value_mbps: float | None) -> str | None:
+    if value_mbps is None or value_mbps <= 0:
+        return None
+    return f"{value_mbps:g} Mbps"
+
+
+def _flow_qos_ref(flow: FlowConfig, fallback_index: int) -> int:
+    if flow.qos_ref is not None:
+        return flow.qos_ref
+    return fallback_index
+
+
+def _flow_precedence(flow: FlowConfig, fallback_index: int) -> int:
+    if flow.precedence is not None:
+        return flow.precedence
+    return fallback_index
+
+
+def _build_flow_rule_payload(
+    scenario: ScenarioConfig,
+    ue: UeConfig,
+    flow: FlowConfig,
+    qos_ref: int,
+    precedence: int,
+) -> dict[str, object]:
+    session = _resolve_flow_session(scenario, ue, flow)
     payload = {
         "flowId": flow.flow_id,
         "appId": flow.app_id,
-        "5qi": flow.five_qi,
-        "slaTarget": _sla_target_payload(flow),
+        "snssai": _slice_snssai_string(scenario, flow.slice_ref),
+        "dnn": flow.dnn or session.apn,
+        "qosRef": qos_ref,
+        "precedence": precedence,
     }
-    if flow.sla_target.priority is not None:
-        payload["arp"] = {"priorityLevel": flow.sla_target.priority}
+    if flow.policy_filter:
+        payload["filter"] = flow.policy_filter
     return payload
 
 
-def _build_charging_payload(flow: FlowConfig) -> dict[str, object]:
-    return {
-        "chargingId": flow.flow_id,
+def _build_qos_flow_payload(
+    scenario: ScenarioConfig,
+    ue: UeConfig,
+    flow: FlowConfig,
+    qos_ref: int,
+) -> dict[str, object]:
+    session = _resolve_flow_session(scenario, ue, flow)
+    payload = {
+        "flowId": flow.flow_id,
         "appId": flow.app_id,
-        "ratingGroup": flow.app_id,
-        "sliceRef": flow.slice_ref,
+        "snssai": _slice_snssai_string(scenario, flow.slice_ref),
+        "dnn": flow.dnn or session.apn,
+        "qosRef": qos_ref,
+        "5qi": flow.five_qi,
+        "mbrUL": _format_bandwidth_string(flow.sla_target.bandwidth_ul_mbps),
+        "mbrDL": _format_bandwidth_string(flow.sla_target.bandwidth_dl_mbps),
+        "gbrUL": _format_bandwidth_string(flow.sla_target.guaranteed_bandwidth_ul_mbps),
+        "gbrDL": _format_bandwidth_string(flow.sla_target.guaranteed_bandwidth_dl_mbps),
     }
+    return {key: value for key, value in payload.items() if value is not None}
+
+
+def _build_charging_payload(
+    scenario: ScenarioConfig,
+    ue: UeConfig,
+    flow: FlowConfig,
+    qos_ref: int,
+) -> dict[str, object]:
+    if all(
+        value is None
+        for value in (flow.charging_method, flow.quota, flow.unit_cost)
+    ):
+        return {}
+
+    session = _resolve_flow_session(scenario, ue, flow)
+    payload = {
+        "flowId": flow.flow_id,
+        "appId": flow.app_id,
+        "snssai": _slice_snssai_string(scenario, flow.slice_ref),
+        "dnn": flow.dnn or session.apn,
+        "qosRef": qos_ref,
+        "filter": flow.policy_filter,
+        "chargingMethod": flow.charging_method,
+        "quota": flow.quota,
+        "unitCost": flow.unit_cost,
+    }
+    return {key: value for key, value in payload.items() if value is not None}
 
 
 def build_subscriber_payload(
@@ -286,6 +327,16 @@ def build_subscriber_payload(
             },
         }
 
+    flow_rules = []
+    qos_flows = []
+    charging_datas = []
+    for index, flow in enumerate(ue_flows, start=1):
+        qos_ref = _flow_qos_ref(flow, index)
+        precedence = _flow_precedence(flow, index)
+        flow_rules.append(_build_flow_rule_payload(scenario, ue, flow, qos_ref, precedence))
+        qos_flows.append(_build_qos_flow_payload(scenario, ue, flow, qos_ref))
+        charging_datas.append(_build_charging_payload(scenario, ue, flow, qos_ref))
+
     payload = {
         "plmnID": serving_plmn_id,
         "ueId": ue.supi,
@@ -311,9 +362,9 @@ def build_subscriber_payload(
         "SmPolicyData": {
             "smPolicySnssaiData": sm_policy,
         },
-        "FlowRules": [_build_flow_rule_payload(scenario, flow) for flow in ue_flows],
-        "QosFlows": [_build_qos_flow_payload(flow) for flow in ue_flows],
-        "ChargingDatas": [_build_charging_payload(flow) for flow in ue_flows],
+        "FlowRules": flow_rules,
+        "QosFlows": qos_flows,
+        "ChargingDatas": [item for item in charging_datas if item],
     }
     local_policy_data: dict[str, object] = {}
     if ue.free5gc_policy.target_gnb is not None or ue.free5gc_policy.preferred_gnbs:
@@ -338,6 +389,7 @@ def build_subscriber_payload(
                 "appId": flow.app_id,
                 "appName": flow.app_name,
                 "sliceRef": flow.slice_ref,
+                "sessionRef": _resolve_flow_session(scenario, ue, flow).session_ref,
                 "5qi": flow.five_qi,
                 "serviceType": flow.service_type,
                 "packetSizeBytes": flow.packet_size_bytes,

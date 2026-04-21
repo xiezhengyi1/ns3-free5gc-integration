@@ -12,8 +12,11 @@ UE_NUM=""
 UE_NUM_PER_GNB="1"
 TICK_MS="1000"
 SIM_TIME_MS="30000"
+SIMULATOR="RealtimeSimulatorImpl"
 OUTPUT_FILE=""
+CLOCK_FILE=""
 FLOW_PROFILE_FILE=""
+POLICY_RELOAD_MS="1000"
 UPF_NAMES="upf"
 SLICE_SDS="010203"
 UE_SUPIS=""
@@ -21,6 +24,10 @@ UE_GNB_MAP=""
 GNB_UPF_MAP=""
 GNB_POSITIONS=""
 UE_POSITIONS=""
+BRIDGE_GNB_TAPS=""
+BRIDGE_UPF_TAPS=""
+BRIDGE_LINK_RATE_MBPS="1000"
+BRIDGE_LINK_DELAY_MS="1"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -52,12 +59,24 @@ while [[ $# -gt 0 ]]; do
       SIM_TIME_MS="$2"
       shift 2
       ;;
+    --simulator)
+      SIMULATOR="$2"
+      shift 2
+      ;;
     --output-file)
       OUTPUT_FILE="$2"
       shift 2
       ;;
+    --clock-file)
+      CLOCK_FILE="$2"
+      shift 2
+      ;;
     --flow-profile-file)
       FLOW_PROFILE_FILE="$2"
+      shift 2
+      ;;
+    --policy-reload-ms)
+      POLICY_RELOAD_MS="$2"
       shift 2
       ;;
     --upf-names)
@@ -88,6 +107,22 @@ while [[ $# -gt 0 ]]; do
       UE_POSITIONS="$2"
       shift 2
       ;;
+    --bridge-gnb-taps)
+      BRIDGE_GNB_TAPS="$2"
+      shift 2
+      ;;
+    --bridge-upf-taps)
+      BRIDGE_UPF_TAPS="$2"
+      shift 2
+      ;;
+    --bridge-link-rate-mbps)
+      BRIDGE_LINK_RATE_MBPS="$2"
+      shift 2
+      ;;
+    --bridge-link-delay-ms)
+      BRIDGE_LINK_DELAY_MS="$2"
+      shift 2
+      ;;
     *)
       echo "Unknown argument: $1" >&2
       exit 1
@@ -108,10 +143,20 @@ if [[ -n "$FLOW_PROFILE_FILE" && "$FLOW_PROFILE_FILE" != /* ]]; then
   FLOW_PROFILE_FILE="$PROJECT_ROOT/$FLOW_PROFILE_FILE"
 fi
 
+if [[ -n "$CLOCK_FILE" && "$CLOCK_FILE" != /* ]]; then
+  CLOCK_FILE="$PROJECT_ROOT/$CLOCK_FILE"
+fi
+
 mkdir -p "$(dirname "$OUTPUT_FILE")"
+if [[ -n "$CLOCK_FILE" ]]; then
+  mkdir -p "$(dirname "$CLOCK_FILE")"
+fi
 cp "$PROJECT_ROOT/sim/ns3/nr_multignb_multiupf.cc" "$NS3_ROOT/scratch/nr_multignb_multiupf.cc"
 
-NS3_ARGS="--runId=$RUN_ID --scenarioId=$SCENARIO_ID --gNbNum=$GNB_NUM --ueNumPerGnb=$UE_NUM_PER_GNB --tickMs=$TICK_MS --simTimeMs=$SIM_TIME_MS --outputFile=$OUTPUT_FILE --upfNames=$UPF_NAMES --sliceSds=$SLICE_SDS"
+NS3_ARGS="--runId=$RUN_ID --scenarioId=$SCENARIO_ID --gNbNum=$GNB_NUM --ueNumPerGnb=$UE_NUM_PER_GNB --tickMs=$TICK_MS --simTimeMs=$SIM_TIME_MS --simulator=$SIMULATOR --outputFile=$OUTPUT_FILE --upfNames=$UPF_NAMES --sliceSds=$SLICE_SDS --policyReloadMs=$POLICY_RELOAD_MS --bridgeLinkRateMbps=$BRIDGE_LINK_RATE_MBPS --bridgeLinkDelayMs=$BRIDGE_LINK_DELAY_MS"
+if [[ -n "$CLOCK_FILE" ]]; then
+  NS3_ARGS="$NS3_ARGS --clockFile=$CLOCK_FILE"
+fi
 if [[ -n "$FLOW_PROFILE_FILE" ]]; then
   NS3_ARGS="$NS3_ARGS --flowProfileFile=$FLOW_PROFILE_FILE"
 fi
@@ -132,6 +177,12 @@ if [[ -n "$GNB_POSITIONS" ]]; then
 fi
 if [[ -n "$UE_POSITIONS" ]]; then
   NS3_ARGS="$NS3_ARGS --uePositions=$UE_POSITIONS"
+fi
+if [[ -n "$BRIDGE_GNB_TAPS" ]]; then
+  NS3_ARGS="$NS3_ARGS --bridgeGnbTaps=$BRIDGE_GNB_TAPS"
+fi
+if [[ -n "$BRIDGE_UPF_TAPS" ]]; then
+  NS3_ARGS="$NS3_ARGS --bridgeUpfTaps=$BRIDGE_UPF_TAPS"
 fi
 
 cd "$NS3_ROOT"

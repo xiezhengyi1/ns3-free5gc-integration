@@ -20,6 +20,30 @@ from bridge.writer.local_store import SnapshotStore
 from bridge.writer.postgres_graph_store import PostgresGraphStore
 
 
+class Ns3ClockReference:
+    def __init__(self, path: str) -> None:
+        self.path = Path(path).expanduser().resolve()
+        self._mtime_ns: int | None = None
+        self._tick_index = 0
+
+    def current_tick(self) -> int:
+        try:
+            stat = self.path.stat()
+        except FileNotFoundError:
+            return self._tick_index
+        if self._mtime_ns == stat.st_mtime_ns:
+            return self._tick_index
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return self._tick_index
+        tick_index = payload.get("tick_index")
+        if tick_index is not None:
+            self._tick_index = int(tick_index)
+            self._mtime_ns = stat.st_mtime_ns
+        return self._tick_index
+
+
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--state-db", required=True, help="sqlite path for local state")
     parser.add_argument("--archive-dir", required=True, help="directory for archived ticks")
@@ -98,6 +122,7 @@ def _follow_compose_logs(args: argparse.Namespace) -> int:
     parser = (
         parse_free5gc_compose_line if args.parser == "free5gc" else parse_ueransim_compose_line
     )
+    clock_reference = Ns3ClockReference(args.clock_file) if args.clock_file else None
     clock = ObservationClock(args.tick_ms)
     command = ["docker", "compose"]
     if args.project_name:
@@ -131,7 +156,7 @@ def _follow_compose_logs(args: argparse.Namespace) -> int:
                 line,
                 run_id=args.run_id,
                 scenario_id=args.scenario_id,
-                tick_index=clock.current_tick(),
+                tick_index=(clock_reference.current_tick() if clock_reference else clock.current_tick()),
             )
             for event in events:
                 result = store.append_event(event)
@@ -158,6 +183,24 @@ def _ingest_stdin(args: argparse.Namespace) -> int:
     return 0
 
 
+def _next_complete_jsonl_line(
+    handle: object,
+    pending: str,
+    *,
+    flush_pending: bool,
+) -> tuple[str, str | None]:
+    chunk = handle.readline()
+    if not chunk:
+        if flush_pending and pending:
+            return "", pending
+        return pending, None
+
+    pending += chunk
+    if not pending.endswith("\n"):
+        return pending, None
+    return "", pending
+
+
 def _follow_jsonl(args: argparse.Namespace) -> int:
     store, client, graph_store = _build_writer(args)
     path = Path(args.path).expanduser().resolve()
@@ -167,9 +210,14 @@ def _follow_jsonl(args: argparse.Namespace) -> int:
     with path.open("r", encoding="utf-8") as handle:
         if args.from_end:
             handle.seek(0, 2)
+        pending = ""
         while True:
-            line = handle.readline()
-            if line:
+            pending, line = _next_complete_jsonl_line(
+                handle,
+                pending,
+                flush_pending=bool(args.stop_at_eof),
+            )
+            if line is not None:
                 _ingest_line(line, store, client, graph_store, args)
                 continue
             if args.stop_at_eof:
@@ -214,6 +262,7 @@ def build_parser() -> argparse.ArgumentParser:
     follow_logs.add_argument("--run-id", required=True, help="run identifier")
     follow_logs.add_argument("--scenario-id", required=True, help="scenario identifier")
     follow_logs.add_argument("--tick-ms", type=int, default=1000, help="event tick window in milliseconds")
+    follow_logs.add_argument("--clock-file", help="optional ns-3 clock file used as the authoritative tick source")
     follow_logs.add_argument(
         "--tail",
         default="all",

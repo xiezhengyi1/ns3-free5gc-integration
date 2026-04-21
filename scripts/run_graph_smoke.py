@@ -63,6 +63,16 @@ def _start_background_command(
     return process, log_handle
 
 
+def _background_log_key(command_name: str) -> str:
+    if command_name == "writer-follow-free5gc":
+        return "free5gc"
+    if command_name == "writer-follow-ueransim":
+        return "ueransim"
+    if command_name == "writer-follow-ns3":
+        return "ns3"
+    return command_name.replace("-", "_")
+
+
 def _extract_option(argv: list[str], option: str) -> str | None:
     if option not in argv:
         return None
@@ -182,6 +192,15 @@ def _summarize_ns3_snapshot(
             and actual_gnb_upf_map == expected_gnb_upf_map
         ),
     }
+
+
+def _expected_physical_upf_count(manifest: dict[str, object]) -> int:
+    core_services = manifest.get("core_services", [])
+    return sum(
+        1
+        for service_name in core_services
+        if isinstance(service_name, str) and "upf" in service_name.lower()
+    )
 
 
 def _query_graph_counts(graph_db_url: str, run_id: str) -> dict[str, object]:
@@ -372,6 +391,8 @@ def main(argv: list[str] | None = None) -> int:
 
     background_processes: list[tuple[subprocess.Popen[str], Any]] = []
     should_teardown = not args.no_teardown
+    graph_db_url: str | None = None
+    log_paths: dict[str, Path] = {}
 
     try:
         compose_down = _command_by_name(manifest, "compose-down")
@@ -386,34 +407,25 @@ def main(argv: list[str] | None = None) -> int:
             snapshot_file.unlink()
         snapshot_file.parent.mkdir(parents=True, exist_ok=True)
 
-        _run_command(_command_by_name(manifest, "compose-up-core"))
-
-        free5gc_process, free5gc_log = _start_background_command(
-            _command_by_name(manifest, "writer-follow-free5gc"),
-            log_path=logs_dir / "writer-free5gc.log",
-        )
-        background_processes.append((free5gc_process, free5gc_log))
-
-        _run_command(_command_by_name(manifest, "bootstrap-subscribers"))
-        _run_command(_command_by_name(manifest, "compose-up-ran"))
-
-        ueransim_process, ueransim_log = _start_background_command(
-            _command_by_name(manifest, "writer-follow-ueransim"),
-            log_path=logs_dir / "writer-ueransim.log",
-        )
-        background_processes.append((ueransim_process, ueransim_log))
-
-        ns3_command = _command_by_name(manifest, "writer-follow-ns3")
-        graph_db_url = _extract_option(ns3_command["argv"], "--graph-db-url")
-        ns3_process, ns3_log = _start_background_command(
-            ns3_command,
-            log_path=logs_dir / "writer-ns3.log",
-            ensure_graph_schema=True,
-        )
-        background_processes.append((ns3_process, ns3_log))
-
-        _run_command(_command_by_name(manifest, "ns3-build"))
-        _run_command(_command_by_name(manifest, "ns3-run"))
+        for command in manifest["commands"]:
+            command_name = str(command["name"])
+            if command_name == "compose-down":
+                continue
+            if command.get("background"):
+                log_key = _background_log_key(command_name)
+                log_path = logs_dir / f"writer-{log_key}.log"
+                ensure_graph_schema = command_name == "writer-follow-ns3"
+                process, log_handle = _start_background_command(
+                    command,
+                    log_path=log_path,
+                    ensure_graph_schema=ensure_graph_schema,
+                )
+                background_processes.append((process, log_handle))
+                log_paths[log_key] = log_path
+                if command_name == "writer-follow-ns3":
+                    graph_db_url = _extract_option(list(command["argv"]), "--graph-db-url")
+                continue
+            _run_command(command)
 
         summary = _wait_for_ingestion(
             state_db=state_db,
@@ -427,7 +439,7 @@ def main(argv: list[str] | None = None) -> int:
             summary,
             expected_ues=len(scenario.ues),
             expected_gnbs=len(scenario.gnbs),
-            expected_upfs=len(scenario.upfs),
+            expected_upfs=_expected_physical_upf_count(manifest),
             expected_gnb_services=set(manifest["service_map"]["gnb"].values()),
         )
 
@@ -438,16 +450,16 @@ def main(argv: list[str] | None = None) -> int:
             "compose_project_name": manifest["compose_project_name"],
             "expected_ues": len(scenario.ues),
             "expected_gnbs": len(scenario.gnbs),
-            "expected_upfs": len(scenario.upfs),
+            "expected_logical_upfs": len(scenario.upfs),
+            "expected_physical_upfs": _expected_physical_upf_count(manifest),
             "resolved_topology": resolved_topology.to_dict(),
             "ran_services": manifest["ran_services"],
             "snapshot_file": str(snapshot_file),
             "state_db": str(state_db),
             "archive_dir": str(archive_dir),
             "logs": {
-                "free5gc": str(logs_dir / "writer-free5gc.log"),
-                "ueransim": str(logs_dir / "writer-ueransim.log"),
-                "ns3": str(logs_dir / "writer-ns3.log"),
+                key: str(path)
+                for key, path in sorted(log_paths.items())
             },
             **summary,
         }

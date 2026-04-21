@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from adapters.free5gc_ueransim.compose_override import UPF_CONTROL_IP, gnb_service_ip, upf_service_ip
 from bridge.common.scenario import ScenarioConfig
 from bridge.common.topology import ResolvedScenarioTopology, resolve_scenario_topology
 
@@ -14,18 +15,20 @@ class BridgeInterfacePlan:
     link_index: int
     gnb_name: str
     gnb_service: str
-    ue_name: str
-    ue_service: str
+    upf_name: str
+    upf_service: str
     gnb_tap: str
-    ue_tap: str
+    upf_tap: str
     gnb_bridge: str
-    ue_bridge: str
+    upf_bridge: str
     gnb_host_veth: str
-    ue_host_veth: str
+    upf_host_veth: str
     gnb_ns_if: str
-    ue_ns_if: str
+    upf_ns_if: str
     gnb_ip: str
-    ue_ip: str
+    upf_ip: str
+    gnb_route_target: str
+    upf_route_target: str
 
     def to_dict(self) -> dict[str, str | int]:
         return asdict(self)
@@ -39,30 +42,40 @@ def build_bridge_plan(
     scenario: ScenarioConfig,
     service_map: dict[str, dict[str, str]],
     resolved_topology: ResolvedScenarioTopology | None = None,
+    inspect_targets: dict[str, str] | None = None,
 ) -> list[BridgeInterfacePlan]:
     resolved_topology = resolved_topology or resolve_scenario_topology(scenario)
     plans: list[BridgeInterfacePlan] = []
-    for index, ue in enumerate(scenario.ues, start=1):
-        target_gnb = resolved_topology.ue_to_gnb[ue.name]
-        gnb_service = service_map["gnb"][target_gnb]
-        ue_service = service_map["ue"][ue.name]
+    inspect_targets = inspect_targets or {}
+    upf_index_by_name = {upf.name: index for index, upf in enumerate(scenario.upfs, start=1)}
+    for index, gnb in enumerate(scenario.gnbs, start=1):
+        target_upf = resolved_topology.gnb_to_upf[gnb.name]
+        gnb_service_name = service_map["gnb"][gnb.name]
+        upf_service_name = service_map["upf"][target_upf]
+        gnb_service = inspect_targets.get(gnb_service_name, gnb_service_name)
+        upf_service = inspect_targets.get(upf_service_name, upf_service_name)
+        route_target = UPF_CONTROL_IP
+        if scenario.free5gc.mode == "ulcl":
+            route_target = upf_service_ip(upf_index_by_name[target_upf])
         plans.append(
             BridgeInterfacePlan(
                 link_index=index,
-                gnb_name=target_gnb,
+                gnb_name=gnb.name,
                 gnb_service=gnb_service,
-                ue_name=ue.name,
-                ue_service=ue_service,
+                upf_name=target_upf,
+                upf_service=upf_service,
                 gnb_tap=_short_ifname("tgnb", index),
-                ue_tap=_short_ifname("tue", index),
+                upf_tap=_short_ifname("tupf", index),
                 gnb_bridge=_short_ifname("brg", index),
-                ue_bridge=_short_ifname("bru", index),
+                upf_bridge=_short_ifname("bru", index),
                 gnb_host_veth=_short_ifname("vgh", index),
-                ue_host_veth=_short_ifname("vuh", index),
+                upf_host_veth=_short_ifname("vuh", index),
                 gnb_ns_if=_short_ifname("esg", index),
-                ue_ns_if=_short_ifname("esu", index),
+                upf_ns_if=_short_ifname("esu", index),
                 gnb_ip=f"10.210.{index}.1",
-                ue_ip=f"10.210.{index}.2",
+                upf_ip=f"10.210.{index}.2",
+                gnb_route_target=gnb_service_ip(index),
+                upf_route_target=route_target,
             )
         )
     return plans
@@ -74,11 +87,11 @@ def render_bridge_script(plans: list[BridgeInterfacePlan], output_path: Path) ->
         cleanup_names.extend(
             [
                 plan.gnb_host_veth,
-                plan.ue_host_veth,
+                plan.upf_host_veth,
                 plan.gnb_bridge,
-                plan.ue_bridge,
+                plan.upf_bridge,
                 plan.gnb_tap,
-                plan.ue_tap,
+                plan.upf_tap,
             ]
         )
 
@@ -103,17 +116,17 @@ def render_bridge_script(plans: list[BridgeInterfacePlan], output_path: Path) ->
         lines.extend(
             [
                 f"gnb_pid_{plan.link_index}=$(docker inspect --format '{{{{ .State.Pid }}}}' {plan.gnb_service})",
-                f"ue_pid_{plan.link_index}=$(docker inspect --format '{{{{ .State.Pid }}}}' {plan.ue_service})",
+                f"upf_pid_{plan.link_index}=$(docker inspect --format '{{{{ .State.Pid }}}}' {plan.upf_service})",
                 f"ip tuntap add mode tap {plan.gnb_tap}",
-                f"ip tuntap add mode tap {plan.ue_tap}",
+                f"ip tuntap add mode tap {plan.upf_tap}",
                 f"ip link add name {plan.gnb_bridge} type bridge",
-                f"ip link add name {plan.ue_bridge} type bridge",
+                f"ip link add name {plan.upf_bridge} type bridge",
                 f"ip link set {plan.gnb_tap} master {plan.gnb_bridge}",
-                f"ip link set {plan.ue_tap} master {plan.ue_bridge}",
+                f"ip link set {plan.upf_tap} master {plan.upf_bridge}",
                 f"ip link set {plan.gnb_tap} up promisc on",
-                f"ip link set {plan.ue_tap} up promisc on",
+                f"ip link set {plan.upf_tap} up promisc on",
                 f"ip link set {plan.gnb_bridge} up",
-                f"ip link set {plan.ue_bridge} up",
+                f"ip link set {plan.upf_bridge} up",
                 f"ip link add {plan.gnb_host_veth} type veth peer name tmpg{plan.link_index}",
                 f"ip link set {plan.gnb_host_veth} master {plan.gnb_bridge}",
                 f"ip link set {plan.gnb_host_veth} up",
@@ -121,15 +134,15 @@ def render_bridge_script(plans: list[BridgeInterfacePlan], output_path: Path) ->
                 f"nsenter -t $gnb_pid_{plan.link_index} -n ip link set tmpg{plan.link_index} name {plan.gnb_ns_if}",
                 f"nsenter -t $gnb_pid_{plan.link_index} -n ip link set {plan.gnb_ns_if} up",
                 f"nsenter -t $gnb_pid_{plan.link_index} -n ip addr add {plan.gnb_ip}/30 dev {plan.gnb_ns_if}",
-                f"nsenter -t $gnb_pid_{plan.link_index} -n ip route replace {plan.ue_ip}/32 dev {plan.gnb_ns_if}",
-                f"ip link add {plan.ue_host_veth} type veth peer name tmpu{plan.link_index}",
-                f"ip link set {plan.ue_host_veth} master {plan.ue_bridge}",
-                f"ip link set {plan.ue_host_veth} up",
-                f"ip link set tmpu{plan.link_index} netns $ue_pid_{plan.link_index}",
-                f"nsenter -t $ue_pid_{plan.link_index} -n ip link set tmpu{plan.link_index} name {plan.ue_ns_if}",
-                f"nsenter -t $ue_pid_{plan.link_index} -n ip link set {plan.ue_ns_if} up",
-                f"nsenter -t $ue_pid_{plan.link_index} -n ip addr add {plan.ue_ip}/30 dev {plan.ue_ns_if}",
-                f"nsenter -t $ue_pid_{plan.link_index} -n ip route replace {plan.gnb_ip}/32 dev {plan.ue_ns_if}",
+                f"nsenter -t $gnb_pid_{plan.link_index} -n ip route replace {plan.upf_route_target}/32 dev {plan.gnb_ns_if}",
+                f"ip link add {plan.upf_host_veth} type veth peer name tmpu{plan.link_index}",
+                f"ip link set {plan.upf_host_veth} master {plan.upf_bridge}",
+                f"ip link set {plan.upf_host_veth} up",
+                f"ip link set tmpu{plan.link_index} netns $upf_pid_{plan.link_index}",
+                f"nsenter -t $upf_pid_{plan.link_index} -n ip link set tmpu{plan.link_index} name {plan.upf_ns_if}",
+                f"nsenter -t $upf_pid_{plan.link_index} -n ip link set {plan.upf_ns_if} up",
+                f"nsenter -t $upf_pid_{plan.link_index} -n ip addr add {plan.upf_ip}/30 dev {plan.upf_ns_if}",
+                f"nsenter -t $upf_pid_{plan.link_index} -n ip route replace {plan.gnb_route_target}/32 dev {plan.upf_ns_if}",
                 "",
             ]
         )

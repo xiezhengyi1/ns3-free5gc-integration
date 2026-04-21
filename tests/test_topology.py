@@ -174,6 +174,41 @@ class TopologyResolutionTest(unittest.TestCase):
         self.assertEqual(resolved.gnb_positions["gnb2"].to_tuple(), (200.0, 0.0, 10.0))
         self.assertEqual(resolved.ue_positions["ue1"].to_tuple(), (190.0, 0.0, 1.5))
 
+    def test_loads_ulcl_graph_derived_entities(self) -> None:
+        scenario = load_scenario(PROJECT_ROOT / "scenarios" / "baseline_ulcl_multi_gnb.yaml")
+        resolved = resolve_scenario_topology(scenario)
+
+        self.assertEqual(
+            [(item.name, item.role) for item in scenario.upfs],
+            [("i-upf", "branching-upf"), ("psa-upf", "anchor-upf")],
+        )
+        self.assertEqual([item.name for item in scenario.gnbs], ["gnb1", "gnb2"])
+        self.assertEqual([item.name for item in scenario.ues], ["ue1", "ue2"])
+        self.assertEqual(scenario.ues[0].free5gc_policy.target_gnb, "gnb2")
+        self.assertEqual(scenario.ues[0].free5gc_policy.preferred_gnbs, ("gnb2", "gnb1"))
+        self.assertEqual(resolved.ue_to_gnb["ue1"], "gnb2")
+        self.assertEqual(resolved.ue_to_gnb["ue2"], "gnb1")
+        self.assertEqual(resolved.gnb_to_upf["gnb1"], "i-upf")
+        self.assertEqual(resolved.gnb_to_upf["gnb2"], "i-upf")
+        self.assertEqual(resolved.gnb_positions["gnb2"].to_tuple(), (200.0, 0.0, 10.0))
+        self.assertEqual(resolved.ue_positions["ue1"].to_tuple(), (190.0, 0.0, 1.5))
+
+    def test_loads_ulcl_multi_slice_graph_entities(self) -> None:
+        scenario = load_scenario(PROJECT_ROOT / "scenarios" / "baseline_ulcl_multi_slice_multi_gnb.yaml")
+        resolved = resolve_scenario_topology(scenario)
+
+        self.assertEqual([item.slice_id for item in scenario.slices], ["slice-1-010203", "slice-1-112233"])
+        self.assertEqual([item.name for item in scenario.gnbs], ["gnb1", "gnb2"])
+        self.assertEqual([item.name for item in scenario.ues], ["ue1", "ue2"])
+        self.assertEqual([session.session_ref for session in scenario.ues[0].sessions], ["ue1-video-session", "ue1-control-session"])
+        self.assertEqual([session.slice_ref for session in scenario.ues[0].sessions], ["slice-1-010203", "slice-1-112233"])
+        self.assertEqual(scenario.flows[0].session_ref, "ue1-video-session")
+        self.assertEqual(scenario.flows[1].session_ref, "ue1-control-session")
+        self.assertEqual(resolved.ue_to_gnb["ue1"], "gnb2")
+        self.assertEqual(resolved.ue_to_gnb["ue2"], "gnb1")
+        self.assertEqual(resolved.gnb_to_upf["gnb1"], "i-upf")
+        self.assertEqual(resolved.gnb_to_upf["gnb2"], "i-upf")
+
     def test_loads_semantic_graph_snapshot_into_scenario_model(self) -> None:
         payload = {
             "name": "semantic-graph-snapshot",

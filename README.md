@@ -163,39 +163,18 @@ ns3_free5gc_integration/
 - **UPFs**：用户面功能实例及其角色（`upf` / `branching-upf` / `anchor-upf`）
 - **gNBs**：基站配置，包括 TAC、NCI、切片绑定、回程 UPF 关联
 - **UEs**：终端设备配置，含 SUPI、密钥、鉴权参数、PDU Session 定义
-- **free5GC UE 策略**：可通过 `ues[].free5gc_policy.target_gnb` 或 `preferred_gnbs` 为 UE 指定接入 gNB 策略
 - **free5gc**：核心网 Compose 文件路径、模式（`single_upf` / `ulcl`）、bridge 名称
 - **ns3**：ns-3 根路径、scratch 程序名、仿真时长
 - **writer**：归档目录、状态数据库路径、可选 PostgreSQL URL
-- **topology**：可选的初始化网络图文件，通过 `topology.graph_file` 提供 nodes/links 拓扑关系、节点坐标，以及可派生的 slice / UPF / gNB / UE 属性
 - **bridge**：可选的 inline tap harness 开关
 
 场景数据模型定义在 `bridge/common/scenario.py`，使用 frozen dataclass，在加载时做完整的交叉引用校验（UE → gNB、Session → Slice）。
-
-当同时提供多个 UE 接入来源时，当前解析优先级为：
-
-- `ues[].free5gc_policy.target_gnb` / `preferred_gnbs`
-- `topology.graph_file` 中的 `attached_to` 边
-- 兼容旧场景的 `ues[].gnb`
-
-其中 `topology.graph_file` 不再只是“拓扑层输入”。当前支持的图驱动派生包括：
-
-- `slice` 节点：派生 `slices[]`（`sst` / `sd` / `label`）
-- `core_node` 节点：派生 `upfs[]`（`name` / `role` / `dnn`）
-- `ran_node` 节点：派生 `gnbs[]`（`alias` / `tac` / `nci` / `position`）
-- `ue` 节点：派生 `ues[]`（`supi` / `key` / `op` / `op_type` / `amf` / `free5gc_policy` / `position`）
-- `serves_slice` 边：派生 gNB → slice 绑定
-- `uses_slice` 边：派生 UE session（`apn` / `type` / `five_qi` / `app_id`）
-- `attached_to` 边：派生 UE → gNB 初始绑定
-- `tunneled_via` 边：派生 gNB → UPF 回程映射
-
-显式场景 YAML 仍然优先保留自身字段；图输入默认用于补齐缺失实体与属性。对 UE 接入目标的最终解析优先级仍然是：`free5gc_policy` > 图上的 `attached_to` > 兼容旧场景的 `ue.gnb`。
 
 ### 配置渲染引擎
 
 `bridge/orchestrator/config_renderer.py` 中的 `render_run_assets()` 是核心渲染函数。它接收场景对象，执行以下转换：
 
-1. **核心网配置渲染**：读取 free5GC 原始 `amfcfg.yaml` / `smfcfg.yaml` / `upfcfg.yaml`，替换服务发现地址为容器固定 IP，并根据场景里的 gNB 列表生成 AMF 支持的 `supportTaiList`
+1. **核心网配置渲染**：读取 free5GC 原始 `smfcfg.yaml` / `upfcfg.yaml`，替换服务发现地址为容器固定 IP
 2. **gNB 配置渲染**：基于模板为每个 gNB 生成独立配置（IP、TAC、NCI、AMF 地址、切片列表）
 3. **UE 配置渲染**：为每个 UE 生成独立配置（SUPI、密钥、gNB 搜索地址、Session/NSSAI）
 4. **Compose 文件渲染**：在原始 compose 上动态叠加 gNB 和 UE 服务定义，分配容器 IP，挂载渲染后的配置卷
@@ -244,8 +223,6 @@ ns3_free5gc_integration/
 - 节点类型：`ran_node`、`ue`、`core_node`、`slice`、`flow`、`app`
 - 边类型：`attached_to`、`tunneled_via`、`serves_slice` 等
 - 指标：delay_ms、jitter_ms、loss_rate、throughput、queue_bytes 等
-- 首个 tick 写入完整拓扑，后续 tick 仅写入相对上一有效图状态发生变化的 node/edge；消失的关系用 tombstone 行表示
-- `graph_summary` 同时保留完整图规模（`node_count`、`edge_count`）和增量规模（`delta_node_count`、`delta_edge_count`）
 
 **HTTP Sink**（`http_sink.py`）：可选的外部 HTTP 端点投递。
 
@@ -269,9 +246,7 @@ ns3_free5gc_integration/
 - **edge_rows**：拓扑关系（UE→gNB, gNB→UPF, Flow→Slice, …）
 - **metric_rows**：每个 Flow 的性能指标时间序列
 
-图写入采用“首帧完整、后续增量”的方式：首个快照落完整图，后续快照沿 `base_network_snapshot_id` 仅写入变化的 node/edge 和当前 tick 的 metric，从而避免每个 tick 都重建整图。
-
-这种设计使得下游系统（如多智能体决策平台）可以在不重复写整图的前提下，按图快照链路恢复任意时刻的有效网络状态。
+这种设计使得下游系统（如多智能体决策平台）可以按图快照为单位查询和推理网络状态。
 
 ---
 
@@ -313,26 +288,16 @@ ULCL（Uplink Classifier）场景：1 gNB + 1 UE + 2 UPF（branching-upf + ancho
 
 当前生成器会为这个场景额外渲染 ULCL 专用的 `smfcfg.yaml`、`i-upf-upfcfg.yaml` 和 `psa-upf-upfcfg.yaml`，并为 AMF、SMF、I-UPF、PSA-UPF、gNB 分配显式内网地址，确保真实双 UPF 拓扑里的 PFCP 和 N3/N9 路径不会再依赖 `*.free5gc.org` 解析结果。
 
-### baseline_ulcl_multi_ue.yaml
+### baseline_ulcl_multi_gnb.yaml
 
-ULCL + 双 UE 场景：1 gNB + 2 UE + 2 UPF。这个场景用于验证更复杂拓扑下的 graph 持久化链路，尤其是多 UE 注册、双 PFCP 关联和 ns-3 tick 图快照在同一个 run 中的闭环。
-
-### policy_graph_multi_gnb.yaml
-
-策略 + 网络图初始化场景：2 gNB + 2 UE + 1 UPF。这个场景现在演示三类能力：
-
-- Scenario YAML 只保留运行参数；`slices` / `upfs` / `gnbs` / `ues` 由 `topology.graph_file` 自动派生
-- 图中的 `ue1.free5gc_policy.target_gnb = gnb2` 会覆盖图上的 `attached_to: ue1 -> gnb1`
-- 图中的 `serves_slice` / `uses_slice` / `tunneled_via` 会直接写入生成的 gNB、UE、subscriber 和 ns-3 配置
-
-在当前实现里，free5GC 策略优先于图上的 `attached_to` 关系，因此即使图里把 `ue1` 连到 `gnb1`，最终生成的 UERANSIM 配置和 ns-3 attach 映射仍会让 `ue1` 接到 `gnb2`；同时 `ue1` 的 `preferred_gnbs` 会被渲染为有序的 `gnbSearchList`。
+ULCL + 双 gNB 场景：2 gNB + 2 UE + 2 UPF。这个场景通过图文件自动派生 `i-upf`、`psa-upf`、`gnb1`、`gnb2`、`ue1`、`ue2`，并把 ULCL 的 `smfcfg.yaml` 渲染成多 AN 节点拓扑，让多个 gNB 同时指向 I-UPF，再由 I-UPF 连接 PSA-UPF。
 
 ---
 
 ## 使用方式
 
 启动ssh隧道：
-`ssh -L 5433:localhost:5432 xiezhengyi@172.27.208.1 -N`
+`ssh -L 5433:localhost:5432 xiezhengyi@172.19.160.1 -N`
 
 ### 1. 渲染运行产物
 
@@ -346,8 +311,8 @@ python scripts/render_run.py scenarios/baseline_multi_ue.yaml
 # ULCL 基线
 python scripts/render_run.py scenarios/baseline_ulcl.yaml
 
-# ULCL + 双 UE 基线
-python scripts/render_run.py scenarios/baseline_ulcl_multi_ue.yaml
+# ULCL + 双 gNB 基线
+python scripts/render_run.py scenarios/baseline_ulcl_multi_gnb.yaml
 ```
 
 也可指定 run-id：
@@ -359,7 +324,7 @@ python -m bridge.orchestrator.cli prepare-run scenarios/baseline_multi_ue.yaml -
 
 python -m bridge.orchestrator.cli prepare-run scenarios/baseline_ulcl.yaml --run-id my-ulcl-001
 
-python -m bridge.orchestrator.cli prepare-run scenarios/baseline_ulcl_multi_ue.yaml --run-id my-ulcl-multi-ue-001
+python -m bridge.orchestrator.cli prepare-run scenarios/baseline_ulcl_multi_gnb.yaml --run-id my-ulcl-multi-gnb-001
 ```
 
 ### 2. 启动全栈
@@ -368,7 +333,7 @@ python -m bridge.orchestrator.cli prepare-run scenarios/baseline_ulcl_multi_ue.y
 python scripts/start_stack.py artifacts/runs/<run-id>/run-manifest.json
 ```
 
-说明：针对真实 free5GC Compose 基线，生成器现在会为 AMF、SMF、UPF 和 gNB 渲染显式内网地址；在多 gNB 场景里还会按 gNB TAC 自动扩展 `amfcfg.yaml` 的 `supportTaiList`，避免第二个 gNB 被 AMF 以未知 TA/PLMN 拒绝。在 ULCL 场景里还会为 I-UPF 和 PSA-UPF 分别生成独立配置，避免宿主机把 `*.free5gc.org` 解析到 `198.18.x.x` 后造成 PFCP/NGAP/N9 指向错误目标。
+说明：针对真实 free5GC Compose 基线，生成器现在会为 SMF、UPF 和 gNB 渲染显式内网地址；在 ULCL 场景里还会为 I-UPF 和 PSA-UPF 分别生成独立配置，避免宿主机把 `*.free5gc.org` 解析到 `198.18.x.x` 后造成 PFCP/NGAP/N9 指向错误目标。
 
 仅执行特定步骤：
 
@@ -383,34 +348,6 @@ python -m bridge.orchestrator.cli start artifacts/runs/<run-id>/run-manifest.jso
 ```bash
 python -m bridge.orchestrator.cli start artifacts/runs/<run-id>/run-manifest.json --dry-run
 ```
-
-### 2.1 一键 Graph Smoke
-
-```bash
-# 默认运行双 UE graph smoke
-python scripts/run_graph_smoke.py
-
-# 运行 policy + graph 驱动的多 gNB 真实 smoke
-python scripts/run_graph_smoke.py \
-  --scenario scenarios/policy_graph_multi_gnb_smoke.yaml \
-  --run-id policy-graph-multi-gnb-smoke
-
-# 运行 ULCL + 双 UE graph smoke
-python scripts/run_graph_smoke.py \
-  --scenario scenarios/baseline_ulcl_multi_ue.yaml \
-  --run-id ulcl-multi-ue-graph-smoke
-```
-
-脚本会自动完成以下步骤：
-
-- 渲染场景产物并清理上次 run 的状态文件
-- 启动 core、subscriber bootstrap、RAN、writer followers 和 ns-3 twin
-- 等待 SQLite 与 PostgreSQL 图写入稳定
-- 校验 UE 注册、TUN 建立、所有 gNB 的 NG Setup 事件、tick 与 graph snapshot 数量
-- 校验 ns-3 首帧中的 UE→gNB 与 gNB→UPF 映射是否和图/策略解析结果一致
-- 默认在结束时自动 `compose down`
-
-输出摘要会写到 `artifacts/runs/<run-id>/smoke-summary.json`。
 
 ### 3. 手动数据摄入
 

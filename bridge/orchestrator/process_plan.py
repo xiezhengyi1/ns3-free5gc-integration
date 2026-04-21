@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from adapters.free5gc_ueransim.bridge_setup import BridgeInterfacePlan
 from bridge.common.scenario import ScenarioConfig
 from bridge.common.topology import ResolvedScenarioTopology
 
@@ -27,7 +28,9 @@ class RunManifest:
     compose_project_name: str
     free5gc_webui_url: str
     bridge_script: str
+    bridge_links: list[dict[str, object]]
     snapshot_file: str
+    clock_file: str
     ns3_flow_profile_file: str
     state_db: str
     archive_dir: str
@@ -51,7 +54,9 @@ def build_run_manifest(
     run_dir: Path,
     compose_file: Path,
     bridge_script: Path,
+    bridge_plans: list[BridgeInterfacePlan],
     snapshot_file: Path,
+    clock_file: Path,
     flow_profile_file: Path,
     state_db: Path,
     archive_dir: Path,
@@ -125,6 +130,8 @@ def build_run_manifest(
                 scenario.scenario_id,
                 "--tick-ms",
                 str(scenario.tick_ms),
+                "--clock-file",
+                str(clock_file),
                 "--tail",
                 "all",
                 "--state-db",
@@ -175,6 +182,8 @@ def build_run_manifest(
                 scenario.scenario_id,
                 "--tick-ms",
                 str(scenario.tick_ms),
+                "--clock-file",
+                str(clock_file),
                 "--tail",
                 "all",
                 "--state-db",
@@ -225,10 +234,16 @@ def build_run_manifest(
                 str(scenario.tick_ms),
                 "--sim-time-ms",
                 str(scenario.ns3.sim_time_ms),
+                "--simulator",
+                scenario.ns3.simulator,
                 "--output-file",
                 str(snapshot_file),
+                "--clock-file",
+                str(clock_file),
                 "--flow-profile-file",
                 str(flow_profile_file),
+                "--policy-reload-ms",
+                str(scenario.ns3.policy_reload_ms),
                 "--upf-names",
                 upf_names,
                 "--slice-sds",
@@ -251,6 +266,20 @@ def build_run_manifest(
             argv=[*compose_base_argv, "down"],
         ),
     ]
+    if scenario.bridge.enable_inline_harness and bridge_plans:
+        ns3_run = next(command for command in commands if command.name == "ns3-run")
+        ns3_run.argv.extend(
+            [
+                "--bridge-gnb-taps",
+                ",".join(plan.gnb_tap for plan in bridge_plans),
+                "--bridge-upf-taps",
+                ",".join(plan.upf_tap for plan in bridge_plans),
+                "--bridge-link-rate-mbps",
+                str(scenario.ns3.bridge_link_rate_mbps),
+                "--bridge-link-delay-ms",
+                str(scenario.ns3.bridge_link_delay_ms),
+            ]
+        )
     if scenario.bridge.enable_inline_harness:
         compose_up_ran_index = next(
             index for index, command in enumerate(commands) if command.name == "compose-up-ran"
@@ -260,7 +289,23 @@ def build_run_manifest(
             CommandSpec(
                 name="bridge-setup",
                 cwd=str(project_root),
-                argv=["bash", str(bridge_script)],
+                argv=[
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--privileged",
+                    "--pid",
+                    "host",
+                    "--network",
+                    "host",
+                    "-v",
+                    "/:/host",
+                    "free5gc/base:latest",
+                    "chroot",
+                    "/host",
+                    "bash",
+                    str(bridge_script),
+                ],
             ),
         )
     if scenario.writer.graph_db_url:
@@ -280,7 +325,9 @@ def build_run_manifest(
         compose_project_name=scenario.free5gc.project_name,
         free5gc_webui_url=free5gc_webui_url,
         bridge_script=str(bridge_script),
+        bridge_links=[plan.to_dict() for plan in bridge_plans],
         snapshot_file=str(snapshot_file),
+        clock_file=str(clock_file),
         ns3_flow_profile_file=str(flow_profile_file),
         state_db=str(state_db),
         archive_dir=str(archive_dir),

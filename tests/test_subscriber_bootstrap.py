@@ -4,6 +4,7 @@ import json
 import shutil
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -166,8 +167,82 @@ class SubscriberBootstrapTest(unittest.TestCase):
             {
                 key: value
                 for key, value in subscriber_payload.items()
-                if key not in {"LocalPolicyData", "FlowRules", "QosFlows", "ChargingDatas"}
+                if key not in {"LocalPolicyData"}
             },
+        )
+
+    def test_binds_multi_slice_flows_to_explicit_sessions(self) -> None:
+        scenario = load_scenario(PROJECT_ROOT / "scenarios" / "baseline_ulcl_multi_slice_multi_gnb.yaml")
+
+        ue1_payload = build_subscriber_payload(scenario, scenario.ues[0], "20893")
+        ue2_payload = build_subscriber_payload(scenario, scenario.ues[1], "20893")
+
+        self.assertEqual(
+            [item["singleNssai"]["sd"] for item in ue1_payload["SessionManagementSubscriptionData"]],
+            ["010203", "112233"],
+        )
+        self.assertEqual(
+            ue1_payload["SessionManagementSubscriptionData"][1]["dnnConfigurations"]["enterprise"]["5gQosProfile"]["5qi"],
+            7,
+        )
+        self.assertEqual(
+            ue1_payload["FlowRules"],
+            [
+                {
+                    "flowId": "ue1-video-flow",
+                    "appId": "ue1-video-app",
+                    "snssai": "01010203",
+                    "dnn": "internet",
+                    "qosRef": 1,
+                    "precedence": 1,
+                },
+                {
+                    "flowId": "ue1-control-flow",
+                    "appId": "ue1-control-app",
+                    "snssai": "01112233",
+                    "dnn": "enterprise",
+                    "qosRef": 2,
+                    "precedence": 2,
+                },
+            ],
+        )
+        self.assertEqual(
+            [item["sessionRef"] for item in ue1_payload["LocalPolicyData"]["flows"]],
+            ["ue1-video-session", "ue1-control-session"],
+        )
+        self.assertEqual(ue1_payload["ChargingDatas"], [])
+        self.assertEqual(ue2_payload["FlowRules"][0]["snssai"], "01112233")
+        self.assertEqual(ue2_payload["FlowRules"][0]["dnn"], "enterprise")
+        self.assertEqual(ue2_payload["FlowRules"][0]["precedence"], 1)
+        self.assertEqual(ue2_payload["LocalPolicyData"]["flows"][0]["sessionRef"], "ue2-telemetry-session")
+        self.assertEqual(ue2_payload["ChargingDatas"], [])
+
+    def test_emits_charging_payload_only_when_explicitly_configured(self) -> None:
+        scenario = load_scenario(PROJECT_ROOT / "scenarios" / "baseline_ulcl_multi_slice_multi_gnb.yaml")
+        charged_flow = replace(
+            scenario.flows[0],
+            charging_method="ONLINE",
+            quota="1GB",
+            unit_cost="0.05",
+        )
+        charged_scenario = replace(scenario, flows=(charged_flow, *scenario.flows[1:]))
+
+        payload = build_subscriber_payload(charged_scenario, charged_scenario.ues[0], "20893")
+
+        self.assertEqual(
+            payload["ChargingDatas"],
+            [
+                {
+                    "flowId": "ue1-video-flow",
+                    "appId": "ue1-video-app",
+                    "snssai": "01010203",
+                    "dnn": "internet",
+                    "qosRef": 1,
+                    "chargingMethod": "ONLINE",
+                    "quota": "1GB",
+                    "unitCost": "0.05",
+                }
+            ],
         )
 
 

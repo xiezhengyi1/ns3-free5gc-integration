@@ -125,6 +125,7 @@ class FlowRecord:
     throughput_dl_mbps: float
     queue_bytes: int
     rlc_buffer_bytes: int
+    session_ref: str | None = None
     name: str | None = None
     app_name: str | None = None
     service: dict[str, Any] = field(default_factory=dict)
@@ -142,6 +143,7 @@ class FlowRecord:
             src_gnb=str(_require(payload, "src_gnb")),
             dst_upf=str(_require(payload, "dst_upf")),
             slice_id=str(_require(payload, "slice_id")),
+            session_ref=(str(payload["session_ref"]) if payload.get("session_ref") is not None else None),
             five_qi=int(_require(payload, "5qi")),
             delay_ms=_number(_require(payload, "delay_ms"), "delay_ms"),
             jitter_ms=_number(_require(payload, "jitter_ms"), "jitter_ms"),

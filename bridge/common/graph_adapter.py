@@ -106,6 +106,8 @@ def _merge_flow_item(existing: dict[str, object], derived: dict[str, object]) ->
         "app_id",
         "app_name",
         "slice_ref",
+        "session_ref",
+        "dnn",
         "five_qi",
         "service_type",
         "service_type_id",
@@ -115,6 +117,12 @@ def _merge_flow_item(existing: dict[str, object], derived: dict[str, object]) ->
         "allocated_bandwidth_dl_mbps",
         "allocated_bandwidth_ul_mbps",
         "optimize_requested",
+        "policy_filter",
+        "precedence",
+        "qos_ref",
+        "charging_method",
+        "quota",
+        "unit_cost",
     ):
         if field not in merged and field in derived:
             merged[field] = copy.deepcopy(derived[field])
@@ -211,6 +219,7 @@ def _build_semantic_graph_payload(graph_summary: dict[str, Any]) -> dict[str, An
     app_id_by_key: dict[str, str] = {}
     app_name_by_key: dict[str, str] = {}
     flow_id_by_key: dict[str, str] = {}
+    session_payloads_by_key: dict[str, dict[str, object]] = {}
     ran_hosts_by_slice: dict[str, list[str]] = {}
     core_hosts_by_slice: dict[str, list[str]] = {}
 
@@ -321,6 +330,8 @@ def _build_semantic_graph_payload(graph_summary: dict[str, Any]) -> dict[str, An
                     "app_id": app_id,
                     "app_name": _string(properties.get("app_name")),
                     "slice_ref": slice_ref,
+                    "session_ref": _string(properties.get("session_ref"), _string(traffic.get("session_ref"))),
+                    "dnn": _string(properties.get("dnn"), _string(service.get("dnn"), _string(service.get("apn")))),
                     "five_qi": _infer_five_qi(
                         {
                             "five_qi": properties.get("5qi"),
@@ -335,6 +346,12 @@ def _build_semantic_graph_payload(graph_summary: dict[str, Any]) -> dict[str, An
                     "allocated_bandwidth_dl_mbps": _maybe_float(allocation.get("allocated_bandwidth_dl")),
                     "allocated_bandwidth_ul_mbps": _maybe_float(allocation.get("allocated_bandwidth_ul")),
                     "optimize_requested": allocation.get("optimize_requested"),
+                    "policy_filter": _string(traffic.get("filter"), _string(properties.get("policy_filter"))),
+                    "precedence": _maybe_int(traffic.get("precedence")),
+                    "qos_ref": _maybe_int(allocation.get("qos_ref")),
+                    "charging_method": _string(properties.get("charging_method")),
+                    "quota": _string(properties.get("quota")),
+                    "unit_cost": _string(properties.get("unit_cost")),
                     "sla_target": {
                         "latency_ms": _maybe_float(sla.get("latency")),
                         "jitter_ms": _maybe_float(sla.get("jitter")),
@@ -347,6 +364,35 @@ def _build_semantic_graph_payload(graph_summary: dict[str, Any]) -> dict[str, An
                     },
                 },
             )
+            continue
+
+        if node_type == "session":
+            session_ref = _string(properties.get("session_ref"), _string(properties.get("id"), label))
+            supi = _string(properties.get("supi"))
+            if session_ref is None or supi is None:
+                continue
+            session_payloads_by_key[node_key] = {
+                "session_ref": session_ref,
+                "supi": supi,
+                "ue_name": ue_name_by_supi.get(supi),
+                "slice_ref": _string(properties.get("slice_ref")),
+                "apn": _string(properties.get("dnn"), _string(properties.get("apn"))),
+                "type": _string(properties.get("type"), "IPv4"),
+                "five_qi": _maybe_int(properties.get("five_qi")),
+                "app_id": _string(properties.get("app_id")),
+            }
+
+    for app_payload in app_payloads.values():
+        if app_payload.get("ue_name") is None:
+            app_payload["ue_name"] = ue_name_by_supi.get(_string(app_payload.get("supi"), ""))
+
+    for flow_payload in flow_payloads.values():
+        if flow_payload.get("ue_name") is None:
+            flow_payload["ue_name"] = ue_name_by_supi.get(_string(flow_payload.get("supi"), ""))
+
+    for session_payload in session_payloads_by_key.values():
+        if session_payload.get("ue_name") is None:
+            session_payload["ue_name"] = ue_name_by_supi.get(_string(session_payload.get("supi"), ""))
 
     for edge in edges:
         if not isinstance(edge, dict):
@@ -384,6 +430,10 @@ def _build_semantic_graph_payload(graph_summary: dict[str, Any]) -> dict[str, An
             flow_id = flow_id_by_key.get(source_key)
             slice_ref = slice_ref_by_key.get(target_key)
             if flow_id is None or slice_ref is None:
+                session_payload = session_payloads_by_key.get(source_key)
+                if session_payload is None or slice_ref is None:
+                    continue
+                session_payload["slice_ref"] = slice_ref
                 continue
             flow_payload = flow_payloads.setdefault(flow_id, {"flow_id": flow_id})
             flow_payload["slice_ref"] = slice_ref
@@ -393,6 +443,33 @@ def _build_semantic_graph_payload(graph_summary: dict[str, Any]) -> dict[str, An
                 sd = _string(slice_payload.get("sd"))
                 if sst is not None and sd is not None:
                     flow_payload["current_slice_snssai"] = f"{sst:02d}{sd.lower()}"
+            continue
+
+        if edge_type == "uses_session":
+            ue_name = ue_name_by_key.get(source_key)
+            session_payload = session_payloads_by_key.get(target_key)
+            if ue_name is None or session_payload is None:
+                continue
+            session_payload["ue_name"] = ue_name
+            continue
+
+        if edge_type == "runs_on_session":
+            flow_id = flow_id_by_key.get(source_key)
+            session_payload = session_payloads_by_key.get(target_key)
+            if flow_id is None or session_payload is None:
+                continue
+            flow_payload = flow_payloads.setdefault(flow_id, {"flow_id": flow_id})
+            flow_payload.setdefault("session_ref", session_payload.get("session_ref"))
+            flow_payload.setdefault("slice_ref", session_payload.get("slice_ref"))
+            flow_payload.setdefault("dnn", session_payload.get("apn"))
+            continue
+
+        if edge_type == "uses_slice":
+            session_payload = session_payloads_by_key.get(source_key)
+            slice_ref = slice_ref_by_key.get(target_key)
+            if session_payload is None or slice_ref is None:
+                continue
+            session_payload["slice_ref"] = slice_ref
             continue
 
         if edge_type == "hosted_on":
@@ -423,20 +500,53 @@ def _build_semantic_graph_payload(graph_summary: dict[str, Any]) -> dict[str, An
 
     sessions_by_ue: dict[str, list[dict[str, object]]] = {}
     preferred_gnbs_by_ue: dict[str, list[str]] = {}
-    for flow_payload in flow_payloads.values():
-        ue_name = _string(flow_payload.get("ue_name"))
-        slice_ref = _string(flow_payload.get("slice_ref"))
+
+    for session_payload in session_payloads_by_key.values():
+        ue_name = _string(session_payload.get("ue_name"))
+        slice_ref = _string(session_payload.get("slice_ref"))
         if ue_name is None or slice_ref is None:
             continue
         sessions_by_ue.setdefault(ue_name, []).append(
             {
                 "slice_ref": slice_ref,
-                "apn": "internet",
-                "type": "IPv4",
-                "five_qi": int(flow_payload.get("five_qi", 9)),
-                "app_id": _string(flow_payload.get("app_id"), flow_payload.get("flow_id")),
+                "session_ref": _string(session_payload.get("session_ref")),
+                "apn": _string(session_payload.get("apn"), "internet"),
+                "type": _string(session_payload.get("type"), "IPv4"),
+                "five_qi": int(session_payload.get("five_qi", 9)),
+                "app_id": _string(session_payload.get("app_id")),
             }
         )
+
+    for flow_payload in flow_payloads.values():
+        ue_name = _string(flow_payload.get("ue_name"))
+        slice_ref = _string(flow_payload.get("slice_ref"))
+        if ue_name is None or slice_ref is None:
+            continue
+        derived_session = {
+            "slice_ref": slice_ref,
+            "session_ref": _string(flow_payload.get("session_ref")),
+            "apn": _string(flow_payload.get("dnn"), "internet"),
+            "type": "IPv4",
+            "five_qi": int(flow_payload.get("five_qi", 9)),
+            "app_id": _string(flow_payload.get("app_id"), flow_payload.get("flow_id")),
+        }
+        existing_sessions = sessions_by_ue.setdefault(ue_name, [])
+        session_ref = _string(derived_session.get("session_ref"))
+        if session_ref is not None:
+            matched = next(
+                (
+                    item
+                    for item in existing_sessions
+                    if _string(item.get("session_ref")) == session_ref
+                ),
+                None,
+            )
+            if matched is not None:
+                for key, value in derived_session.items():
+                    if key not in matched and value is not None:
+                        matched[key] = value
+                continue
+        existing_sessions.append(derived_session)
         for gnb_name in ran_hosts_by_slice.get(slice_ref, []):
             preferred_list = preferred_gnbs_by_ue.setdefault(ue_name, [])
             if gnb_name not in preferred_list:

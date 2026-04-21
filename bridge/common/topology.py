@@ -135,6 +135,10 @@ def _slice_ref_from_values(sst: int, sd: str) -> str:
     return f"slice-{sst}-{sd.lower()}"
 
 
+def _default_session_ref(ue_name: str, app_id: str, slice_ref: str, apn: str) -> str:
+    return f"{ue_name}:{app_id}:{slice_ref}:{apn}"
+
+
 def _parse_slice_ref(value: str) -> tuple[int, str] | None:
     match = _SLICE_REF_RE.match(value)
     if match is None:
@@ -235,15 +239,19 @@ def _normalize_session_payload(
     *,
     slice_payloads: dict[str, dict[str, object]],
     default_app_id: str,
+    default_session_ref: str | None = None,
 ) -> dict[str, object]:
     if isinstance(raw_session, str):
         slice_ref = _register_slice_payload(slice_payloads, raw_session)
+        app_id = default_app_id
+        apn = "internet"
         return {
             "slice_ref": slice_ref,
-            "apn": "internet",
+            "session_ref": default_session_ref or _default_session_ref(ue_name, app_id, slice_ref, apn),
+            "apn": apn,
             "type": "IPv4",
             "five_qi": 9,
-            "app_id": default_app_id,
+            "app_id": app_id,
         }
 
     if not isinstance(raw_session, dict):
@@ -251,12 +259,20 @@ def _normalize_session_payload(
 
     slice_descriptor = raw_session.get("slice") if raw_session.get("slice") is not None else raw_session
     slice_ref = _register_slice_payload(slice_payloads, slice_descriptor)
+    apn = str(raw_session.get("apn", "internet"))
+    app_id = str(raw_session.get("app_id", default_app_id))
     return {
         "slice_ref": slice_ref,
-        "apn": str(raw_session.get("apn", "internet")),
+        "session_ref": str(
+            raw_session.get(
+                "session_ref",
+                default_session_ref or _default_session_ref(ue_name, app_id, slice_ref, apn),
+            )
+        ),
+        "apn": apn,
         "type": str(raw_session.get("type", raw_session.get("session_type", "IPv4"))),
         "five_qi": int(raw_session.get("five_qi", 9)),
-        "app_id": str(raw_session.get("app_id", default_app_id)),
+        "app_id": app_id,
     }
 
 
@@ -278,16 +294,21 @@ def _merge_policy_payload(
 
 def _dedupe_sessions(existing: list[dict[str, object]]) -> list[dict[str, object]]:
     merged: list[dict[str, object]] = []
-    index_by_key: dict[tuple[object, object, object], int] = {}
+    index_by_key: dict[tuple[object, object, object, object], int] = {}
     for session in existing:
-        key = (session.get("slice_ref"), session.get("apn"), session.get("app_id"))
+        key = (
+            session.get("session_ref"),
+            session.get("slice_ref"),
+            session.get("apn"),
+            session.get("app_id"),
+        )
         index = index_by_key.get(key)
         if index is None:
             index_by_key[key] = len(merged)
             merged.append(dict(session))
             continue
         current = merged[index]
-        for field in ("type", "five_qi"):
+        for field in ("session_ref", "type", "five_qi"):
             if field not in current and field in session:
                 current[field] = session[field]
     return merged

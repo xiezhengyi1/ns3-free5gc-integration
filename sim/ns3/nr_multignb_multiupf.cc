@@ -3,12 +3,14 @@
 #include "ns3/antenna-module.h"
 #include "ns3/applications-module.h"
 #include "ns3/core-module.h"
+#include "ns3/csma-module.h"
 #include "ns3/flow-monitor-module.h"
 #include "ns3/internet-apps-module.h"
 #include "ns3/internet-module.h"
 #include "ns3/mobility-module.h"
 #include "ns3/nr-module.h"
 #include "ns3/point-to-point-module.h"
+#include "ns3/tap-bridge-module.h"
 
 #include <algorithm>
 #include <cmath>
@@ -150,8 +152,10 @@ struct FlowProfile
     std::string supi;
     std::string appId;
     std::string appName;
+    std::string sessionRef;
     std::string sliceRef;
     std::string sliceSnssai;
+    std::string dnn;
     std::string serviceType;
     uint32_t serviceTypeId = 0;
     uint32_t fiveQi = 9;
@@ -168,6 +172,12 @@ struct FlowProfile
     double allocatedBandwidthDlMbps = 0.0;
     double allocatedBandwidthUlMbps = 0.0;
     bool optimizeRequested = false;
+    std::string policyFilter;
+    uint32_t precedence = 128;
+    uint32_t qosRef = 0;
+    std::string chargingMethod;
+    std::string quota;
+    std::string unitCost;
 };
 
 PositionOverrides
@@ -319,8 +329,10 @@ LoadFlowProfiles(const std::string& path)
         profile.supi = GetColumnValue(headerIndex, columns, "supi");
         profile.appId = GetColumnValue(headerIndex, columns, "app_id");
         profile.appName = GetColumnValue(headerIndex, columns, "app_name");
+        profile.sessionRef = GetColumnValue(headerIndex, columns, "session_ref");
         profile.sliceRef = GetColumnValue(headerIndex, columns, "slice_ref");
         profile.sliceSnssai = GetColumnValue(headerIndex, columns, "slice_snssai");
+        profile.dnn = GetColumnValue(headerIndex, columns, "dnn");
         profile.serviceType = GetColumnValue(headerIndex, columns, "service_type");
         profile.serviceTypeId = ParseOptionalUint(GetColumnValue(headerIndex, columns, "service_type_id"), 0);
         profile.fiveQi = ParseOptionalUint(GetColumnValue(headerIndex, columns, "five_qi"), 9);
@@ -347,6 +359,12 @@ LoadFlowProfiles(const std::string& path)
         profile.optimizeRequested = ParseOptionalBool(
             GetColumnValue(headerIndex, columns, "optimize_requested"),
             false);
+        profile.policyFilter = GetColumnValue(headerIndex, columns, "policy_filter");
+        profile.precedence = ParseOptionalUint(GetColumnValue(headerIndex, columns, "precedence"), 128);
+        profile.qosRef = ParseOptionalUint(GetColumnValue(headerIndex, columns, "qos_ref"), 0);
+        profile.chargingMethod = GetColumnValue(headerIndex, columns, "charging_method");
+        profile.quota = GetColumnValue(headerIndex, columns, "quota");
+        profile.unitCost = GetColumnValue(headerIndex, columns, "unit_cost");
 
         if (profile.flowId.empty())
         {
@@ -366,33 +384,340 @@ BuildSupi(uint32_t index)
     return supi.str();
 }
 
+bool
+ParseSliceId(const std::string& sliceId, uint32_t* sst, std::string* sd)
+{
+    if (sliceId.rfind("slice-", 0) != 0)
+    {
+        return false;
+    }
+
+    const auto remainder = sliceId.substr(6);
+    const auto separator = remainder.find('-');
+    if (separator == std::string::npos)
+    {
+        return false;
+    }
+
+    const auto sstValue = remainder.substr(0, separator);
+    const auto sdValue = remainder.substr(separator + 1);
+    if (sstValue.empty() || sdValue.empty())
+    {
+        return false;
+    }
+
+    try
+    {
+        *sst = static_cast<uint32_t>(std::stoul(sstValue));
+    }
+    catch (const std::exception&)
+    {
+        return false;
+    }
+    *sd = sdValue;
+    return true;
+}
+
+std::string
+BuildSliceSnssai(const std::string& sliceId, const std::string& fallbackSd)
+{
+    uint32_t sst = 1;
+    std::string sd = fallbackSd;
+    if (!ParseSliceId(sliceId, &sst, &sd))
+    {
+        return "01" + fallbackSd;
+    }
+
+    std::ostringstream stream;
+    stream << std::setw(2) << std::setfill('0') << sst << sd;
+    return stream.str();
+}
+
+std::string
+BuildDefaultSliceId(const std::vector<std::string>& sliceIds,
+                    const std::vector<std::string>& sliceSds,
+                    uint32_t index)
+{
+    if (!sliceIds.empty())
+    {
+        return sliceIds[index % sliceIds.size()];
+    }
+    return "slice-1-" + sliceSds[index % sliceSds.size()];
+}
+
+void
+AppendUniqueString(std::vector<std::string>* values, const std::string& value)
+{
+    if (value.empty())
+    {
+        return;
+    }
+    if (std::find(values->begin(), values->end(), value) == values->end())
+    {
+        values->push_back(value);
+    }
+}
+
 struct SnapshotContext
 {
+    struct FlowRuntimeState
+    {
+        FlowProfile profile;
+        Ptr<UdpClient> client;
+        uint16_t port = 0;
+        uint32_t ueIndex = 0;
+    };
+
     std::string runId;
     std::string scenarioId;
     std::string outputFile;
+    std::string clockFile;
+    std::string flowProfileFile;
     uint32_t tickMs;
+    uint32_t policyReloadMs = 1000;
     uint32_t tickIndex = 0;
     uint32_t gNbNum;
     uint32_t ueNum;
+    double bridgeLinkRateMbps = 1000.0;
     std::vector<std::string> upfNames;
     std::vector<std::string> sliceSds;
+    std::vector<std::string> sliceIds;
     std::vector<uint32_t> gnbToUpf;
     std::vector<std::string> ueSliceIds;
     std::vector<Ipv4Address> ueIps;
     std::vector<uint32_t> ueToGnb;
     std::vector<std::string> ueSupis;
     std::vector<uint16_t> uePorts;
-    std::map<uint16_t, FlowProfile> flowProfileByPort;
+    std::map<uint16_t, FlowRuntimeState> flowRuntimeByPort;
     Ptr<FlowMonitor> monitor;
     Ptr<Ipv4FlowClassifier> classifier;
     Time appStartTime;
     Time simTime;
 };
 
+std::string
+NormalizeSimulatorType(const std::string& simulator)
+{
+    if (simulator.rfind("ns3::", 0) == 0)
+    {
+        return simulator;
+    }
+    return "ns3::" + simulator;
+}
+
+double
+RequestedBandwidthDlMbps(const FlowProfile& profile)
+{
+    if (profile.bandwidthDlMbps > 0.0)
+    {
+        return profile.bandwidthDlMbps;
+    }
+    if (profile.packetSizeBytes <= 0.0 || profile.arrivalRatePps <= 0.0)
+    {
+        return 0.0;
+    }
+    return profile.arrivalRatePps * profile.packetSizeBytes * 8.0 / 1e6;
+}
+
+double
+GuaranteedBandwidthDlMbps(const FlowProfile& profile)
+{
+    return std::max(0.0, profile.guaranteedBandwidthDlMbps);
+}
+
+double
+PriorityWeight(const FlowProfile& profile)
+{
+    return 1.0 / static_cast<double>(std::max<uint32_t>(1, profile.priority == 0 ? 1 : profile.priority));
+}
+
+void
+ApplyClientRate(const SnapshotContext::FlowRuntimeState& runtime)
+{
+    if (runtime.client == nullptr)
+    {
+        return;
+    }
+    const auto packetSize = static_cast<uint32_t>(std::max(64.0, runtime.profile.packetSizeBytes));
+    runtime.client->SetAttribute("PacketSize", UintegerValue(packetSize));
+
+    double ratePps = runtime.profile.arrivalRatePps;
+    if (runtime.profile.allocatedBandwidthDlMbps > 0.0 && runtime.profile.packetSizeBytes > 0.0)
+    {
+        ratePps = runtime.profile.allocatedBandwidthDlMbps * 1e6 / 8.0 / runtime.profile.packetSizeBytes;
+    }
+    ratePps = std::max(1.0, ratePps);
+    runtime.client->SetAttribute("Interval", TimeValue(Seconds(1.0 / ratePps)));
+}
+
+void
+ReloadFlowProfiles(SnapshotContext* context)
+{
+    if (context->flowProfileFile.empty())
+    {
+        return;
+    }
+
+    const auto profiles = LoadFlowProfiles(context->flowProfileFile);
+    std::map<std::string, FlowProfile> byId;
+    for (const auto& profile : profiles)
+    {
+        byId[profile.flowId] = profile;
+    }
+
+    for (auto& [port, runtime] : context->flowRuntimeByPort)
+    {
+        auto it = byId.find(runtime.profile.flowId);
+        if (it == byId.end())
+        {
+            continue;
+        }
+        const double currentAllocatedDl = runtime.profile.allocatedBandwidthDlMbps;
+        const double currentAllocatedUl = runtime.profile.allocatedBandwidthUlMbps;
+        runtime.profile = it->second;
+        runtime.profile.allocatedBandwidthDlMbps = currentAllocatedDl;
+        runtime.profile.allocatedBandwidthUlMbps = currentAllocatedUl;
+    }
+}
+
+void
+ApplySlaDrivenAllocations(SnapshotContext* context)
+{
+    std::map<uint32_t, std::vector<SnapshotContext::FlowRuntimeState*>> flowsByGnb;
+    for (auto& [port, runtime] : context->flowRuntimeByPort)
+    {
+        if (runtime.ueIndex >= context->ueToGnb.size())
+        {
+            continue;
+        }
+        flowsByGnb[context->ueToGnb[runtime.ueIndex]].push_back(&runtime);
+    }
+
+    for (auto& [gnbIndex, runtimes] : flowsByGnb)
+    {
+        const double capacity = std::max(1.0, context->bridgeLinkRateMbps);
+        double guaranteedSum = 0.0;
+        for (auto* runtime : runtimes)
+        {
+            const double requested = RequestedBandwidthDlMbps(runtime->profile);
+            const double guaranteed = std::min(requested > 0.0 ? requested : capacity,
+                                               GuaranteedBandwidthDlMbps(runtime->profile));
+            runtime->profile.allocatedBandwidthDlMbps = guaranteed;
+            guaranteedSum += guaranteed;
+        }
+
+        if (guaranteedSum > capacity && guaranteedSum > 0.0)
+        {
+            const double scale = capacity / guaranteedSum;
+            for (auto* runtime : runtimes)
+            {
+                runtime->profile.allocatedBandwidthDlMbps *= scale;
+            }
+        }
+        else
+        {
+            double remaining = std::max(0.0, capacity - guaranteedSum);
+            std::vector<SnapshotContext::FlowRuntimeState*> active;
+            for (auto* runtime : runtimes)
+            {
+                const double requested = RequestedBandwidthDlMbps(runtime->profile);
+                if (requested > runtime->profile.allocatedBandwidthDlMbps)
+                {
+                    active.push_back(runtime);
+                }
+            }
+
+            while (remaining > 1e-6 && !active.empty())
+            {
+                double totalWeight = 0.0;
+                for (const auto* runtime : active)
+                {
+                    totalWeight += PriorityWeight(runtime->profile);
+                }
+                if (totalWeight <= 0.0)
+                {
+                    break;
+                }
+
+                std::vector<SnapshotContext::FlowRuntimeState*> nextActive;
+                double consumed = 0.0;
+                for (auto* runtime : active)
+                {
+                    const double requested = RequestedBandwidthDlMbps(runtime->profile);
+                    const double need = std::max(0.0, requested - runtime->profile.allocatedBandwidthDlMbps);
+                    if (need <= 1e-6)
+                    {
+                        continue;
+                    }
+                    const double share = remaining * PriorityWeight(runtime->profile) / totalWeight;
+                    const double grant = std::min(need, share);
+                    runtime->profile.allocatedBandwidthDlMbps += grant;
+                    consumed += grant;
+                    if (need - grant > 1e-6)
+                    {
+                        nextActive.push_back(runtime);
+                    }
+                }
+                if (consumed <= 1e-6)
+                {
+                    break;
+                }
+                remaining = std::max(0.0, remaining - consumed);
+                active = nextActive;
+            }
+        }
+
+        for (auto* runtime : runtimes)
+        {
+            if (runtime->profile.allocatedBandwidthUlMbps <= 0.0)
+            {
+                runtime->profile.allocatedBandwidthUlMbps = std::max(
+                    runtime->profile.bandwidthUlMbps,
+                    runtime->profile.guaranteedBandwidthUlMbps);
+            }
+            ApplyClientRate(*runtime);
+        }
+    }
+}
+
+void
+WriteClockState(const SnapshotContext* context)
+{
+    if (context->clockFile.empty())
+    {
+        return;
+    }
+
+    std::filesystem::path clockPath(context->clockFile);
+    if (!clockPath.parent_path().empty())
+    {
+        std::filesystem::create_directories(clockPath.parent_path());
+    }
+
+    const auto tempPath = clockPath.string() + ".tmp";
+    std::ofstream output(tempPath, std::ios::trunc);
+    output << "{" << Quote("run_id") << ":" << Quote(context->runId) << ","
+           << Quote("scenario_id") << ":" << Quote(context->scenarioId) << ","
+           << Quote("tick_index") << ":" << context->tickIndex << ","
+            << Quote("sim_time_ms") << ":" << Simulator::Now().GetMilliSeconds() << "}" << std::endl;
+    output.close();
+    std::error_code errorCode;
+    std::filesystem::remove(clockPath, errorCode);
+    errorCode.clear();
+    std::filesystem::rename(tempPath, clockPath, errorCode);
+}
+
 void
 EmitSnapshot(SnapshotContext* context)
 {
+    const uint32_t reloadEveryTicks = std::max<uint32_t>(1, std::max<uint32_t>(1, context->policyReloadMs) /
+                                                                std::max<uint32_t>(1, context->tickMs));
+    if (!context->flowRuntimeByPort.empty() && context->tickIndex % reloadEveryTicks == 0)
+    {
+        ReloadFlowProfiles(context);
+        ApplySlaDrivenAllocations(context);
+    }
+
     context->monitor->CheckForLostPackets();
     const auto stats = context->monitor->GetFlowStats();
     const double elapsedSeconds =
@@ -509,7 +834,7 @@ EmitSnapshot(SnapshotContext* context)
         {
             json << ",";
         }
-        const auto defaultSliceId = Quote("slice-1-" + context->sliceSds[ue % context->sliceSds.size()]);
+        const auto defaultSliceId = Quote(BuildDefaultSliceId(context->sliceIds, context->sliceSds, ue));
         const auto resolvedSliceId =
             ue < context->ueSliceIds.size() && !context->ueSliceIds[ue].empty()
                 ? Quote(context->ueSliceIds[ue])
@@ -536,8 +861,10 @@ EmitSnapshot(SnapshotContext* context)
         const uint32_t gnbIndex = context->ueToGnb[ueIndex];
         const uint32_t upfIndex = context->gnbToUpf[gnbIndex];
         const uint32_t sliceIndex = ueIndex % context->sliceSds.size();
-        const auto profileIt = context->flowProfileByPort.find(tuple.destinationPort);
-        const FlowProfile* profile = profileIt != context->flowProfileByPort.end() ? &profileIt->second : nullptr;
+        const std::string defaultSliceId = BuildDefaultSliceId(context->sliceIds, context->sliceSds, ueIndex);
+        const auto profileIt = context->flowRuntimeByPort.find(tuple.destinationPort);
+        const FlowProfile* profile =
+            profileIt != context->flowRuntimeByPort.end() ? &profileIt->second.profile : nullptr;
         const double delayMs = flow.rxPackets > 0 ? 1000.0 * flow.delaySum.GetSeconds() / flow.rxPackets : 0.0;
         const double jitterMs = flow.rxPackets > 0 ? 1000.0 * flow.jitterSum.GetSeconds() / flow.rxPackets : 0.0;
         const double lossRate = flow.txPackets > 0
@@ -558,11 +885,11 @@ EmitSnapshot(SnapshotContext* context)
                 ? profile->sliceRef
                 : (ueIndex < context->ueSliceIds.size() && !context->ueSliceIds[ueIndex].empty()
                        ? context->ueSliceIds[ueIndex]
-                       : "slice-1-" + context->sliceSds[sliceIndex]);
+                       : defaultSliceId);
         const std::string sliceSnssai =
             profile != nullptr && !profile->sliceSnssai.empty()
                 ? profile->sliceSnssai
-                : "01" + context->sliceSds[sliceIndex];
+                : BuildSliceSnssai(sliceId, context->sliceSds[sliceIndex]);
         const uint32_t fiveQi = profile != nullptr ? profile->fiveQi : 9;
         const double packetSizeBytes = profile != nullptr ? profile->packetSizeBytes : 512.0;
         const double arrivalRatePps = profile != nullptr ? profile->arrivalRatePps : 1000.0;
@@ -582,8 +909,15 @@ EmitSnapshot(SnapshotContext* context)
         const bool optimizeRequested = profile != nullptr ? profile->optimizeRequested : false;
         const std::string serviceType =
             profile != nullptr && !profile->serviceType.empty() ? profile->serviceType : "eMBB";
+        const std::string dnn = profile != nullptr ? profile->dnn : "internet";
+        const std::string sessionRef =
+            profile != nullptr && !profile->sessionRef.empty()
+                ? profile->sessionRef
+                : context->ueSupis[ueIndex] + ":" + sliceId + ":" + dnn;
+        const std::string policyFilter = profile != nullptr ? profile->policyFilter : "";
         const uint32_t serviceTypeId = profile != nullptr ? profile->serviceTypeId : 1;
         const uint32_t priority = profile != nullptr ? profile->priority : 0;
+        const uint32_t qosRef = profile != nullptr ? profile->qosRef : 0;
 
         totalThroughputDl += throughputDl;
         totalDelayMs += delayMs;
@@ -600,6 +934,7 @@ EmitSnapshot(SnapshotContext* context)
              << Quote("supi") << ":" << Quote(context->ueSupis[ueIndex]) << ","
                << Quote("app_id") << ":" << Quote(appId) << ","
                << Quote("app_name") << ":" << Quote(appName) << ","
+                             << Quote("session_ref") << ":" << Quote(sessionRef) << ","
              << Quote("src_gnb") << ":" << Quote("gnb-" + std::to_string(gnbIndex + 1)) << ","
              << Quote("dst_upf") << ":" << Quote(context->upfNames[upfIndex]) << ","
                << Quote("slice_id") << ":" << Quote(sliceId) << ","
@@ -612,12 +947,14 @@ EmitSnapshot(SnapshotContext* context)
              << Quote("queue_bytes") << ":0,"
                << Quote("rlc_buffer_bytes") << ":0,"
                << Quote("service") << ":{" << Quote("service_type") << ":" << Quote(serviceType) << ","
-               << Quote("service_type_id") << ":" << serviceTypeId << "},"
+               << Quote("service_type_id") << ":" << serviceTypeId << ","
+               << Quote("dnn") << ":" << Quote(dnn) << "},"
                << Quote("traffic") << ":{" << Quote("five_tuple") << ":{" << Quote("protocol") << ":"
-               << tuple.protocol << "," << Quote("source_ip") << ":" << Quote(ToString(tuple.sourceAddress)) << ","
+               << static_cast<uint32_t>(tuple.protocol) << "," << Quote("source_ip") << ":" << Quote(ToString(tuple.sourceAddress)) << ","
                << Quote("source_port") << ":" << tuple.sourcePort << "," << Quote("destination_ip") << ":"
                << Quote(ToString(tuple.destinationAddress)) << "," << Quote("destination_port") << ":"
                << tuple.destinationPort << "}," << Quote("packet_size") << ":" << packetSizeBytes << ","
+               << Quote("filter") << ":" << Quote(policyFilter) << ","
                << Quote("arrival_rate") << ":" << arrivalRatePps << "},"
                << Quote("sla") << ":{" << Quote("latency") << ":" << targetLatencyMs << ","
                << Quote("jitter") << ":" << targetJitterMs << "," << Quote("priority") << ":"
@@ -633,6 +970,7 @@ EmitSnapshot(SnapshotContext* context)
                << Quote("throughput_ul") << ":0},"
                << Quote("allocation") << ":{" << Quote("optimize_requested") << ":"
                << (optimizeRequested ? "true" : "false") << ","
+                             << Quote("qos_ref") << ":" << qosRef << ","
                << Quote("current_slice_snssai") << ":" << Quote(sliceSnssai) << ","
                << Quote("allocated_bandwidth_dl") << ":" << allocatedBandwidthDlMbps << ","
                << Quote("allocated_bandwidth_ul") << ":" << allocatedBandwidthUlMbps << "}}"
@@ -641,15 +979,19 @@ EmitSnapshot(SnapshotContext* context)
     json << "],";
 
     json << Quote("slices") << ":[";
-    for (uint32_t index = 0; index < context->sliceSds.size(); ++index)
+    for (uint32_t index = 0; index < context->sliceIds.size(); ++index)
     {
         if (index > 0)
         {
             json << ",";
         }
-        json << "{" << Quote("slice_id") << ":" << Quote("slice-1-" + context->sliceSds[index]) << ","
-             << Quote("sst") << ":1,"
-             << Quote("sd") << ":" << Quote(context->sliceSds[index]) << ","
+        const auto& sliceId = context->sliceIds[index];
+        uint32_t sst = 1;
+        std::string sd = context->sliceSds[index % context->sliceSds.size()];
+        ParseSliceId(sliceId, &sst, &sd);
+        json << "{" << Quote("slice_id") << ":" << Quote(sliceId) << ","
+             << Quote("sst") << ":" << sst << ","
+             << Quote("sd") << ":" << Quote(sd) << ","
              << Quote("label") << ":" << Quote("slice-" + std::to_string(index + 1)) << "}";
     }
     json << "],";
@@ -668,6 +1010,7 @@ EmitSnapshot(SnapshotContext* context)
 
     std::ofstream output(context->outputFile, std::ios::app);
     output << json.str() << std::endl;
+    WriteClockState(context);
 
     context->tickIndex++;
     const auto nextTick = Simulator::Now() + MilliSeconds(context->tickMs);
@@ -689,8 +1032,11 @@ main(int argc, char* argv[])
     uint32_t simTimeMs = 30000;
     std::string runId = "run-local";
     std::string scenarioId = "scenario-local";
+    std::string simulator = "RealtimeSimulatorImpl";
     std::string outputFile = "./tick-snapshots.jsonl";
+    std::string clockFile;
     std::string flowProfileFile;
+    uint32_t policyReloadMs = 1000;
     std::string upfNamesCsv = "upf";
     std::string sliceSdsCsv = "010203";
     std::string ueSupisCsv;
@@ -698,6 +1044,10 @@ main(int argc, char* argv[])
     std::string gnbUpfMapCsv;
     std::string gnbPositionsArg;
     std::string uePositionsArg;
+    std::string bridgeGnbTapsCsv;
+    std::string bridgeUpfTapsCsv;
+    double bridgeLinkRateMbps = 1000.0;
+    double bridgeLinkDelayMs = 1.0;
 
     CommandLine cmd(__FILE__);
     cmd.AddValue("gNbNum", "Number of gNBs", gNbNum);
@@ -707,8 +1057,11 @@ main(int argc, char* argv[])
     cmd.AddValue("simTimeMs", "Simulation time in milliseconds", simTimeMs);
     cmd.AddValue("runId", "Run identifier", runId);
     cmd.AddValue("scenarioId", "Scenario identifier", scenarioId);
+    cmd.AddValue("simulator", "Simulator implementation type", simulator);
     cmd.AddValue("outputFile", "Snapshot JSONL output path", outputFile);
+    cmd.AddValue("clockFile", "Clock state JSON output path", clockFile);
     cmd.AddValue("flowProfileFile", "TSV file describing scenario app/flow profiles", flowProfileFile);
+    cmd.AddValue("policyReloadMs", "How often to reload the flow profile TSV", policyReloadMs);
     cmd.AddValue("upfNames", "Comma separated UPF names", upfNamesCsv);
     cmd.AddValue("sliceSds", "Comma separated slice SD list", sliceSdsCsv);
     cmd.AddValue("ueSupis", "Comma separated UE SUPI list", ueSupisCsv);
@@ -716,10 +1069,25 @@ main(int argc, char* argv[])
     cmd.AddValue("gnbUpfMap", "Comma separated 1-based UPF index for each gNB", gnbUpfMapCsv);
     cmd.AddValue("gnbPositions", "Semicolon separated x:y:z gNB positions or auto", gnbPositionsArg);
     cmd.AddValue("uePositions", "Semicolon separated x:y:z UE positions or auto", uePositionsArg);
+    cmd.AddValue("bridgeGnbTaps", "Comma separated tap names attached to each gNB bridge", bridgeGnbTapsCsv);
+    cmd.AddValue("bridgeUpfTaps", "Comma separated tap names attached to each UPF bridge", bridgeUpfTapsCsv);
+    cmd.AddValue("bridgeLinkRateMbps", "Bridge link data rate in Mbps", bridgeLinkRateMbps);
+    cmd.AddValue("bridgeLinkDelayMs", "Bridge link delay in milliseconds", bridgeLinkDelayMs);
     cmd.Parse(argc, argv);
+
+    GlobalValue::Bind("SimulatorImplementationType", StringValue(NormalizeSimulatorType(simulator)));
+    GlobalValue::Bind("ChecksumEnabled", BooleanValue(true));
 
     std::filesystem::create_directories(std::filesystem::path(outputFile).parent_path());
     std::ofstream(outputFile, std::ios::trunc).close();
+    if (!clockFile.empty())
+    {
+        std::filesystem::path clockPath(clockFile);
+        if (!clockPath.parent_path().empty())
+        {
+            std::filesystem::create_directories(clockPath.parent_path());
+        }
+    }
 
     const uint32_t resolvedUeNum = ueNum > 0 ? ueNum : gNbNum * ueNumPerGnb;
     const auto upfNames = SplitCsv(upfNamesCsv);
@@ -751,11 +1119,15 @@ main(int argc, char* argv[])
         }
     }
 
+    const auto bridgeGnbTaps = ParseStringList(bridgeGnbTapsCsv, gNbNum, "bridgeGnbTaps");
+    const auto bridgeUpfTaps = ParseStringList(bridgeUpfTapsCsv, gNbNum, "bridgeUpfTaps");
+
     const auto gnbPositionOverrides = ParsePositionOverrides(gnbPositionsArg, gNbNum, "gnbPositions");
     const auto uePositionOverrides = ParsePositionOverrides(uePositionsArg, resolvedUeNum, "uePositions");
     const auto flowProfiles = LoadFlowProfiles(flowProfileFile);
     std::map<std::string, uint32_t> ueIndexBySupi;
     std::vector<std::string> ueSliceIds(resolvedUeNum);
+    std::vector<std::string> sliceIds;
     for (uint32_t index = 0; index < resolvedUeNum; ++index)
     {
         ueIndexBySupi[ueSupis[index]] = index;
@@ -771,6 +1143,18 @@ main(int argc, char* argv[])
         if (!profile.sliceRef.empty())
         {
             ueSliceIds[it->second] = profile.sliceRef;
+            AppendUniqueString(&sliceIds, profile.sliceRef);
+        }
+    }
+    for (const auto& sliceId : ueSliceIds)
+    {
+        AppendUniqueString(&sliceIds, sliceId);
+    }
+    if (sliceIds.empty())
+    {
+        for (const auto& sd : sliceSds)
+        {
+            AppendUniqueString(&sliceIds, "slice-1-" + sd);
         }
     }
 
@@ -839,6 +1223,33 @@ main(int argc, char* argv[])
     NetDeviceContainer ueNetDev =
         nrHelper->InstallUeDevice(gridScenario.GetUserTerminals(), allBwps);
 
+    if (!bridgeGnbTaps.empty() && !bridgeUpfTaps.empty())
+    {
+        NodeContainer gnbBridgeNodes;
+        gnbBridgeNodes.Create(gNbNum);
+        NodeContainer upfBridgeNodes;
+        upfBridgeNodes.Create(gNbNum);
+        CsmaHelper bridgeCsma;
+        bridgeCsma.SetChannelAttribute(
+            "DataRate",
+            DataRateValue(DataRate(static_cast<uint64_t>(std::max(1.0, bridgeLinkRateMbps) * 1e6))));
+        bridgeCsma.SetChannelAttribute("Delay",
+                                       TimeValue(Seconds(std::max(0.0, bridgeLinkDelayMs) / 1000.0)));
+        TapBridgeHelper tapBridge;
+        tapBridge.SetAttribute("Mode", StringValue("UseBridge"));
+        for (uint32_t index = 0; index < gNbNum; ++index)
+        {
+            NodeContainer pair;
+            pair.Add(gnbBridgeNodes.Get(index));
+            pair.Add(upfBridgeNodes.Get(index));
+            NetDeviceContainer devices = bridgeCsma.Install(pair);
+            tapBridge.SetAttribute("DeviceName", StringValue(bridgeGnbTaps[index]));
+            tapBridge.Install(pair.Get(0), devices.Get(0));
+            tapBridge.SetAttribute("DeviceName", StringValue(bridgeUpfTaps[index]));
+            tapBridge.Install(pair.Get(1), devices.Get(1));
+        }
+    }
+
     double x = std::pow(10, totalTxPower / 10.0);
     for (uint32_t index = 0; index < gnbNetDev.GetN(); ++index)
     {
@@ -859,7 +1270,7 @@ main(int argc, char* argv[])
 
     ApplicationContainer serverApps;
     ApplicationContainer clientApps;
-    std::map<uint16_t, FlowProfile> flowProfileByPort;
+    std::map<uint16_t, SnapshotContext::FlowRuntimeState> flowRuntimeByPort;
 
     if (!flowProfiles.empty())
     {
@@ -886,7 +1297,8 @@ main(int argc, char* argv[])
             client.SetAttribute(
                 "Remote",
                 AddressValue(addressUtils::ConvertToSocketAddress(ueIpIfaces.GetAddress(ueIndex), dlPort)));
-            clientApps.Add(client.Install(remoteHost));
+            ApplicationContainer installedClient = client.Install(remoteHost);
+            clientApps.Add(installedClient);
 
             NrEpsBearer bearer(NrEpsBearer::NGBR_LOW_LAT_EMBB);
             Ptr<NrEpcTft> tft = Create<NrEpcTft>();
@@ -895,7 +1307,12 @@ main(int argc, char* argv[])
             filter.localPortEnd = dlPort;
             tft->Add(filter);
             nrHelper->ActivateDedicatedEpsBearer(ueNetDev.Get(ueIndex), bearer, tft);
-            flowProfileByPort[dlPort] = profile;
+            flowRuntimeByPort[dlPort] = SnapshotContext::FlowRuntimeState{
+                profile,
+                DynamicCast<UdpClient>(installedClient.Get(0)),
+                dlPort,
+                ueIndex,
+            };
         }
     }
     else
@@ -913,7 +1330,8 @@ main(int argc, char* argv[])
             client.SetAttribute(
                 "Remote",
                 AddressValue(addressUtils::ConvertToSocketAddress(ueIpIfaces.GetAddress(index), dlPort)));
-            clientApps.Add(client.Install(remoteHost));
+            ApplicationContainer installedClient = client.Install(remoteHost);
+            clientApps.Add(installedClient);
 
             NrEpsBearer bearer(NrEpsBearer::NGBR_LOW_LAT_EMBB);
             Ptr<NrEpcTft> tft = Create<NrEpcTft>();
@@ -945,11 +1363,16 @@ main(int argc, char* argv[])
     context.runId = runId;
     context.scenarioId = scenarioId;
     context.outputFile = outputFile;
+    context.clockFile = clockFile;
+    context.flowProfileFile = flowProfileFile;
     context.tickMs = tickMs;
+    context.policyReloadMs = policyReloadMs;
     context.gNbNum = gNbNum;
     context.ueNum = resolvedUeNum;
+    context.bridgeLinkRateMbps = bridgeLinkRateMbps;
     context.upfNames = upfNames;
     context.sliceSds = sliceSds;
+    context.sliceIds = sliceIds;
     context.ueSliceIds = ueSliceIds;
     context.gnbToUpf.reserve(gnbToUpf.size());
     for (const auto value : gnbToUpf)
@@ -960,7 +1383,7 @@ main(int argc, char* argv[])
     context.classifier = classifier;
     context.appStartTime = appStartTime;
     context.simTime = simTime;
-    context.flowProfileByPort = flowProfileByPort;
+    context.flowRuntimeByPort = flowRuntimeByPort;
 
     for (uint32_t index = 0; index < resolvedUeNum; ++index)
     {
@@ -969,6 +1392,8 @@ main(int argc, char* argv[])
         context.ueSupis.push_back(ueSupis[index]);
         context.uePorts.push_back(static_cast<uint16_t>(5000 + index));
     }
+
+    ApplySlaDrivenAllocations(&context);
 
     Simulator::Schedule(MilliSeconds(tickMs), &EmitSnapshot, &context);
     Simulator::Stop(simTime);
