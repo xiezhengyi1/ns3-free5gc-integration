@@ -247,11 +247,32 @@ def _build_semantic_graph_payload(graph_summary: dict[str, Any]) -> dict[str, An
             else:
                 continue
             slice_ref_by_key[node_key] = slice_ref
-            slice_payloads[slice_ref] = {
+            slice_payload = {
                 "sst": sst,
                 "sd": sd,
                 "label": _string(properties.get("name"), label),
             }
+            capacity = dict(properties.get("capacity", {})) if isinstance(properties.get("capacity"), dict) else {}
+            if capacity:
+                resource_payload = {
+                    "capacity_dl_mbps": _maybe_float(capacity.get("capacity_dl_mbps") or capacity.get("total_bandwidth_dl")),
+                    "capacity_ul_mbps": _maybe_float(capacity.get("capacity_ul_mbps") or capacity.get("total_bandwidth_ul")),
+                    "guaranteed_dl_mbps": _maybe_float(
+                        capacity.get("guaranteed_dl_mbps") or capacity.get("reserved_bandwidth_dl")
+                    ),
+                    "guaranteed_ul_mbps": _maybe_float(
+                        capacity.get("guaranteed_ul_mbps") or capacity.get("reserved_bandwidth_ul")
+                    ),
+                    "priority": _maybe_int(capacity.get("priority")) or 1,
+                }
+                if all(resource_payload[key] is not None for key in (
+                    "capacity_dl_mbps",
+                    "capacity_ul_mbps",
+                    "guaranteed_dl_mbps",
+                    "guaranteed_ul_mbps",
+                )):
+                    slice_payload["resource"] = resource_payload
+            slice_payloads[slice_ref] = slice_payload
             continue
 
         if node_type == "core_node":

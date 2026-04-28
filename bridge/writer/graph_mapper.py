@@ -149,7 +149,12 @@ def _flow_service_properties(flow: FlowRecord) -> dict[str, object]:
 
 
 def _flow_traffic_properties(flow: FlowRecord) -> dict[str, object]:
-    return _dict_properties(flow.traffic)
+    properties = _dict_properties(flow.traffic)
+    if isinstance(properties.get("five_tuple"), dict):
+        properties.setdefault("direction", "downlink")
+        properties.setdefault("source_entity", "ns3_remote_host")
+        properties.setdefault("destination_entity", "ue_pdu_ip")
+    return properties
 
 
 def _flow_dnn(flow: FlowRecord) -> str | None:
@@ -279,11 +284,18 @@ def is_graph_row_deleted(row: dict[str, object]) -> bool:
 def _canonical_node_row(row: dict[str, object] | None) -> dict[str, object] | None:
     if row is None:
         return None
+    properties = _normalized_properties(row.get("properties"))
+    if row["node_type"] == "slice":
+        properties = {
+            key: value
+            for key, value in properties.items()
+            if key not in {"capacity", "load", "qos", "telemetry"}
+        }
     return {
         "node_key": row["node_key"],
         "node_type": row["node_type"],
         "label": row.get("label"),
-        "properties": _normalized_properties(row.get("properties")),
+        "properties": properties,
     }
 
 
@@ -740,6 +752,14 @@ def build_graph_snapshot_bundle(
                 _dict_properties(summary_flow_properties.get("telemetry")),
                 created_at,
             )
+            _append_nested_numeric_metrics(
+                metric_rows,
+                snapshot_id,
+                flow_key,
+                "allocation",
+                _dict_properties(summary_flow_properties.get("allocation")),
+                created_at,
+            )
             add_edge("contains_flow", app_key, flow_key, {"app_id": app_id})
             add_edge("served_by_slice", flow_key, slice_node_key, {"slice": slice_node_key.split(":", 1)[1]})
 
@@ -797,15 +817,18 @@ def build_graph_snapshot_bundle(
                     telemetry_jitter.append(telemetry_jitter_value)
                 if telemetry_loss_value is not None:
                     telemetry_loss.append(telemetry_loss_value)
+        slice_resource = _dict_properties(slice_record.resource)
         slice_capacity = {
-            "total_bandwidth_dl": total_bandwidth_dl,
-            "total_bandwidth_ul": total_bandwidth_ul,
-            "reserved_bandwidth_dl": reserved_bandwidth_dl,
-            "reserved_bandwidth_ul": reserved_bandwidth_ul,
+            "total_bandwidth_dl": slice_resource.get("capacity_dl_mbps", total_bandwidth_dl),
+            "total_bandwidth_ul": slice_resource.get("capacity_ul_mbps", total_bandwidth_ul),
+            "reserved_bandwidth_dl": slice_resource.get("guaranteed_dl_mbps", reserved_bandwidth_dl),
+            "reserved_bandwidth_ul": slice_resource.get("guaranteed_ul_mbps", reserved_bandwidth_ul),
         }
         slice_load = {
-            "current_bandwidth_dl": current_bandwidth_dl,
-            "current_bandwidth_ul": current_bandwidth_ul,
+            "current_bandwidth_dl": _dict_properties(slice_record.telemetry).get("allocated_dl_mbps", current_bandwidth_dl),
+            "current_bandwidth_ul": _dict_properties(slice_record.telemetry).get("allocated_ul_mbps", current_bandwidth_ul),
+            "demand_bandwidth_dl": _dict_properties(slice_record.telemetry).get("demand_dl_mbps"),
+            "demand_bandwidth_ul": _dict_properties(slice_record.telemetry).get("demand_ul_mbps"),
         }
         slice_qos = {
             "latency": _average(latency_targets),
@@ -830,6 +853,10 @@ def build_graph_snapshot_bundle(
             "utilization_dl": utilization_dl,
             "utilization_ul": utilization_ul,
         }
+        slice_telemetry.update(_dict_properties(slice_record.telemetry))
+        properties["capacity"] = slice_capacity
+        properties["load"] = slice_load
+        properties["telemetry"] = slice_telemetry
         summary_properties["capacity"] = slice_capacity
         summary_properties["load"] = slice_load
         summary_properties["qos"] = slice_qos

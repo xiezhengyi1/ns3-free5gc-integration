@@ -27,6 +27,7 @@ _PDU_SESSION_TYPE_MAP = {
     "ethernet": "ETHERNET",
 }
 _LOCAL_ONLY_PAYLOAD_KEYS = {"LocalPolicyData"}
+_WEBUI_OPENER = request.build_opener(request.ProxyHandler({}))
 
 
 @dataclass(slots=True)
@@ -91,7 +92,7 @@ def _normalize_pdu_session_type(session_type: str) -> str:
     return _PDU_SESSION_TYPE_MAP[normalized]
 
 
-def _build_dnn_configuration(session: SessionConfig) -> dict[str, object]:
+def _build_dnn_configuration(session: SessionConfig, downlink_ambr: str, uplink_ambr: str) -> dict[str, object]:
     session_type = _normalize_pdu_session_type(session.session_type)
     return {
         "pduSessionTypes": {
@@ -103,8 +104,8 @@ def _build_dnn_configuration(session: SessionConfig) -> dict[str, object]:
             "allowedSscModes": ["SSC_MODE_1"],
         },
         "sessionAmbr": {
-            "downlink": _DEFAULT_AMBR,
-            "uplink": _DEFAULT_AMBR,
+            "downlink": downlink_ambr,
+            "uplink": uplink_ambr,
         },
         "5gQosProfile": {
             "5qi": session.five_qi,
@@ -301,10 +302,29 @@ def build_subscriber_payload(
     for slice_ref in ordered_slice_refs:
         slice_config = slice_map[slice_ref]
         snssai_key = _snssai_key(slice_config.sst, slice_config.sd)
-        dnn_configurations = {
-            apn: _build_dnn_configuration(session)
-            for apn, session in sessions_by_slice[slice_ref].items()
-        }
+        dnn_configurations = {}
+        for apn, session in sessions_by_slice[slice_ref].items():
+            session_flows = [
+                flow
+                for flow in ue_flows
+                if _resolve_flow_session(scenario, ue, flow).session_ref == session.session_ref
+            ]
+            downlink_mbps = sum(
+                flow.sla_target.bandwidth_dl_mbps or flow.allocated_bandwidth_dl_mbps or 0.0
+                for flow in session_flows
+            )
+            uplink_mbps = sum(
+                flow.sla_target.bandwidth_ul_mbps or flow.allocated_bandwidth_ul_mbps or 0.0
+                for flow in session_flows
+            )
+            if slice_config.resource is not None:
+                downlink_mbps = min(downlink_mbps, slice_config.resource.capacity_dl_mbps)
+                uplink_mbps = min(uplink_mbps, slice_config.resource.capacity_ul_mbps)
+            dnn_configurations[apn] = _build_dnn_configuration(
+                session,
+                _format_bandwidth_string(downlink_mbps) or _DEFAULT_AMBR,
+                _format_bandwidth_string(uplink_mbps) or _DEFAULT_AMBR,
+            )
         sm_data.append(
             {
                 "singleNssai": {
@@ -499,7 +519,8 @@ def _put_subscriber(base_url: str, payload: dict[str, object]) -> int:
         headers={"Content-Type": "application/json"},
         method="PUT",
     )
-    with request.urlopen(http_request, timeout=10) as response:
+    # Ignore host HTTP(S) proxy settings; WebUI is expected to be local to the run.
+    with _WEBUI_OPENER.open(http_request, timeout=10) as response:
         return response.status
 
 

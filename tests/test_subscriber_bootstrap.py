@@ -11,6 +11,7 @@ from unittest import mock
 from adapters.free5gc_ueransim.compose_override import render_compose_for_run
 from adapters.free5gc_ueransim.subscriber_bootstrap import (
     _sanitize_payload_for_webui,
+    _put_subscriber,
     build_subscriber_payload,
     render_subscriber_bootstrap_assets,
     upsert_subscriber_payloads,
@@ -116,6 +117,19 @@ class SubscriberBootstrapTest(unittest.TestCase):
             self.assertEqual(results[0]["attempts"], 2)
         finally:
             shutil.rmtree(root, ignore_errors=True)
+
+    def test_put_subscriber_ignores_host_proxy_settings(self) -> None:
+        opener = mock.MagicMock()
+        opener.open.return_value.__enter__.return_value.status = 204
+
+        with mock.patch("adapters.free5gc_ueransim.subscriber_bootstrap._WEBUI_OPENER", opener):
+            status = _put_subscriber(
+                "http://127.0.0.1:5000",
+                {"ueId": "imsi-208930000000001", "plmnID": "20893"},
+            )
+
+        self.assertEqual(status, 204)
+        opener.open.assert_called_once()
 
     def test_renders_local_flow_and_sla_payloads_for_semantic_graph(self) -> None:
         payload = {

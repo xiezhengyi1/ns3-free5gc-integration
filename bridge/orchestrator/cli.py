@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import signal
 import subprocess
+import time
 from pathlib import Path
 
 from bridge.common.ids import generate_run_id
@@ -35,28 +38,92 @@ def _start_run(args: argparse.Namespace) -> int:
             if args.dry_run:
                 print(json.dumps(command, ensure_ascii=False))
                 continue
+            child_env = os.environ.copy()
+            child_env.update(command.get("env", {}) or {})
+            stream_output = _should_stream_command(command)
             if command.get("background"):
                 process = subprocess.Popen(
                     command["argv"],
                     cwd=command["cwd"],
-                    env={**command.get("env", {})} or None,
+                    env=child_env,
                     text=True,
+                    start_new_session=True,
+                    stdout=None if stream_output else subprocess.DEVNULL,
+                    stderr=None if stream_output else subprocess.DEVNULL,
                 )
                 processes.append(process)
-                print(f"started background command {command['name']} pid={process.pid}")
             else:
-                subprocess.run(
-                    command["argv"],
-                    cwd=command["cwd"],
-                    env={**command.get("env", {})} or None,
-                    check=True,
-                    text=True,
-                )
+                _run_command(command, child_env, stream_output=stream_output)
         return 0
+    except BaseException:
+        _terminate_background_processes(processes)
+        raise
     finally:
         if args.wait_background:
             for process in processes:
                 process.wait()
+
+
+def _run_command(command: dict[str, object], child_env: dict[str, str], *, stream_output: bool) -> None:
+    argv = command["argv"]
+    cwd = command["cwd"]
+    retries = 3 if _is_retryable_compose_up(argv) else 1
+    last_error: subprocess.CalledProcessError | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            subprocess.run(
+                argv,
+                cwd=cwd,
+                env=child_env,
+                check=True,
+                text=True,
+                stdout=None if stream_output else subprocess.DEVNULL,
+                stderr=None if stream_output else subprocess.DEVNULL,
+            )
+            return
+        except subprocess.CalledProcessError as exc:
+            last_error = exc
+            message = str(exc)
+            if attempt >= retries or not _is_retryable_compose_failure(message):
+                raise
+            time.sleep(2)
+    if last_error is not None:
+        raise last_error
+
+
+def _is_retryable_compose_up(argv: object) -> bool:
+    return (
+        isinstance(argv, list)
+        and len(argv) >= 6
+        and argv[:2] == ["docker", "compose"]
+        and "up" in argv
+    )
+
+
+def _is_retryable_compose_failure(message: str) -> bool:
+    return "already in progress" in message or "No such container" in message
+
+
+def _should_stream_command(command: dict[str, object]) -> bool:
+    return str(command.get("name") or "") == "policy-acceptor"
+
+
+def _terminate_background_processes(processes: list[subprocess.Popen[str]]) -> None:
+    active = [process for process in processes if process.poll() is None]
+    for process in active:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+    deadline = time.time() + 5
+    while active and time.time() < deadline:
+        active = [process for process in active if process.poll() is None]
+        time.sleep(0.1)
+    for process in active:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            continue
 
 
 def build_parser() -> argparse.ArgumentParser:

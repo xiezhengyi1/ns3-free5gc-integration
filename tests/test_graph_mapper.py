@@ -13,7 +13,17 @@ from tests.test_schema import build_payload
 
 class GraphMapperTest(unittest.TestCase):
     def test_graph_bundle_contains_flow_slice_and_app_nodes(self) -> None:
-        snapshot = TickSnapshot.from_dict(build_payload())
+        payload = build_payload()
+        payload["flows"][0]["traffic"] = {
+            "five_tuple": {
+                "protocol": 17,
+                "source_ip": "1.0.0.2",
+                "source_port": 49153,
+                "destination_ip": "10.60.0.1",
+                "destination_port": 5000,
+            }
+        }
+        snapshot = TickSnapshot.from_dict(payload)
         bundle = build_graph_snapshot_bundle(snapshot, trigger_event="sim_tick:test:0")
 
         node_keys = {row["node_key"] for row in bundle.node_rows}
@@ -47,9 +57,38 @@ class GraphMapperTest(unittest.TestCase):
             summary_nodes["flow:imsi-208930000000001:app-1:flow-1"]["properties"]["telemetry"]["throughput_dl"],
             10.5,
         )
+        self.assertEqual(
+            summary_nodes["flow:imsi-208930000000001:app-1:flow-1"]["properties"]["traffic"]["direction"],
+            "downlink",
+        )
         self.assertIn("nodes", bundle.snapshot_row["graph_summary"])
         self.assertIn("edges", bundle.snapshot_row["graph_summary"])
         self.assertIn("metrics", bundle.snapshot_row["graph_summary"])
+
+    def test_graph_bundle_preserves_uplink_real_flow_direction(self) -> None:
+        payload = build_payload()
+        payload["flows"][0]["traffic"] = {
+            "five_tuple": {
+                "protocol": 17,
+                "source_ip": "ue_pdu_ip",
+                "source_port": 15000,
+                "destination_ip": "8.8.8.8",
+                "destination_port": 5000,
+            },
+            "direction": "uplink",
+            "source_entity": "ue_pdu_ip",
+            "destination_entity": "external_data_network",
+        }
+        bundle = build_graph_snapshot_bundle(TickSnapshot.from_dict(payload))
+        summary_nodes = {
+            row["node_key"]: row
+            for row in bundle.snapshot_row["graph_summary"]["nodes"]
+        }
+
+        traffic = summary_nodes["flow:imsi-208930000000001:app-1:flow-1"]["properties"]["traffic"]
+        self.assertEqual(traffic["direction"], "uplink")
+        self.assertEqual(traffic["source_entity"], "ue_pdu_ip")
+        self.assertEqual(traffic["destination_entity"], "external_data_network")
 
     def test_graph_bundle_contains_explicit_session_nodes_for_multi_slice_flows(self) -> None:
         payload = build_payload()

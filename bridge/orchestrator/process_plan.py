@@ -32,6 +32,7 @@ class RunManifest:
     snapshot_file: str
     clock_file: str
     ns3_flow_profile_file: str
+    ns3_slice_resource_file: str
     state_db: str
     archive_dir: str
     ns3_source_file: str
@@ -58,6 +59,7 @@ def build_run_manifest(
     snapshot_file: Path,
     clock_file: Path,
     flow_profile_file: Path,
+    slice_resource_file: Path,
     state_db: Path,
     archive_dir: Path,
     service_map: dict[str, dict[str, str]],
@@ -67,6 +69,8 @@ def build_run_manifest(
     free5gc_webui_url: str,
     resolved_topology: ResolvedScenarioTopology,
 ) -> RunManifest:
+    python_executable = project_root / ".venv" / "bin" / "python3"
+    python_command = str(python_executable) if python_executable.exists() else "python3"
     compose_base_argv = [
         "docker",
         "compose",
@@ -108,13 +112,20 @@ def build_run_manifest(
         CommandSpec(
             name="compose-up-core",
             cwd=str(project_root),
-            argv=[*compose_base_argv, "up", "-d", *core_services],
+            argv=[
+                *compose_base_argv,
+                "up",
+                "-d",
+                "--force-recreate",
+                "--remove-orphans",
+                *core_services,
+            ],
         ),
         CommandSpec(
             name="writer-follow-free5gc",
             cwd=str(project_root),
             argv=[
-                "python3",
+                python_command,
                 "-m",
                 "bridge.writer.cli",
                 "follow-compose-logs",
@@ -145,7 +156,7 @@ def build_run_manifest(
             name="bootstrap-subscribers",
             cwd=str(project_root),
             argv=[
-                "python3",
+                python_command,
                 "-m",
                 "adapters.free5gc_ueransim.subscriber_bootstrap",
                 "--base-url",
@@ -157,16 +168,43 @@ def build_run_manifest(
                 *[str(path) for path in subscriber_payloads],
             ],
         ),
+        *(
+            [
+                CommandSpec(
+                    name="bootstrap-app-data",
+                    cwd=str(project_root),
+                    argv=[
+                        python_command,
+                        str(project_root / "scripts" / "bootstrap_app_data.py"),
+                        "--uerouting-file",
+                        str(run_dir / "generated" / "config" / "uerouting.yaml"),
+                        "--mongo-container",
+                        "mongodb",
+                        "--database",
+                        "free5gc",
+                    ],
+                )
+            ]
+            if scenario.free5gc.mode == "ulcl"
+            else []
+        ),
         CommandSpec(
             name="compose-up-ran",
             cwd=str(project_root),
-            argv=[*compose_base_argv, "up", "-d", *ran_services],
+            argv=[
+                *compose_base_argv,
+                "up",
+                "-d",
+                "--force-recreate",
+                "--remove-orphans",
+                *ran_services,
+            ],
         ),
         CommandSpec(
             name="writer-follow-ueransim",
             cwd=str(project_root),
             argv=[
-                "python3",
+                python_command,
                 "-m",
                 "bridge.writer.cli",
                 "follow-compose-logs",
@@ -193,11 +231,56 @@ def build_run_manifest(
             ] + [item for service in ran_services for item in ("--service", service)],
             background=True,
         ),
+        *(
+            [
+                CommandSpec(
+                    name="real-ue-flows",
+                    cwd=str(project_root),
+                    argv=[
+                        python_command,
+                        str(project_root / "scripts" / "run_real_ue_flows.py"),
+                        "--flow-profile-file",
+                        str(flow_profile_file),
+                        "--clock-file",
+                        str(clock_file),
+                        "--state-file",
+                        str(clock_file.parent / "real-ue-flows.jsonl"),
+                        "--run-id",
+                        run_id,
+                        "--scenario-id",
+                        scenario.scenario_id,
+                        "--target-ip",
+                        "8.8.8.8",
+                        "--base-port",
+                        "5000",
+                        "--source-base-port",
+                        "15000",
+                        "--tick-ms",
+                        str(scenario.tick_ms),
+                        *[
+                            item
+                            for container in (
+                                upf.name if scenario.free5gc.mode == "ulcl" else service_map["upf"][upf.name]
+                                for upf in scenario.upfs
+                            )
+                            for item in ("--upf-container", container)
+                        ],
+                        *[
+                            f"{ue.name}={service_map['ue'][ue.name]}"
+                            for ue in scenario.ues
+                        ],
+                    ],
+                    background=True,
+                )
+            ]
+            if scenario.bridge.enable_inline_harness
+            else []
+        ),
         CommandSpec(
             name="writer-follow-ns3",
             cwd=str(project_root),
             argv=[
-                "python3",
+                python_command,
                 "-m",
                 "bridge.writer.cli",
                 "follow-jsonl",
@@ -210,9 +293,35 @@ def build_run_manifest(
             background=True,
         ),
         CommandSpec(
+            name="policy-acceptor",
+            cwd=str(project_root),
+            argv=[
+                "bash",
+                str(project_root / "scripts" / "run_policy_acceptor.sh"),
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "18080",
+                "--flow-profile-file",
+                str(flow_profile_file),
+                "--latest-snapshot-file",
+                str(archive_dir / run_id / "latest.json"),
+                "--state-file",
+                str(run_dir / "state" / "policy-acceptor-state.json"),
+                "--upstream-pcf-host",
+                "10.100.200.20",
+                "--upstream-pcf-port",
+                "8000",
+                "--default-timeout-ms",
+                "30000",
+            ],
+            background=True,
+        ),
+        CommandSpec(
             name="ns3-build",
             cwd=str(project_root),
             argv=["bash", str(project_root / "scripts" / "build_ns3_twin.sh")],
+            env={"NS3_ROOT": scenario.ns3.ns3_root},
         ),
         CommandSpec(
             name="ns3-run",
@@ -242,6 +351,8 @@ def build_run_manifest(
                 str(clock_file),
                 "--flow-profile-file",
                 str(flow_profile_file),
+                "--slice-resource-file",
+                str(slice_resource_file),
                 "--policy-reload-ms",
                 str(scenario.ns3.policy_reload_ms),
                 "--upf-names",
@@ -259,6 +370,7 @@ def build_run_manifest(
                 "--ue-positions",
                 ue_positions,
             ],
+            env={"NS3_ROOT": scenario.ns3.ns3_root},
         ),
         CommandSpec(
             name="compose-down",
@@ -278,9 +390,22 @@ def build_run_manifest(
                 str(scenario.ns3.bridge_link_rate_mbps),
                 "--bridge-link-delay-ms",
                 str(scenario.ns3.bridge_link_delay_ms),
+                "--external-traffic-only",
+                "--external-traffic-target-ip",
+                "8.8.8.8",
+                "--external-traffic-source-base-port",
+                "15000",
             ]
         )
     if scenario.bridge.enable_inline_harness:
+        next(command for command in commands if command.name == "writer-follow-ns3").argv.extend(
+            [
+                "--real-traffic-state-file",
+                str(clock_file.parent / "real-ue-flows.jsonl"),
+                "--real-traffic-timeout-seconds",
+                "15",
+            ]
+        )
         compose_up_ran_index = next(
             index for index, command in enumerate(commands) if command.name == "compose-up-ran"
         )
@@ -311,7 +436,14 @@ def build_run_manifest(
     if scenario.writer.graph_db_url:
         next(
             command for command in commands if command.name == "writer-follow-ns3"
-        ).argv.extend(["--graph-db-url", scenario.writer.graph_db_url])
+        ).argv.extend(
+            [
+                "--graph-db-url",
+                scenario.writer.graph_db_url,
+                "--live-graph-snapshot-id",
+                f"live-{scenario.scenario_id}",
+            ]
+        )
     if resolved_topology.source_graph_file:
         next(
             command for command in commands if command.name == "writer-follow-ns3"
@@ -329,6 +461,7 @@ def build_run_manifest(
         snapshot_file=str(snapshot_file),
         clock_file=str(clock_file),
         ns3_flow_profile_file=str(flow_profile_file),
+        ns3_slice_resource_file=str(slice_resource_file),
         state_db=str(state_db),
         archive_dir=str(archive_dir),
         ns3_source_file=str(project_root / "sim" / "ns3" / "nr_multignb_multiupf.cc"),

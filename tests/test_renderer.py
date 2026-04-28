@@ -10,6 +10,7 @@ import yaml
 
 from adapters.free5gc_ueransim.compose_override import (
     AMF_CONTROL_IP,
+    PCF_CONTROL_IP,
     SMF_CONTROL_IP,
     UPF_CONTROL_IP,
     gnb_service_ip,
@@ -46,6 +47,7 @@ class RendererTest(unittest.TestCase):
 
             command_names = [item["name"] for item in manifest["commands"]]
             self.assertLess(command_names.index("compose-up-ran"), command_names.index("bridge-setup"))
+            self.assertIn("policy-acceptor", command_names)
 
             ns3_run = next(item for item in manifest["commands"] if item["name"] == "ns3-run")
             self.assertIn("--bridge-gnb-taps", ns3_run["argv"])
@@ -56,6 +58,16 @@ class RendererTest(unittest.TestCase):
             self.assertIn("250.0", ns3_run["argv"])
             self.assertIn("--bridge-link-delay-ms", ns3_run["argv"])
             self.assertIn("2.0", ns3_run["argv"])
+
+            policy_acceptor = next(item for item in manifest["commands"] if item["name"] == "policy-acceptor")
+            self.assertEqual(policy_acceptor["argv"][:2], ["bash", str(PROJECT_ROOT / "scripts" / "run_policy_acceptor.sh")])
+            self.assertIn("--flow-profile-file", policy_acceptor["argv"])
+            self.assertIn(manifest["ns3_flow_profile_file"], policy_acceptor["argv"])
+            self.assertIn("--latest-snapshot-file", policy_acceptor["argv"])
+            self.assertIn(str(Path(manifest["archive_dir"]) / manifest["run_id"] / "latest.json"), policy_acceptor["argv"])
+            self.assertIn("--upstream-pcf-host", policy_acceptor["argv"])
+            self.assertIn(PCF_CONTROL_IP, policy_acceptor["argv"])
+            self.assertIn("--default-timeout-ms", policy_acceptor["argv"])
 
             self.assertEqual(gnb_payload["gtpIp"], gnb_service_ip(1))
             self.assertEqual(gnb_payload["linkIp"], gnb_service_ip(1))
@@ -82,6 +94,7 @@ class RendererTest(unittest.TestCase):
             self.assertTrue((rendered.config_dir / "gnb1-gnbcfg.yaml").exists())
             self.assertTrue((rendered.config_dir / "ue1-uecfg.yaml").exists())
             self.assertTrue((rendered.config_dir / "amfcfg.yaml").exists())
+            self.assertTrue((rendered.config_dir / "nrfcfg.yaml").exists())
             self.assertTrue((rendered.config_dir / "nssfcfg.yaml").exists())
             self.assertTrue((rendered.config_dir / "smfcfg.yaml").exists())
             self.assertTrue((rendered.config_dir / "upfcfg.yaml").exists())
@@ -89,6 +102,7 @@ class RendererTest(unittest.TestCase):
             manifest = json.loads((rendered.run_dir / "run-manifest.json").read_text(encoding="utf-8"))
             compose_payload = yaml.safe_load(rendered.compose_file.read_text(encoding="utf-8"))
             amf_payload = yaml.safe_load((rendered.config_dir / "amfcfg.yaml").read_text(encoding="utf-8"))
+            nrf_payload = yaml.safe_load((rendered.config_dir / "nrfcfg.yaml").read_text(encoding="utf-8"))
             nssf_payload = yaml.safe_load((rendered.config_dir / "nssfcfg.yaml").read_text(encoding="utf-8"))
             gnb_payload = yaml.safe_load((rendered.config_dir / "gnb1-gnbcfg.yaml").read_text(encoding="utf-8"))
             ue_payload = yaml.safe_load((rendered.config_dir / "ue1-uecfg.yaml").read_text(encoding="utf-8"))
@@ -108,6 +122,8 @@ class RendererTest(unittest.TestCase):
                 "postgresql://postgres:123456@localhost:5433/multiagents_db",
                 writer_command["argv"],
             )
+            self.assertIn("--live-graph-snapshot-id", writer_command["argv"])
+            self.assertIn(f"live-{scenario.scenario_id}", writer_command["argv"])
             self.assertEqual(manifest["clock_file"], str(rendered.generated_dir / "ns3" / "ns3-clock.json"))
             free5gc_follow = next(item for item in manifest["commands"] if item["name"] == "writer-follow-free5gc")
             self.assertIn("--clock-file", free5gc_follow["argv"])
@@ -121,12 +137,17 @@ class RendererTest(unittest.TestCase):
             compose_up_ran = next(item for item in manifest["commands"] if item["name"] == "compose-up-ran")
             self.assertIn("-p", compose_up_core["argv"])
             self.assertIn("nrint", compose_up_core["argv"])
+            self.assertIn("--force-recreate", compose_up_core["argv"])
+            self.assertIn("--remove-orphans", compose_up_core["argv"])
+            self.assertIn("--force-recreate", compose_up_ran["argv"])
+            self.assertIn("--remove-orphans", compose_up_ran["argv"])
             self.assertIn("ueransim", compose_up_ran["argv"])
             self.assertIn("ue-ue1", compose_up_ran["argv"])
             self.assertEqual(manifest["free5gc_webui_url"], "http://127.0.0.1:5000")
             self.assertEqual(gnb_payload["ngapIp"], gnb_service_ip(1))
             self.assertEqual(gnb_payload["gtpIp"], gnb_service_ip(1))
             self.assertEqual(gnb_payload["amfConfigs"][0]["address"], AMF_CONTROL_IP)
+            self.assertFalse(nrf_payload["configuration"]["sbi"]["oauth"])
             self.assertEqual(amf_payload["configuration"]["ngapIpList"], [AMF_CONTROL_IP])
             self.assertEqual(amf_payload["configuration"]["supportTaiList"][0]["tac"], "000001")
             self.assertEqual(
@@ -181,6 +202,14 @@ class RendererTest(unittest.TestCase):
             self.assertEqual(
                 compose_payload["services"]["free5gc-amf"]["volumes"][0],
                 f"{rendered.config_dir / 'amfcfg.yaml'}:/free5gc/config/amfcfg.yaml",
+            )
+            self.assertEqual(
+                compose_payload["services"]["free5gc-nrf"]["volumes"][0],
+                f"{rendered.config_dir / 'nrfcfg.yaml'}:/free5gc/config/nrfcfg.yaml",
+            )
+            self.assertEqual(
+                compose_payload["services"]["free5gc-pcf"]["networks"]["privnet"]["ipv4_address"],
+                PCF_CONTROL_IP,
             )
             self.assertEqual(
                 compose_payload["services"]["free5gc-upf"]["networks"]["privnet"]["ipv4_address"],
@@ -258,6 +287,8 @@ class RendererTest(unittest.TestCase):
             self.assertEqual(manifest["ran_services"], ["ueransim", "ue-ue1"])
             writer_command = next(item for item in manifest["commands"] if item["name"] == "writer-follow-ns3")
             self.assertIn("postgresql://postgres:123456@localhost:5433/multiagents_db", writer_command["argv"])
+            self.assertIn("--live-graph-snapshot-id", writer_command["argv"])
+            self.assertIn(f"live-{scenario.scenario_id}", writer_command["argv"])
             ns3_run = next(item for item in manifest["commands"] if item["name"] == "ns3-run")
             self.assertIn("--simulator", ns3_run["argv"])
             self.assertIn("--clock-file", ns3_run["argv"])

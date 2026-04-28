@@ -126,6 +126,20 @@ def _render_amf_config(scenario: ScenarioConfig, config_dir: Path) -> None:
     _yaml_dump(config_dir / "amfcfg.yaml", payload)
 
 
+def _render_nrf_config(scenario: ScenarioConfig, config_dir: Path) -> None:
+    payload = _yaml_load(Path(scenario.free5gc.config_root) / "nrfcfg.yaml")
+    configuration = payload.get("configuration")
+    if not isinstance(configuration, dict):
+        raise ValueError("nrfcfg.yaml must define configuration")
+
+    sbi = configuration.get("sbi")
+    if isinstance(sbi, dict):
+        # Real-flow startup should not depend on external OAuth bootstrap.
+        sbi["oauth"] = False
+
+    _yaml_dump(config_dir / "nrfcfg.yaml", payload)
+
+
 def _render_nssf_config(scenario: ScenarioConfig, config_dir: Path) -> None:
     payload = _yaml_load(Path(scenario.free5gc.config_root) / "nssfcfg.yaml")
     configuration = payload.get("configuration")
@@ -319,10 +333,7 @@ def _render_ulcl_smf_config(
 ) -> None:
     slice_apn_map = _scenario_slice_apns(scenario)
     all_apns = sorted({apn for slice_apns in slice_apn_map.values() for apn in slice_apns})
-    slice_pool_map = {
-        slice_config.slice_id: _dnn_pool(index)
-        for index, slice_config in enumerate(scenario.slices)
-    }
+    slice_count = len(scenario.slices)
     replacements = {
         "smf.free5gc.org": SMF_CONTROL_IP,
         "gnb.free5gc.org": gnb_service_ip(1),
@@ -409,11 +420,14 @@ def _render_ulcl_smf_config(
         gnb_node_names[gnb.name] = node_name
 
     upf_node_names: dict[str, str] = {}
+    branching_upf_node_names: list[str] = []
+    anchor_upf_node_names: list[str] = []
     for index, upf in enumerate(scenario.upfs, start=1):
         node_name = _ulcl_upnode_name(upf.name, upf.role, used_node_names)
         template_payload = deepcopy(template_upf_nodes.get(node_name, {}))
         if not template_payload:
-            template_payload = {"type": "UPF"}
+            template_key = "I-UPF" if "branch" in upf.role.lower() else "PSA-UPF"
+            template_payload = deepcopy(template_upf_nodes.get(template_key, {"type": "UPF"}))
         template_payload["nodeID"] = upf_service_ip(index)
         template_payload["addr"] = upf_service_ip(index)
         interfaces = template_payload.get("interfaces")
@@ -441,17 +455,18 @@ def _render_ulcl_smf_config(
 
         rendered_snssai_infos = []
         is_anchor = "anchor" in upf.role.lower() or "psa" in upf.role.lower()
-        for slice_config in scenario.slices:
+        for slice_index, slice_config in enumerate(scenario.slices):
             dnn_upf_info_list = []
+            cidr, static_cidr = _dnn_pool((index - 1) * slice_count + slice_index)
             for apn in slice_apn_map[slice_config.slice_id]:
                 dnn_upf_info = deepcopy(template_dnn_info) if template_dnn_info is not None else {}
                 dnn_upf_info["dnn"] = apn
                 if is_anchor or "pools" in dnn_upf_info:
-                    dnn_upf_info["pools"] = [{"cidr": slice_pool_map[slice_config.slice_id][0]}]
+                    dnn_upf_info["pools"] = [{"cidr": cidr}]
                 else:
                     dnn_upf_info.pop("pools", None)
                 if "staticPools" in dnn_upf_info:
-                    dnn_upf_info["staticPools"] = [{"cidr": slice_pool_map[slice_config.slice_id][1]}]
+                    dnn_upf_info["staticPools"] = [{"cidr": static_cidr}]
                 dnn_upf_info_list.append(dnn_upf_info)
             rendered_snssai_infos.append(
                 {
@@ -466,6 +481,10 @@ def _render_ulcl_smf_config(
         rendered_up_nodes[node_name] = template_payload
         used_node_names.add(node_name)
         upf_node_names[upf.name] = node_name
+        if is_anchor:
+            anchor_upf_node_names.append(node_name)
+        else:
+            branching_upf_node_names.append(node_name)
 
     rendered_links: list[dict[str, str]] = []
     seen_links: set[tuple[str, str]] = set()
@@ -482,6 +501,10 @@ def _render_ulcl_smf_config(
             gnb_node_names[gnb.name],
             upf_node_names[resolved_topology.gnb_to_upf[gnb.name]],
         )
+
+    for branch_node_name in branching_upf_node_names:
+        for anchor_node_name in anchor_upf_node_names:
+            add_link(branch_node_name, anchor_node_name)
 
     for link in template_links:
         if not isinstance(link, dict):
@@ -503,20 +526,19 @@ def _render_ulcl_upf_config(
     config_dir: Path,
     ulcl_root: Path,
     upf_name: str,
+    upf_role: str,
     upf_index: int,
 ) -> None:
     slice_apn_map = _scenario_slice_apns(scenario)
-    slice_pool_map = {
-        slice_config.slice_id: _dnn_pool(index)
-        for index, slice_config in enumerate(scenario.slices)
-    }
+    slice_count = len(scenario.slices)
     replacements = {
         f"{upf.name}.free5gc.org": upf_service_ip(index)
         for index, upf in enumerate(scenario.upfs, start=1)
     }
 
+    template_name = "psa-upf" if ("anchor" in upf_role.lower() or "psa" in upf_role.lower()) else "i-upf"
     upf_text = _rewrite_config_text(
-        (ulcl_root / f"upfcfg-{upf_name}.yaml").read_text(encoding="utf-8"),
+        (ulcl_root / f"upfcfg-{template_name}.yaml").read_text(encoding="utf-8"),
         replacements,
     )
     upf_payload = yaml.safe_load(upf_text)
@@ -545,8 +567,8 @@ def _render_ulcl_upf_config(
                 break
 
     upf_payload["dnnList"] = []
-    for slice_config in scenario.slices:
-        cidr, _ = slice_pool_map[slice_config.slice_id]
+    for slice_index, slice_config in enumerate(scenario.slices):
+        cidr, _ = _dnn_pool((upf_index - 1) * slice_count + slice_index)
         for apn in slice_apn_map[slice_config.slice_id]:
             dnn_entry = deepcopy(template_entry) if template_entry is not None else {}
             dnn_entry["dnn"] = apn
@@ -642,6 +664,7 @@ def _render_ulcl_uerouting_config(
 
     ue_routing_info: dict[str, dict[str, Any]] = {}
     pfd_data_by_app: dict[str, dict[str, Any]] = {}
+    flow_index_by_id = {flow.flow_id: index for index, flow in enumerate(scenario.flows)}
 
     for ue in scenario.ues:
         topology_links = _ulcl_topology_links_for_ue(ue.name, scenario, resolved_topology, userplane_links)
@@ -653,8 +676,17 @@ def _render_ulcl_uerouting_config(
             if destination and specific_path_nodes:
                 specific_paths.append({"dest": destination, "path": list(specific_path_nodes)})
 
-            if not flow.policy_filter:
-                continue
+            flow_index = flow_index_by_id[flow.flow_id]
+            source_port = 15000 + flow_index
+            destination_port = 5000 + flow_index
+            flow_descriptions = (
+                [flow.policy_filter]
+                if flow.policy_filter
+                else [
+                    f"permit out udp from any {source_port} to 8.8.8.8/32 {destination_port}",
+                    f"permit out udp from 8.8.8.8/32 {destination_port} to any {source_port}",
+                ]
+            )
             app_payload = pfd_data_by_app.setdefault(
                 flow.app_id,
                 {
@@ -665,7 +697,7 @@ def _render_ulcl_uerouting_config(
             app_payload["pfds"].append(
                 {
                     "pfdID": flow.flow_id,
-                    "flowDescriptions": [flow.policy_filter],
+                    "flowDescriptions": flow_descriptions,
                 }
             )
 
@@ -831,6 +863,7 @@ def _render_core_configs(
     resolved_topology: ResolvedScenarioTopology,
 ) -> None:
     base_root = Path(scenario.free5gc.config_root)
+    _render_nrf_config(scenario, config_dir)
     _render_amf_config(scenario, config_dir)
     _render_nssf_config(scenario, config_dir)
 
@@ -839,7 +872,7 @@ def _render_core_configs(
         _render_ulcl_smf_config(scenario, config_dir, ulcl_root, resolved_topology)
 
         for index, upf in enumerate(scenario.upfs, start=1):
-            _render_ulcl_upf_config(scenario, config_dir, ulcl_root, upf.name, index)
+            _render_ulcl_upf_config(scenario, config_dir, ulcl_root, upf.name, upf.role, index)
         _render_ulcl_uerouting_config(scenario, config_dir, ulcl_root, resolved_topology)
         return
 
@@ -1041,6 +1074,34 @@ def _render_ns3_flow_profiles(scenario: ScenarioConfig, output_path: Path) -> No
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _render_ns3_slice_resources(scenario: ScenarioConfig, output_path: Path) -> None:
+    header = [
+        "slice_ref",
+        "slice_snssai",
+        "capacity_dl_mbps",
+        "capacity_ul_mbps",
+        "guaranteed_dl_mbps",
+        "guaranteed_ul_mbps",
+        "priority",
+    ]
+    lines = ["\t".join(header)]
+    for slice_config in scenario.slices:
+        if slice_config.resource is None:
+            continue
+        resource = slice_config.resource
+        values = [
+            slice_config.slice_id,
+            f"{slice_config.sst:02d}{slice_config.sd.lower()}",
+            resource.capacity_dl_mbps,
+            resource.capacity_ul_mbps,
+            resource.guaranteed_dl_mbps,
+            resource.guaranteed_ul_mbps,
+            resource.priority,
+        ]
+        lines.append("\t".join(_format_tsv_value(value) for value in values))
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def render_run_assets(
     project_root: Path,
     scenario: ScenarioConfig,
@@ -1052,6 +1113,7 @@ def render_run_assets(
     subscriber_dir = generated_dir / "subscribers"
     ns3_dir = generated_dir / scenario.ns3.output_subdir
     flow_profile_file = generated_dir / "ns3-flow-profiles.tsv"
+    slice_resource_file = ns3_dir / "slice-resources.tsv"
     state_dir = run_dir / "state"
     archive_dir = _resolve_output_path(run_dir, scenario.writer.archive_dir)
     state_db = _resolve_output_path(run_dir, scenario.writer.state_db)
@@ -1079,6 +1141,7 @@ def render_run_assets(
     _render_gnb_configs(scenario, config_dir, resolved_topology)
     _render_ue_configs(scenario, config_dir, resolved_topology)
     _render_ns3_flow_profiles(scenario, flow_profile_file)
+    _render_ns3_slice_resources(scenario, slice_resource_file)
 
     compose_file = generated_dir / "free5gc-compose.generated.yaml"
     _yaml_dump(compose_file, compose_render.compose_payload)
@@ -1106,6 +1169,7 @@ def render_run_assets(
         snapshot_file=snapshot_file,
         clock_file=clock_file,
         flow_profile_file=flow_profile_file,
+        slice_resource_file=slice_resource_file,
         state_db=state_db,
         archive_dir=archive_dir,
         service_map=compose_render.service_map,

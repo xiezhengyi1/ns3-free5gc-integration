@@ -21,6 +21,7 @@ _MODE_EXCLUDED_SERVICES: dict[str, set[str]] = {
 SMF_CONTROL_IP = "10.100.200.110"
 UPF_CONTROL_IP = "10.100.200.15"
 AMF_CONTROL_IP = "10.100.200.16"
+PCF_CONTROL_IP = "10.100.200.20"
 _GNB_SERVICE_IP_BASE = 101
 _UPF_SERVICE_IP_BASE = 15
 
@@ -152,6 +153,14 @@ def render_compose_for_run(
         _replace_volume_source(amf_service, "/free5gc/config/amfcfg.yaml", generated_config_dir / "amfcfg.yaml")
         _ensure_network_entry(amf_service, "privnet")["ipv4_address"] = AMF_CONTROL_IP
 
+    if "free5gc-nrf" in services:
+        nrf_service = services["free5gc-nrf"]
+        _replace_volume_source(nrf_service, "/free5gc/config/nrfcfg.yaml", generated_config_dir / "nrfcfg.yaml")
+
+    if "free5gc-pcf" in services:
+        pcf_service = services["free5gc-pcf"]
+        _ensure_network_entry(pcf_service, "privnet")["ipv4_address"] = PCF_CONTROL_IP
+
     if "free5gc-nssf" in services:
         nssf_service = services["free5gc-nssf"]
         _replace_volume_source(nssf_service, "/free5gc/config/nssfcfg.yaml", generated_config_dir / "nssfcfg.yaml")
@@ -172,17 +181,48 @@ def render_compose_for_run(
         _replace_volume_source(upf_service, "/free5gc/config/upfcfg.yaml", generated_config_dir / "upfcfg.yaml")
         _ensure_network_entry(upf_service, "privnet")["ipv4_address"] = UPF_CONTROL_IP
     elif scenario.free5gc.mode == "ulcl":
+        template_service = deepcopy(services["free5gc-i-upf"])
+        expected_upf_services = {_upf_service_name(upf.name) for upf in scenario.upfs}
         for index, upf in enumerate(scenario.upfs, start=1):
             service_name = _upf_service_name(upf.name)
             if service_name not in services:
-                continue
+                service = deepcopy(template_service)
+                service["container_name"] = upf.name
+                service["networks"] = {"privnet": {"aliases": [f"{upf.name}.free5gc.org"]}}
+                services[service_name] = service
             upf_service = services[service_name]
+            upf_service["command"] = "bash -c \"bash ./upf-iptables.sh && ./upf -c ./config/upfcfg.yaml\""
             _replace_volume_source(
                 upf_service,
                 "/free5gc/config/upfcfg.yaml",
                 generated_config_dir / f"{upf.name}-upfcfg.yaml",
             )
             _ensure_network_entry(upf_service, "privnet")["ipv4_address"] = upf_service_ip(index)
+        for service_name, service in list(services.items()):
+            image = str(service.get("image", ""))
+            if service_name.startswith("free5gc-") and "upf" in service_name and service_name not in expected_upf_services:
+                if "upf" in image or service_name in {"free5gc-i-upf", "free5gc-psa-upf"}:
+                    services.pop(service_name)
+        known_services = set(services)
+        for service in services.values():
+            _filter_depends_on(service, known_services)
+        if "free5gc-smf" in services:
+            depends_on = services["free5gc-smf"].get("depends_on", [])
+            if isinstance(depends_on, dict):
+                depends_on = list(depends_on)
+            if not isinstance(depends_on, list):
+                depends_on = []
+            depends_on = [
+                item
+                for item in depends_on
+                if not (isinstance(item, str) and item.startswith("free5gc-") and "upf" in item)
+            ]
+            for upf in scenario.upfs:
+                service_name = _upf_service_name(upf.name)
+                if service_name not in depends_on:
+                    depends_on.append(service_name)
+            services["free5gc-smf"]["depends_on"] = depends_on
+            _filter_depends_on(services["free5gc-smf"], set(services))
 
     gnb_template = deepcopy(services["ueransim"])
     gnb_template["volumes"] = []

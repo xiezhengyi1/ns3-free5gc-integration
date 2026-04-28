@@ -66,14 +66,14 @@ ues:
     amf: "8000"
 
 free5gc:
-  compose_file: /home/xiezhengyi/workspace/free5gc-compose/docker-compose.yaml
-  config_root: /home/xiezhengyi/workspace/free5gc-compose/config
+  compose_file: /home/yyx/6gcore/free5gc-compose/docker-compose.yaml
+  config_root: /home/yyx/6gcore/free5gc-compose/config
   mode: single_upf
   bridge_name: br-free5gc
   project_name: nrint-graph-snapshot-real-smoke
 
 ns3:
-  ns3_root: /home/xiezhengyi/workspace/ns-allinone-3.46.1/ns-3.46.1
+  ns3_root: /home/yyx/6gcore/ns-allinone-3.46.1/ns-3.46.1
   scratch_name: nr_multignb_multiupf
   output_subdir: ns3
   simulator: RealtimeSimulatorImpl
@@ -82,10 +82,10 @@ ns3:
 writer:
   archive_dir: archive
   state_db: state/writer.db
-  graph_db_url: "postgresql://postgres:123456@localhost:5433/multiagents_db"
+  graph_db_url: "postgresql://postgres:123456@localhost:5432/multiagents_db"
 
 topology:
-  graph_snapshot_id: graph-89c679b8-3aed-4c2c-9594-ccdab6bd4499
+  graph_snapshot_id: f7b8fbb8-76a0-4669-aa97-994dcedfbf53
 
 bridge:
   enable_inline_harness: false

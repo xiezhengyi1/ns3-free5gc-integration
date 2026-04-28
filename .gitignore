@@ -3,6 +3,7 @@ __pycache__/
 .pytest_cache/
 artifacts/
 generated/
+tmp/
 *.log
 *.sqlite3
 *.db

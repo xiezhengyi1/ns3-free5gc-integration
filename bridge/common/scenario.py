@@ -45,10 +45,20 @@ class SliceConfig:
     sst: int
     sd: str
     label: str | None = None
+    resource: "SliceResourceConfig | None" = None
 
     @property
     def slice_id(self) -> str:
         return _coerce_slice_identifier(self.sst, self.sd)
+
+
+@dataclass(slots=True, frozen=True)
+class SliceResourceConfig:
+    capacity_dl_mbps: float
+    capacity_ul_mbps: float
+    guaranteed_dl_mbps: float
+    guaranteed_ul_mbps: float
+    priority: int = 1
 
 
 @dataclass(slots=True, frozen=True)
@@ -167,6 +177,7 @@ class Ns3Config:
     bridge_link_rate_mbps: float = 1000.0
     bridge_link_delay_ms: float = 1.0
     policy_reload_ms: int = 1000
+    slice_isolation: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -368,6 +379,19 @@ class ScenarioConfig:
                 raise ValueError(f"flow {flow.flow_id} references unknown app {flow.app_id}")
             target_ue = ue_by_name[flow.ue_name] if flow.ue_name is not None else ue_by_supi[flow.supi]
             self.resolve_flow_session(target_ue, flow)
+        if self.ns3.slice_isolation:
+            for slice_config in self.slices:
+                resource = slice_config.resource
+                if resource is None:
+                    raise ValueError(f"slice {slice_config.slice_id} must define resource when ns3.slice_isolation is true")
+                if resource.capacity_dl_mbps <= 0.0 or resource.capacity_ul_mbps <= 0.0:
+                    raise ValueError(f"slice {slice_config.slice_id} resource capacity must be positive")
+                if resource.guaranteed_dl_mbps < 0.0 or resource.guaranteed_ul_mbps < 0.0:
+                    raise ValueError(f"slice {slice_config.slice_id} resource guaranteed bandwidth must be >= 0")
+                if resource.guaranteed_dl_mbps > resource.capacity_dl_mbps:
+                    raise ValueError(f"slice {slice_config.slice_id} guaranteed_dl_mbps exceeds capacity_dl_mbps")
+                if resource.guaranteed_ul_mbps > resource.capacity_ul_mbps:
+                    raise ValueError(f"slice {slice_config.slice_id} guaranteed_ul_mbps exceeds capacity_ul_mbps")
 
     @classmethod
     def from_dict(
@@ -417,6 +441,17 @@ class ScenarioConfig:
                 sst=int(item["sst"]),
                 sd=str(item["sd"]),
                 label=item.get("label"),
+                resource=(
+                    SliceResourceConfig(
+                        capacity_dl_mbps=float(item["resource"]["capacity_dl_mbps"]),
+                        capacity_ul_mbps=float(item["resource"]["capacity_ul_mbps"]),
+                        guaranteed_dl_mbps=float(item["resource"]["guaranteed_dl_mbps"]),
+                        guaranteed_ul_mbps=float(item["resource"]["guaranteed_ul_mbps"]),
+                        priority=int(item["resource"].get("priority", 1)),
+                    )
+                    if isinstance(item.get("resource"), dict)
+                    else None
+                ),
             )
             for item in payload.get("slices", [])
         )
@@ -590,6 +625,7 @@ class ScenarioConfig:
                 bridge_link_rate_mbps=float(ns3_payload.get("bridge_link_rate_mbps", 1000.0)),
                 bridge_link_delay_ms=float(ns3_payload.get("bridge_link_delay_ms", 1.0)),
                 policy_reload_ms=int(ns3_payload.get("policy_reload_ms", 1000)),
+                slice_isolation=bool(ns3_payload.get("slice_isolation", False)),
             ),
             writer=WriterConfig(
                 archive_dir=writer_payload.get("archive_dir", "artifacts/archive"),

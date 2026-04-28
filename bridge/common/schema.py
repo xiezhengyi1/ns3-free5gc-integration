@@ -98,6 +98,8 @@ class SliceRecord:
     sst: int
     sd: str
     label: str | None = None
+    resource: dict[str, Any] = field(default_factory=dict)
+    telemetry: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "SliceRecord":
@@ -106,6 +108,8 @@ class SliceRecord:
             sst=int(_require(payload, "sst")),
             sd=str(_require(payload, "sd")),
             label=payload.get("label"),
+            resource=dict(payload.get("resource", {})),
+            telemetry=dict(payload.get("telemetry", {})),
         )
 
 

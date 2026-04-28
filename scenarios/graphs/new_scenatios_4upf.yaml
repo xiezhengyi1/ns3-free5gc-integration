@@ -1,0 +1,186 @@
+nodes:
+  - id: slice-node-1
+    type: slice
+    label: slice-1
+    attributes:
+      sst: 1
+      sd: "000001"
+      label: slice-1
+  - id: slice-node-2
+    type: slice
+    label: slice-2
+    attributes:
+      sst: 1
+      sd: "000002"
+      label: slice-2
+  - id: slice-node-3
+    type: slice
+    label: slice-3
+    attributes:
+      sst: 2
+      sd: "000001"
+      label: slice-3
+  - id: slice-node-4
+    type: slice
+    label: slice-4
+    attributes:
+      sst: 2
+      sd: "000002"
+      label: slice-4
+  - id: slice-node-5
+    type: slice
+    label: slice-5
+    attributes:
+      sst: 3
+      sd: "000001"
+      label: slice-5
+
+  - id: core-node-1
+    type: core_node
+    label: i-upf-a
+    attributes:
+      name: i-upf-a
+      role: branching-upf
+      dnn: internet
+  - id: core-node-2
+    type: core_node
+    label: i-upf-b
+    attributes:
+      name: i-upf-b
+      role: branching-upf
+      dnn: internet
+  - id: core-node-3
+    type: core_node
+    label: psa-upf-a
+    attributes:
+      name: psa-upf-a
+      role: anchor-upf
+      dnn: internet
+  - id: core-node-4
+    type: core_node
+    label: psa-upf-b
+    attributes:
+      name: psa-upf-b
+      role: anchor-upf
+      dnn: internet
+
+  - id: ran-node-1
+    type: ran_node
+    label: gNB-1
+    attributes:
+      name: gNB-1
+      alias: gnb1.free5gc.org
+      tac: 1
+      nci: "0x000000001"
+      position: {x: 0, y: 0, z: 10}
+  - id: ran-node-2
+    type: ran_node
+    label: gNB-2
+    attributes:
+      name: gNB-2
+      alias: gnb2.free5gc.org
+      tac: 1
+      nci: "0x000000002"
+      position: {x: 180, y: 0, z: 10}
+  - id: ran-node-3
+    type: ran_node
+    label: gNB-3
+    attributes:
+      name: gNB-3
+      alias: gnb3.free5gc.org
+      tac: 1
+      nci: "0x000000003"
+      position: {x: 360, y: 0, z: 10}
+  - id: ran-node-4
+    type: ran_node
+    label: gNB-4
+    attributes:
+      name: gNB-4
+      alias: gnb4.free5gc.org
+      tac: 1
+      nci: "0x000000004"
+      position: {x: 90, y: 160, z: 10}
+  - id: ran-node-5
+    type: ran_node
+    label: gNB-5
+    attributes:
+      name: gNB-5
+      alias: gnb5.free5gc.org
+      tac: 1
+      nci: "0x000000005"
+      position: {x: 270, y: 160, z: 10}
+
+  - id: ue-node-1
+    type: ue
+    label: ue1
+    attributes: {name: ue1, supi: imsi-208930000000001, position: {x: 95, y: 145, z: 1.5}}
+  - id: ue-node-2
+    type: ue
+    label: ue2
+    attributes: {name: ue2, supi: imsi-208930000000002, position: {x: 165, y: 20, z: 1.5}}
+  - id: ue-node-3
+    type: ue
+    label: ue3
+    attributes: {name: ue3, supi: imsi-208930000000003, position: {x: 260, y: 150, z: 1.5}}
+  - id: ue-node-4
+    type: ue
+    label: ue4
+    attributes: {name: ue4, supi: imsi-208930000000004, position: {x: 350, y: 20, z: 1.5}}
+  - id: ue-node-5
+    type: ue
+    label: ue5
+    attributes: {name: ue5, supi: imsi-208930000000005, position: {x: 110, y: 170, z: 1.5}}
+  - id: ue-node-6
+    type: ue
+    label: ue6
+    attributes: {name: ue6, supi: imsi-208930000000006, position: {x: 15, y: 15, z: 1.5}}
+  - id: ue-node-7
+    type: ue
+    label: ue7
+    attributes: {name: ue7, supi: imsi-208930000000007, position: {x: 195, y: 25, z: 1.5}}
+  - id: ue-node-8
+    type: ue
+    label: ue8
+    attributes: {name: ue8, supi: imsi-208930000000008, position: {x: 375, y: 25, z: 1.5}}
+  - id: ue-node-9
+    type: ue
+    label: ue9
+    attributes: {name: ue9, supi: imsi-208930000000009, position: {x: 25, y: 25, z: 1.5}}
+  - id: ue-node-10
+    type: ue
+    label: ue10
+    attributes: {name: ue10, supi: imsi-208930000000010, position: {x: 285, y: 145, z: 1.5}}
+
+links:
+  - {source: ran-node-1, target: slice-node-1, type: serves_slice, attributes: {}}
+  - {source: ran-node-1, target: slice-node-2, type: serves_slice, attributes: {}}
+  - {source: ran-node-2, target: slice-node-2, type: serves_slice, attributes: {}}
+  - {source: ran-node-2, target: slice-node-3, type: serves_slice, attributes: {}}
+  - {source: ran-node-3, target: slice-node-4, type: serves_slice, attributes: {}}
+  - {source: ran-node-3, target: slice-node-5, type: serves_slice, attributes: {}}
+  - {source: ran-node-4, target: slice-node-1, type: serves_slice, attributes: {}}
+  - {source: ran-node-4, target: slice-node-4, type: serves_slice, attributes: {}}
+  - {source: ran-node-4, target: slice-node-5, type: serves_slice, attributes: {}}
+  - {source: ran-node-5, target: slice-node-1, type: serves_slice, attributes: {}}
+  - {source: ran-node-5, target: slice-node-2, type: serves_slice, attributes: {}}
+  - {source: ran-node-5, target: slice-node-3, type: serves_slice, attributes: {}}
+  - {source: ran-node-5, target: slice-node-5, type: serves_slice, attributes: {}}
+
+  - {source: ue-node-1, target: ran-node-4, type: attached_to, attributes: {}}
+  - {source: ue-node-2, target: ran-node-2, type: attached_to, attributes: {}}
+  - {source: ue-node-3, target: ran-node-5, type: attached_to, attributes: {}}
+  - {source: ue-node-4, target: ran-node-3, type: attached_to, attributes: {}}
+  - {source: ue-node-5, target: ran-node-4, type: attached_to, attributes: {}}
+  - {source: ue-node-6, target: ran-node-1, type: attached_to, attributes: {}}
+  - {source: ue-node-7, target: ran-node-2, type: attached_to, attributes: {}}
+  - {source: ue-node-8, target: ran-node-3, type: attached_to, attributes: {}}
+  - {source: ue-node-9, target: ran-node-1, type: attached_to, attributes: {}}
+  - {source: ue-node-10, target: ran-node-5, type: attached_to, attributes: {}}
+
+  - {source: ran-node-1, target: core-node-1, type: tunneled_via, attributes: {}}
+  - {source: ran-node-2, target: core-node-1, type: tunneled_via, attributes: {}}
+  - {source: ran-node-3, target: core-node-2, type: tunneled_via, attributes: {}}
+  - {source: ran-node-4, target: core-node-2, type: tunneled_via, attributes: {}}
+  - {source: ran-node-5, target: core-node-2, type: tunneled_via, attributes: {}}
+  - {source: core-node-1, target: core-node-3, type: tunneled_via, attributes: {}}
+  - {source: core-node-2, target: core-node-4, type: tunneled_via, attributes: {}}

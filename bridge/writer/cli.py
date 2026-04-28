@@ -44,6 +44,15 @@ class Ns3ClockReference:
         return self._tick_index
 
 
+def _as_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--state-db", required=True, help="sqlite path for local state")
     parser.add_argument("--archive-dir", required=True, help="directory for archived ticks")
@@ -53,6 +62,10 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
         "--graph-trigger-event",
         default="sim_tick",
         help="trigger_event prefix used when persisting graph snapshots",
+    )
+    parser.add_argument(
+        "--live-graph-snapshot-id",
+        help="update one graph snapshot row instead of creating one graph snapshot per tick",
     )
     parser.add_argument(
         "--ensure-graph-schema",
@@ -65,6 +78,8 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
         default="v1",
         help="topology version label stored with the run",
     )
+    parser.add_argument("--real-traffic-state-file", help="JSONL file written by run_real_ue_flows.py")
+    parser.add_argument("--real-traffic-timeout-seconds", type=float, default=15.0)
 
 
 def _build_writer(
@@ -80,6 +95,130 @@ def _build_writer(
     return store, client, graph_store
 
 
+def _merge_real_traffic_state(snapshot: TickSnapshot, args: argparse.Namespace) -> TickSnapshot:
+    state_file = getattr(args, "real_traffic_state_file", None)
+    if not state_file:
+        return snapshot
+
+    path = Path(state_file).expanduser().resolve()
+    deadline = time.monotonic() + float(getattr(args, "real_traffic_timeout_seconds", 15.0))
+    state_payload: dict[str, object] | None = None
+    while time.monotonic() <= deadline:
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    payload = json.loads(line)
+                    tick_index = int(payload.get("tick_index", -1))
+                    if tick_index <= snapshot.tick_index:
+                        state_payload = payload
+        except FileNotFoundError:
+            pass
+        if state_payload is not None:
+            break
+        time.sleep(0.05)
+
+    if state_payload is None:
+        return snapshot
+
+    tick_seconds = max(0.001, float(getattr(args, "tick_ms", 1000)) / 1000.0)
+    real_flows = {
+        str(item["flow_id"]): item
+        for item in state_payload.get("flows", [])
+        if isinstance(item, dict) and "flow_id" in item
+    }
+    ue_ip_by_supi: dict[str, str] = {}
+    for flow in snapshot.flows:
+        real_flow = real_flows.get(flow.flow_id)
+        if real_flow is None:
+            continue
+        ue_ip = str(real_flow["ue_ip"])
+        source_port = int(real_flow["source_port"])
+        destination_port = int(real_flow["destination_port"])
+        packet_size_bytes = int(real_flow.get("packet_size_bytes", 0) or 0)
+        ul_packets_sent = int(real_flow.get("ul_packets_sent", 0) or 0)
+        dl_packets_sent = int(real_flow.get("dl_packets_sent", 0) or 0)
+        throughput_ul_mbps = (
+            ul_packets_sent * packet_size_bytes * 8.0 / tick_seconds / 1e6
+            if packet_size_bytes > 0
+            else 0.0
+        )
+        throughput_dl_mbps = (
+            dl_packets_sent * packet_size_bytes * 8.0 / tick_seconds / 1e6
+            if packet_size_bytes > 0
+            else 0.0
+        )
+        baseline_loss = _as_float(flow.sla.get("loss_rate")) if isinstance(flow.sla, dict) else None
+        loss_rate = baseline_loss if baseline_loss is not None else 0.0
+        packet_sent = ul_packets_sent + dl_packets_sent
+        packet_received = max(0, int(round(packet_sent * max(0.0, 1.0 - loss_rate))))
+        traffic = dict(flow.traffic)
+        traffic["five_tuple"] = {
+            "protocol": 17,
+            "source_ip": ue_ip,
+            "source_port": source_port,
+            "destination_ip": traffic.get("five_tuple", {}).get("destination_ip", "8.8.8.8")
+            if isinstance(traffic.get("five_tuple"), dict)
+            else "8.8.8.8",
+            "destination_port": destination_port,
+        }
+        if dl_packets_sent > 0:
+            traffic["reverse_five_tuple"] = {
+                "protocol": 17,
+                "source_ip": traffic["five_tuple"]["destination_ip"],
+                "source_port": destination_port,
+                "destination_ip": ue_ip,
+                "destination_port": source_port,
+            }
+        else:
+            traffic.pop("reverse_five_tuple", None)
+        if ul_packets_sent > 0 and dl_packets_sent > 0:
+            traffic["direction"] = "bidirectional"
+        elif dl_packets_sent > 0:
+            traffic["direction"] = "downlink"
+        else:
+            traffic["direction"] = "uplink"
+        traffic["ue_interface"] = str(real_flow["interface"])
+        traffic["dl_upf_container"] = str(real_flow["dl_container"])
+        flow.traffic = traffic
+        flow.throughput_ul_mbps = throughput_ul_mbps
+        flow.throughput_dl_mbps = throughput_dl_mbps
+        flow.loss_rate = loss_rate
+        telemetry = dict(flow.telemetry)
+        telemetry["loss_rate"] = loss_rate
+        telemetry["packet_sent"] = packet_sent
+        telemetry["packet_received"] = packet_received
+        telemetry["throughput_ul"] = throughput_ul_mbps
+        telemetry["throughput_dl"] = throughput_dl_mbps
+        flow.telemetry = telemetry
+        ue_ip_by_supi[flow.supi] = ue_ip
+
+    for ue in snapshot.ues:
+        if ue.supi in ue_ip_by_supi:
+            ue.ip_address = ue_ip_by_supi[ue.supi]
+
+    if snapshot.flows:
+        mean_delay_ms = sum(float(flow.delay_ms) for flow in snapshot.flows) / len(snapshot.flows)
+        mean_loss_rate = sum(float(flow.loss_rate) for flow in snapshot.flows) / len(snapshot.flows)
+        throughput_dl_total = sum(float(flow.throughput_dl_mbps) for flow in snapshot.flows)
+        throughput_ul_total = sum(float(flow.throughput_ul_mbps) for flow in snapshot.flows)
+        kpis = dict(snapshot.kpis)
+        kpis["active_flows"] = float(len(snapshot.flows))
+        kpis["mean_delay_ms"] = mean_delay_ms
+        kpis["mean_loss_rate"] = mean_loss_rate
+        kpis["throughput_dl_mbps_total"] = throughput_dl_total
+        kpis["throughput_ul_mbps_total"] = throughput_ul_total
+        snapshot.kpis = kpis
+
+        reward_inputs = dict(snapshot.reward_inputs)
+        reward_inputs["delay_penalty"] = mean_delay_ms
+        reward_inputs["loss_penalty"] = mean_loss_rate
+        reward_inputs["throughput_score"] = throughput_dl_total + throughput_ul_total
+        snapshot.reward_inputs = reward_inputs
+    return snapshot
+
+
 def _ingest_line(
     line: str,
     store: SnapshotStore,
@@ -90,6 +229,7 @@ def _ingest_line(
     if not line.strip():
         return
     snapshot = TickSnapshot.from_dict(json.loads(line))
+    snapshot = _merge_real_traffic_state(snapshot, args)
     result = store.ingest_snapshot(
         snapshot,
         seed=args.seed,
@@ -98,10 +238,18 @@ def _ingest_line(
     if result["inserted"] and client is not None:
         result["http"] = client.post_snapshot(snapshot)
     if result["inserted"] and graph_store is not None:
-        graph_result = graph_store.ingest_snapshot(
-            snapshot,
-            trigger_event=f"{args.graph_trigger_event}:{snapshot.run_id}:{snapshot.tick_index}",
-        )
+        trigger_event = f"{args.graph_trigger_event}:{snapshot.run_id}:{snapshot.tick_index}"
+        if args.live_graph_snapshot_id:
+            graph_result = graph_store.upsert_live_graph_snapshot(
+                snapshot,
+                snapshot_id=args.live_graph_snapshot_id,
+                trigger_event=trigger_event,
+            )
+        else:
+            graph_result = graph_store.ingest_snapshot(
+                snapshot,
+                trigger_event=trigger_event,
+            )
         result["graph"] = graph_result.to_dict()
     print(json.dumps(result, ensure_ascii=False))
 

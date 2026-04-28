@@ -409,6 +409,121 @@ class PostgresGraphStore:
             write_mode=str(graph_summary["write_mode"]),
         )
 
+    def upsert_live_graph_snapshot(
+        self,
+        snapshot: TickSnapshot,
+        *,
+        snapshot_id: str,
+        trigger_event: str | None = None,
+    ) -> GraphStoreResult:
+        bundle = build_graph_snapshot_bundle(
+            snapshot,
+            base_network_snapshot_id=None,
+            trigger_event=trigger_event,
+        )
+        graph_summary = dict(bundle.snapshot_row["graph_summary"])
+        graph_summary.update(
+            {
+                "snapshot_id": snapshot_id,
+                "write_mode": "live_update",
+                "delta_node_count": len(bundle.node_rows),
+                "delta_edge_count": len(bundle.edge_rows),
+                "delta_metric_count": len(bundle.metric_rows),
+            }
+        )
+        bundle.snapshot_row["snapshot_id"] = snapshot_id
+        bundle.snapshot_row["graph_summary"] = graph_summary
+        for row in bundle.node_rows:
+            row["snapshot_id"] = snapshot_id
+        for row in bundle.edge_rows:
+            row["snapshot_id"] = snapshot_id
+        for row in bundle.metric_rows:
+            row["snapshot_id"] = snapshot_id
+
+        inserted = self._upsert_live_bundle(bundle)
+        return GraphStoreResult(
+            inserted=inserted,
+            snapshot_id=snapshot_id,
+            base_network_snapshot_id=None,
+            node_count=int(graph_summary["node_count"]),
+            edge_count=int(graph_summary["edge_count"]),
+            metric_count=int(graph_summary["metric_count"]),
+            delta_node_count=int(graph_summary["delta_node_count"]),
+            delta_edge_count=int(graph_summary["delta_edge_count"]),
+            delta_metric_count=int(graph_summary["delta_metric_count"]),
+            write_mode="live_update",
+        )
+
+    def _upsert_live_bundle(self, bundle: GraphSnapshotBundle) -> bool:
+        NetworkGraphSnapshot = self.models["NetworkGraphSnapshot"]
+        GraphNode = self.models["GraphNode"]
+        GraphEdge = self.models["GraphEdge"]
+        GraphMetric = self.models["GraphMetric"]
+        snapshot_id = str(bundle.snapshot_row["snapshot_id"])
+
+        with self.models["Session"](self.engine) as session:
+            snapshot_row = (
+                session.query(NetworkGraphSnapshot)
+                .filter_by(snapshot_id=snapshot_id)
+                .one_or_none()
+            )
+            inserted = snapshot_row is None
+            if snapshot_row is None:
+                session.add(NetworkGraphSnapshot(**bundle.snapshot_row))
+                session.flush()
+            else:
+                snapshot_row.base_network_snapshot_id = bundle.snapshot_row["base_network_snapshot_id"]
+                snapshot_row.trigger_event = bundle.snapshot_row["trigger_event"]
+                snapshot_row.graph_summary = bundle.snapshot_row["graph_summary"]
+                snapshot_row.created_at = bundle.snapshot_row["created_at"]
+
+            for row in bundle.node_rows:
+                existing = (
+                    session.query(GraphNode)
+                    .filter_by(snapshot_id=snapshot_id, node_key=row["node_key"])
+                    .one_or_none()
+                )
+                if existing is None:
+                    session.add(GraphNode(**row))
+                else:
+                    existing.node_type = row["node_type"]
+                    existing.label = row.get("label")
+                    existing.properties = row.get("properties")
+
+            for row in bundle.edge_rows:
+                existing = (
+                    session.query(GraphEdge)
+                    .filter_by(snapshot_id=snapshot_id, edge_key=row["edge_key"])
+                    .one_or_none()
+                )
+                if existing is None:
+                    session.add(GraphEdge(**row))
+                else:
+                    existing.edge_type = row["edge_type"]
+                    existing.source_key = row["source_key"]
+                    existing.target_key = row["target_key"]
+                    existing.properties = row.get("properties")
+
+            for row in bundle.metric_rows:
+                existing = (
+                    session.query(GraphMetric)
+                    .filter_by(
+                        snapshot_id=snapshot_id,
+                        owner_type=row["owner_type"],
+                        owner_key=row["owner_key"],
+                        metric_name=row["metric_name"],
+                    )
+                    .one_or_none()
+                )
+                if existing is None:
+                    session.add(GraphMetric(**row))
+                else:
+                    existing.metric_value = row["metric_value"]
+                    existing.observed_at = row["observed_at"]
+
+            session.commit()
+            return inserted
+
     def _persist_bundle(self, bundle: GraphSnapshotBundle) -> None:
         NetworkGraphSnapshot = self.models["NetworkGraphSnapshot"]
         GraphNode = self.models["GraphNode"]

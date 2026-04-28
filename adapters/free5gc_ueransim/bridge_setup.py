@@ -134,7 +134,7 @@ def render_bridge_script(plans: list[BridgeInterfacePlan], output_path: Path) ->
                 f"nsenter -t $gnb_pid_{plan.link_index} -n ip link set tmpg{plan.link_index} name {plan.gnb_ns_if}",
                 f"nsenter -t $gnb_pid_{plan.link_index} -n ip link set {plan.gnb_ns_if} up",
                 f"nsenter -t $gnb_pid_{plan.link_index} -n ip addr add {plan.gnb_ip}/30 dev {plan.gnb_ns_if}",
-                f"nsenter -t $gnb_pid_{plan.link_index} -n ip route replace {plan.upf_route_target}/32 dev {plan.gnb_ns_if}",
+                f"nsenter -t $gnb_pid_{plan.link_index} -n ip route replace {plan.upf_route_target}/32 via {plan.upf_ip} dev {plan.gnb_ns_if}",
                 f"ip link add {plan.upf_host_veth} type veth peer name tmpu{plan.link_index}",
                 f"ip link set {plan.upf_host_veth} master {plan.upf_bridge}",
                 f"ip link set {plan.upf_host_veth} up",
@@ -142,7 +142,7 @@ def render_bridge_script(plans: list[BridgeInterfacePlan], output_path: Path) ->
                 f"nsenter -t $upf_pid_{plan.link_index} -n ip link set tmpu{plan.link_index} name {plan.upf_ns_if}",
                 f"nsenter -t $upf_pid_{plan.link_index} -n ip link set {plan.upf_ns_if} up",
                 f"nsenter -t $upf_pid_{plan.link_index} -n ip addr add {plan.upf_ip}/30 dev {plan.upf_ns_if}",
-                f"nsenter -t $upf_pid_{plan.link_index} -n ip route replace {plan.gnb_route_target}/32 dev {plan.upf_ns_if}",
+                f"nsenter -t $upf_pid_{plan.link_index} -n ip route replace {plan.gnb_route_target}/32 via {plan.gnb_ip} dev {plan.upf_ns_if}",
                 "",
             ]
         )

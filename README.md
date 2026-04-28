@@ -32,6 +32,9 @@ python scripts/render_run.py scenarios/baseline_single_upf.yaml
 
 # 3. 根据生成的 manifest 启动整个栈
 python scripts/start_stack.py artifacts/runs/<run-id>/run-manifest.json
+
+# 图驱动一键启动（网络图 -> YAML -> free5GC/UERANSIM/ns-3）
+python3 scripts/start_graph_stack.py scenarios/graph_snapshot_real_smoke.yaml
 ```
 
 ## 前置依赖
@@ -169,6 +172,30 @@ ns3_free5gc_integration/
 - **bridge**：可选的 inline tap harness 开关
 
 场景数据模型定义在 `bridge/common/scenario.py`，使用 frozen dataclass，在加载时做完整的交叉引用校验（UE → gNB、Session → Slice）。
+
+### Slice 级逻辑资源隔离
+
+启用 `ns3.slice_isolation: true` 后，每个 slice 必须显式声明资源池：
+
+```yaml
+slices:
+  - sst: 1
+    sd: "000001"
+    label: embb
+    resource:
+      capacity_dl_mbps: 80
+      capacity_ul_mbps: 40
+      guaranteed_dl_mbps: 50
+      guaranteed_ul_mbps: 20
+      priority: 1
+
+ns3:
+  slice_isolation: true
+```
+
+渲染器会生成 `generated/ns3/slice-resources.tsv`，ns-3 每个 tick 按 `(gNB, slice)` 资源池分配 UL/DL 带宽，并把每条 flow 的 allocation 写入 `generated/ns3/ns3-clock.json`。真实 UE UDP 发生器读取该 clock 文件限速，因此外部真实用户面和 ns-3 指标使用同一套时钟与资源分配。
+
+free5GC/UERANSIM 侧只做逻辑隔离表达：S-NSSAI、DNN、UPF 选择、QoSFlow GBR/MBR 和 PDU Session AMBR。它们不提供 RAN scheduler 级硬隔离；本项目的隔离语义由 ns-3 slice 资源模型和真实流量限速闭环保证。
 
 ### 配置渲染引擎
 
@@ -332,6 +359,8 @@ python -m bridge.orchestrator.cli prepare-run scenarios/baseline_ulcl_multi_gnb.
 ```bash
 python scripts/start_stack.py artifacts/runs/<run-id>/run-manifest.json
 ```
+
+图驱动的一键启动、日志查看和图增量写回说明见 [docs/start_graph_stack.md](docs/start_graph_stack.md)。
 
 说明：针对真实 free5GC Compose 基线，生成器现在会为 SMF、UPF 和 gNB 渲染显式内网地址；在 ULCL 场景里还会为 I-UPF 和 PSA-UPF 分别生成独立配置，避免宿主机把 `*.free5gc.org` 解析到 `198.18.x.x` 后造成 PFCP/NGAP/N9 指向错误目标。
 
