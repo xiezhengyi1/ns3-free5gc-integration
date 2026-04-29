@@ -22,6 +22,7 @@ import requests
 
 
 EXECUTION_PATH = "/policy-executions"
+HEALTHCHECK_PATH = f"{EXECUTION_PATH}/launch-healthcheck"
 LEGACY_PATHS = {
     "/pcf/policies",
     "/npcf-am-policy-control/v1/policies",
@@ -29,6 +30,7 @@ LEGACY_PATHS = {
 }
 AM_POLICY_TYPE = "PcfAmPolicyControlPolicyAssociation"
 URSP_POLICY_TYPE = "UrspRuleRequest"
+QOS_TOLERANCE_RATIO = 0.10
 
 
 def _emit_policy_event(event: str, *, policy_id: str, policy_type: str, detail: str) -> None:
@@ -51,6 +53,9 @@ class UpstreamPcfDispatcher(Protocol):
     def dispatch(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Dispatch one policy to the upstream PCF."""
 
+    def healthcheck(self) -> tuple[bool, str]:
+        """Return whether the upstream PCF is reachable enough for experiment startup."""
+
 
 class RequestsUpstreamPcfDispatcher:
     """Best-effort HTTP adapter for the live free5GC PCF SBI."""
@@ -61,10 +66,14 @@ class RequestsUpstreamPcfDispatcher:
         base_url: str,
         request_timeout_sec: float = 5.0,
         callback_base_url: str = "",
+        request_retry_count: int = 3,
+        retry_backoff_sec: float = 1.0,
     ) -> None:
         self.base_url = str(base_url or "").rstrip("/")
         self.request_timeout_sec = max(0.1, float(request_timeout_sec or 5.0))
         self.callback_base_url = str(callback_base_url or "").rstrip("/")
+        self.request_retry_count = max(1, int(request_retry_count or 1))
+        self.retry_backoff_sec = max(0.0, float(retry_backoff_sec or 0.0))
         self._session = requests.Session()
         self._session.trust_env = False
 
@@ -82,24 +91,32 @@ class RequestsUpstreamPcfDispatcher:
 
         path, body = self._build_request(policy_type, payload)
         endpoint = f"{self.base_url}{path}"
-        try:
-            response = self._session.post(endpoint, json=body, timeout=self.request_timeout_sec)
-        except requests.exceptions.RequestException as exc:
-            raise PolicyError(f"upstream PCF request failed: {exc}", status_code=502, phase="upstream_pcf") from exc
+        last_error: PolicyError | None = None
+        for attempt in range(1, self.request_retry_count + 1):
+            try:
+                response = self._session.post(endpoint, json=body, timeout=self.request_timeout_sec)
+            except requests.exceptions.RequestException as exc:
+                last_error = PolicyError(f"upstream PCF request failed: {exc}", status_code=502, phase="upstream_pcf")
+                if attempt >= self.request_retry_count:
+                    raise last_error from exc
+                time.sleep(self.retry_backoff_sec)
+                continue
 
-        try:
-            response_payload = response.json()
-        except ValueError:
-            response_payload = {"raw_response": response.text}
+            try:
+                response_payload = response.json()
+            except ValueError:
+                response_payload = {"raw_response": response.text}
 
-        summary = {
-            "status": "success" if response.ok else "failed",
-            "endpoint": endpoint,
-            "request_body": body,
-            "response_code": response.status_code,
-            "response_body": response_payload,
-        }
-        if not response.ok:
+            summary = {
+                "status": "success" if response.ok else "failed",
+                "endpoint": endpoint,
+                "request_body": body,
+                "response_code": response.status_code,
+                "response_body": response_payload,
+            }
+            if response.ok:
+                return summary
+
             error = (
                 response_payload.get("detail")
                 if isinstance(response_payload, dict) and response_payload.get("detail")
@@ -107,12 +124,31 @@ class RequestsUpstreamPcfDispatcher:
                 if isinstance(response_payload, dict) and response_payload.get("error")
                 else response.text
             )
-            raise PolicyError(
+            last_error = PolicyError(
                 f"upstream PCF rejected policy: {str(error or '').strip() or 'unknown upstream error'}",
                 status_code=502,
                 phase="upstream_pcf",
             )
-        return summary
+            if response.status_code < 500 or attempt >= self.request_retry_count:
+                raise last_error
+            time.sleep(self.retry_backoff_sec)
+
+        if last_error is not None:
+            raise last_error
+        raise PolicyError("upstream PCF request failed without a response", status_code=502, phase="upstream_pcf")
+
+    def healthcheck(self) -> tuple[bool, str]:
+        if not self.base_url:
+            return False, "upstream PCF base URL is not configured"
+        try:
+            response = self._session.get(self.base_url, timeout=self.request_timeout_sec)
+            status_code = int(response.status_code)
+            reason = str(response.reason or "").strip()
+            response.close()
+        except requests.exceptions.RequestException as exc:
+            return False, f"upstream request failed: {exc}"
+        detail = f"http {status_code}{(' ' + reason) if reason else ''}"
+        return (200 <= status_code < 500), detail
 
     def _build_request(self, policy_type: str, payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         if policy_type == AM_POLICY_TYPE:
@@ -266,6 +302,23 @@ class PolicyRuntime:
             )
         return _record_to_response(record)
 
+    def launch_healthcheck(self) -> dict[str, Any]:
+        flow_profile_exists = self.flow_profile_file.exists()
+        snapshot_exists = self.latest_snapshot_file.exists() if self.latest_snapshot_file is not None else True
+        upstream_ok = True
+        upstream_detail = "not configured"
+        if self.upstream_dispatcher is not None and hasattr(self.upstream_dispatcher, "healthcheck"):
+            upstream_ok, upstream_detail = self.upstream_dispatcher.healthcheck()
+        healthy = flow_profile_exists and snapshot_exists and upstream_ok
+        return {
+            "status": "ok" if healthy else "failed",
+            "healthy": healthy,
+            "flow_profile_exists": flow_profile_exists,
+            "latest_snapshot_exists": snapshot_exists,
+            "upstream_ok": upstream_ok,
+            "upstream_detail": upstream_detail,
+        }
+
     def _dispatch_upstream(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self.upstream_dispatcher is None:
             raise PolicyError("upstream dispatcher is not configured", status_code=500, phase="upstream_pcf")
@@ -274,6 +327,8 @@ class PolicyRuntime:
     def _wait_for_ns3(self, record: dict[str, Any]) -> dict[str, Any]:
         deadline = time.time() + float(record["timeout_ms"]) / 1000.0
         latest_snapshot: dict[str, Any] | None = None
+        saw_newer_snapshot = False
+        last_observation: dict[str, Any] | None = None
         while time.time() < deadline:
             try:
                 latest_snapshot = self._load_latest_snapshot()
@@ -289,6 +344,8 @@ class PolicyRuntime:
                 time.sleep(self.poll_interval_ms / 1000.0)
                 continue
 
+            saw_newer_snapshot = True
+
             execution_status, compliance_status, monitoring_data = _evaluate_record(record, latest_snapshot)
             record["applied_tick"] = latest_tick
             record["execution_status"] = execution_status
@@ -300,10 +357,22 @@ class PolicyRuntime:
                 record["message"] = "Policy dispatched to the upstream PCF and applied by ns-3."
                 record["status_code"] = 201
                 return record
+
+            last_observation = {
+                "execution_status": execution_status,
+                "compliance_status": compliance_status,
+                "monitoring_data": dict(record.get("monitoring_data") or {}),
+            }
+            time.sleep(self.poll_interval_ms / 1000.0)
+
+        if saw_newer_snapshot and last_observation is not None:
+            record["execution_status"] = str(last_observation.get("execution_status") or "FAILED")
+            record["compliance_status"] = str(last_observation.get("compliance_status") or "VIOLATED")
+            record["monitoring_data"] = dict(last_observation.get("monitoring_data") or {})
             return self._mark_failed(
                 record,
                 phase="ns3_apply",
-                error="ns-3 observed state does not match the requested policy",
+                error="ns-3 observed state did not converge to the requested policy before timeout",
                 status_code=409,
             )
 
@@ -437,6 +506,23 @@ def _values_close(left: Any, right: Any, *, tolerance: float = 1e-6) -> bool:
     if left_number is None or right_number is None:
         return str(left) == str(right)
     return math.isclose(left_number, right_number, rel_tol=tolerance, abs_tol=tolerance)
+
+
+def _within_ratio_tolerance(left: Any, right: Any, *, tolerance_ratio: float = QOS_TOLERANCE_RATIO) -> bool:
+    left_number = _to_float(left)
+    right_number = _to_float(right)
+    if left_number is None or right_number is None:
+        return str(left) == str(right)
+    baseline = max(abs(right_number), 1e-9)
+    return abs(left_number - right_number) <= baseline * max(0.0, float(tolerance_ratio))
+
+
+def _within_upper_bound(left: Any, right: Any, *, tolerance_ratio: float = QOS_TOLERANCE_RATIO) -> bool:
+    left_number = _to_float(left)
+    right_number = _to_float(right)
+    if left_number is None or right_number is None:
+        return str(left) == str(right)
+    return left_number <= right_number * (1.0 + max(0.0, float(tolerance_ratio)))
 
 
 def _normalize_snssai(candidate: Any) -> str:
@@ -836,17 +922,23 @@ def _evaluate_sm_record(
     telemetry = flow.get("telemetry") if isinstance(flow.get("telemetry"), dict) else {}
     applied = True
     if "allocated_bandwidth_dl_mbps" in requested_state:
-        applied = applied and _values_close(allocation.get("allocated_bandwidth_dl"), requested_state["allocated_bandwidth_dl_mbps"])
+        applied = applied and _within_ratio_tolerance(
+            allocation.get("allocated_bandwidth_dl"),
+            requested_state["allocated_bandwidth_dl_mbps"],
+        )
     if "allocated_bandwidth_ul_mbps" in requested_state:
-        applied = applied and _values_close(allocation.get("allocated_bandwidth_ul"), requested_state["allocated_bandwidth_ul_mbps"])
+        applied = applied and _within_ratio_tolerance(
+            allocation.get("allocated_bandwidth_ul"),
+            requested_state["allocated_bandwidth_ul_mbps"],
+        )
 
     compliant = applied
     if "latency_ms" in requested_state:
-        compliant = compliant and (_to_float(telemetry.get("latency")) or float("inf")) <= float(requested_state["latency_ms"])
+        compliant = compliant and _within_upper_bound(telemetry.get("latency"), requested_state["latency_ms"])
     if "jitter_ms" in requested_state:
-        compliant = compliant and (_to_float(telemetry.get("jitter")) or float("inf")) <= float(requested_state["jitter_ms"])
+        compliant = compliant and _within_upper_bound(telemetry.get("jitter"), requested_state["jitter_ms"])
     if "loss_rate" in requested_state:
-        compliant = compliant and (_to_float(telemetry.get("loss_rate")) or float("inf")) <= float(requested_state["loss_rate"])
+        compliant = compliant and _within_upper_bound(telemetry.get("loss_rate"), requested_state["loss_rate"])
 
     return (
         "APPLIED" if applied else "FAILED",
@@ -989,6 +1081,13 @@ class PolicyAcceptorHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if normalized_path == HEALTHCHECK_PATH:
+            if self.runtime is None:
+                self._send_json(500, {"status": "failed", "error": "runtime is not configured"})
+                return
+            response = self.runtime.launch_healthcheck()
+            self._send_json(200 if response.get("healthy") else 503, response)
+            return
         if not normalized_path.startswith(f"{EXECUTION_PATH}/"):
             self._send_json(404, {"status": "failed", "error": "not found"})
             return
@@ -1036,6 +1135,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-file")
     parser.add_argument("--upstream-pcf-base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--upstream-timeout-sec", type=float, default=5.0)
+    parser.add_argument("--upstream-retry-count", type=int, default=3)
+    parser.add_argument("--upstream-retry-backoff-sec", type=float, default=1.0)
     parser.add_argument("--callback-base-url", default="")
     parser.add_argument("--default-timeout-ms", type=int, default=10000)
     parser.add_argument("--poll-interval-ms", type=int, default=200)
@@ -1162,6 +1263,8 @@ def run_server(args: argparse.Namespace) -> None:
             base_url=args.upstream_pcf_base_url,
             request_timeout_sec=args.upstream_timeout_sec,
             callback_base_url=args.callback_base_url,
+            request_retry_count=args.upstream_retry_count,
+            retry_backoff_sec=args.upstream_retry_backoff_sec,
         ),
         default_timeout_ms=args.default_timeout_ms,
         poll_interval_ms=args.poll_interval_ms,

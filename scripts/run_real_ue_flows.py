@@ -12,22 +12,10 @@ import shlex
 import signal
 import subprocess
 import time
-
-
-def _stable_hash(value: str) -> int:
-    result = 0
-    for char in value:
-        result = ((result * 131) + ord(char)) & 0xFFFFFFFF
-    return result
-
-
-def _activity_factor(flow_id: str, tick_index: int, requested_rate_pps: float, capped_rate_pps: float) -> float:
-    if requested_rate_pps <= 0.0 or capped_rate_pps <= 0.0:
+def _rate_pps_from_bandwidth(target_mbps: float, packet_size: float) -> float:
+    if target_mbps <= 0.0 or packet_size <= 0.0:
         return 0.0
-    headroom_ratio = min(1.0, capped_rate_pps / requested_rate_pps)
-    base = 0.82 + 0.12 * headroom_ratio
-    variation = ((_stable_hash(f"{flow_id}:{tick_index}") % 11) - 5) * 0.01
-    return max(0.70, min(0.98, base + variation))
+    return target_mbps * 1e6 / 8.0 / packet_size
 
 
 def _select_interface_for_session(rows: list[list[str]], session_index: int) -> tuple[list[str], bool]:
@@ -127,7 +115,9 @@ def main(argv: list[str] | None = None) -> int:
                     "port": args.base_port + index,
                     "source_port": source_port,
                     "packet_size": packet_size,
-                    "rate_pps": rate_pps,
+                    "requested_rate_pps": rate_pps,
+                    "target_ul_mbps": float(row.get("bandwidth_ul_mbps") or 0.0),
+                    "target_dl_mbps": float(row.get("bandwidth_dl_mbps") or 0.0),
                     "carry_ul": 0.0,
                     "carry_dl": 0.0,
                 }
@@ -216,29 +206,18 @@ def main(argv: list[str] | None = None) -> int:
                 packet_size = float(flow["packet_size"])
                 allocated_ul = float(allocation.get("allocated_bandwidth_ul_mbps", 0.0) or 0.0)
                 allocated_dl = float(allocation.get("allocated_bandwidth_dl_mbps", 0.0) or 0.0)
-                requested_rate_pps = float(flow["rate_pps"])
-                capped_ul_rate_pps = allocated_ul * 1e6 / 8.0 / packet_size if allocated_ul > 0.0 else 0.0
-                capped_dl_rate_pps = allocated_dl * 1e6 / 8.0 / packet_size if allocated_dl > 0.0 else 0.0
-                ul_rate_pps = min(
-                    requested_rate_pps,
-                    capped_ul_rate_pps
-                    * _activity_factor(
-                        str(flow["flow_id"]),
-                        tick_index,
-                        requested_rate_pps,
-                        capped_ul_rate_pps,
-                    ),
-                )
-                dl_rate_pps = min(
-                    requested_rate_pps,
-                    capped_dl_rate_pps
-                    * _activity_factor(
-                        f"{flow['flow_id']}:dl",
-                        tick_index,
-                        requested_rate_pps,
-                        capped_dl_rate_pps,
-                    ),
-                )
+                target_ul_mbps = allocated_ul if allocated_ul > 0.0 else float(flow["target_ul_mbps"])
+                target_dl_mbps = allocated_dl if allocated_dl > 0.0 else float(flow["target_dl_mbps"])
+
+                # Drive external traffic from the current target bandwidth rather than
+                # the original arrival_rate_pps hint. This keeps measured throughput
+                # aligned with the policy-adjusted bandwidth in each direction.
+                ul_rate_pps = _rate_pps_from_bandwidth(target_ul_mbps, packet_size)
+                dl_rate_pps = _rate_pps_from_bandwidth(target_dl_mbps, packet_size)
+                if ul_rate_pps <= 0.0 and dl_rate_pps <= 0.0:
+                    fallback_rate_pps = float(flow["requested_rate_pps"])
+                    ul_rate_pps = fallback_rate_pps
+                    dl_rate_pps = fallback_rate_pps
                 exact_ul_packets = ul_rate_pps * elapsed_ms / 1000.0 + float(flow["carry_ul"])
                 exact_dl_packets = dl_rate_pps * elapsed_ms / 1000.0 + float(flow["carry_dl"])
                 ul_packets = int(exact_ul_packets)

@@ -46,6 +46,7 @@ class SliceConfig:
     sd: str
     label: str | None = None
     resource: "SliceResourceConfig | None" = None
+    qos: "SliceQosConfig | None" = None
 
     @property
     def slice_id(self) -> str:
@@ -59,6 +60,14 @@ class SliceResourceConfig:
     guaranteed_dl_mbps: float
     guaranteed_ul_mbps: float
     priority: int = 1
+
+
+@dataclass(slots=True, frozen=True)
+class SliceQosConfig:
+    latency_ms: float = 0.0
+    jitter_ms: float = 0.0
+    loss_rate: float = 0.0
+    processing_delay_ms: float = 0.0
 
 
 @dataclass(slots=True, frozen=True)
@@ -450,6 +459,16 @@ class ScenarioConfig:
                         priority=int(item["resource"].get("priority", 1)),
                     )
                     if isinstance(item.get("resource"), dict)
+                    else None
+                ),
+                qos=(
+                    SliceQosConfig(
+                        latency_ms=float(item["qos"].get("latency_ms", 0.0)),
+                        jitter_ms=float(item["qos"].get("jitter_ms", 0.0)),
+                        loss_rate=float(item["qos"].get("loss_rate", 0.0)),
+                        processing_delay_ms=float(item["qos"].get("processing_delay_ms", 0.0)),
+                    )
+                    if isinstance(item.get("qos"), dict)
                     else None
                 ),
             )

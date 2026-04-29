@@ -253,6 +253,7 @@ def _build_semantic_graph_payload(graph_summary: dict[str, Any]) -> dict[str, An
                 "label": _string(properties.get("name"), label),
             }
             capacity = dict(properties.get("capacity", {})) if isinstance(properties.get("capacity"), dict) else {}
+            qos = dict(properties.get("qos", {})) if isinstance(properties.get("qos"), dict) else {}
             if capacity:
                 resource_payload = {
                     "capacity_dl_mbps": _maybe_float(capacity.get("capacity_dl_mbps") or capacity.get("total_bandwidth_dl")),
@@ -272,6 +273,17 @@ def _build_semantic_graph_payload(graph_summary: dict[str, Any]) -> dict[str, An
                     "guaranteed_ul_mbps",
                 )):
                     slice_payload["resource"] = resource_payload
+            if qos:
+                qos_payload = {
+                    "latency_ms": _maybe_float(qos.get("latency_ms") or qos.get("latency")),
+                    "jitter_ms": _maybe_float(qos.get("jitter_ms") or qos.get("jitter")),
+                    "loss_rate": _maybe_float(qos.get("loss_rate")),
+                    "processing_delay_ms": _maybe_float(
+                        qos.get("processing_delay_ms") or qos.get("processing_delay")
+                    ),
+                }
+                if any(value is not None for value in qos_payload.values()):
+                    slice_payload["qos"] = {key: value for key, value in qos_payload.items() if value is not None}
             slice_payloads[slice_ref] = slice_payload
             continue
 

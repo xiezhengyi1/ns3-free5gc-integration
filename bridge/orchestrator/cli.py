@@ -19,7 +19,12 @@ def _prepare_run(args: argparse.Namespace) -> int:
     project_root = Path(__file__).resolve().parents[2]
     scenario = load_scenario(args.scenario)
     run_id = args.run_id or generate_run_id(scenario.scenario_id)
-    rendered = render_run_assets(project_root, scenario, run_id)
+    rendered = render_run_assets(
+        project_root,
+        scenario,
+        run_id,
+        live_graph_snapshot_id=args.live_graph_snapshot_id,
+    )
     print(json.dumps(rendered.manifest.to_dict(), indent=2, ensure_ascii=False))
     return 0
 
@@ -67,7 +72,7 @@ def _start_run(args: argparse.Namespace) -> int:
 def _run_command(command: dict[str, object], child_env: dict[str, str], *, stream_output: bool) -> None:
     argv = command["argv"]
     cwd = command["cwd"]
-    retries = 3 if _is_retryable_compose_up(argv) else 1
+    retries = 3 if _is_retryable_compose_up(argv) or _is_retryable_bridge_setup(command) else 1
     last_error: subprocess.CalledProcessError | None = None
     for attempt in range(1, retries + 1):
         try:
@@ -84,7 +89,7 @@ def _run_command(command: dict[str, object], child_env: dict[str, str], *, strea
         except subprocess.CalledProcessError as exc:
             last_error = exc
             message = str(exc)
-            if attempt >= retries or not _is_retryable_compose_failure(message):
+            if attempt >= retries or not _is_retryable_failure(command, message):
                 raise
             time.sleep(2)
     if last_error is not None:
@@ -102,6 +107,16 @@ def _is_retryable_compose_up(argv: object) -> bool:
 
 def _is_retryable_compose_failure(message: str) -> bool:
     return "already in progress" in message or "No such container" in message
+
+
+def _is_retryable_bridge_setup(command: dict[str, object]) -> bool:
+    return str(command.get("name") or "").strip() == "bridge-setup"
+
+
+def _is_retryable_failure(command: dict[str, object], message: str) -> bool:
+    if _is_retryable_bridge_setup(command):
+        return True
+    return _is_retryable_compose_failure(message)
 
 
 def _should_stream_command(command: dict[str, object]) -> bool:
@@ -133,6 +148,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare = subparsers.add_parser("prepare-run", help="render configs and manifest")
     prepare.add_argument("scenario", help="path to scenario YAML")
     prepare.add_argument("--run-id", help="explicit run identifier")
+    prepare.add_argument("--live-graph-snapshot-id", help="override writer-follow-ns3 live graph snapshot id")
     prepare.set_defaults(handler=_prepare_run)
 
     start = subparsers.add_parser("start", help="execute manifest commands")

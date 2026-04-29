@@ -818,6 +818,7 @@ def build_graph_snapshot_bundle(
                 if telemetry_loss_value is not None:
                     telemetry_loss.append(telemetry_loss_value)
         slice_resource = _dict_properties(slice_record.resource)
+        explicit_slice_qos = _dict_properties(getattr(slice_record, "qos", None))
         slice_capacity = {
             "total_bandwidth_dl": slice_resource.get("capacity_dl_mbps", total_bandwidth_dl),
             "total_bandwidth_ul": slice_resource.get("capacity_ul_mbps", total_bandwidth_ul),
@@ -831,10 +832,10 @@ def build_graph_snapshot_bundle(
             "demand_bandwidth_ul": _dict_properties(slice_record.telemetry).get("demand_ul_mbps"),
         }
         slice_qos = {
-            "latency": _average(latency_targets),
-            "jitter": _average(jitter_targets),
-            "loss_rate": _average(loss_targets),
-            "processing_delay": _average(processing_delays),
+            "latency": explicit_slice_qos.get("latency", _average(latency_targets)),
+            "jitter": explicit_slice_qos.get("jitter", _average(jitter_targets)),
+            "loss_rate": explicit_slice_qos.get("loss_rate", _average(loss_targets)),
+            "processing_delay": explicit_slice_qos.get("processing_delay", _average(processing_delays)),
         }
         utilization_dl = (
             current_bandwidth_dl / total_bandwidth_dl

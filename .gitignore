@@ -7,3 +7,4 @@ tmp/
 *.log
 *.sqlite3
 *.db
+.venv

@@ -98,23 +98,109 @@ class SubscriberBootstrapTest(unittest.TestCase):
         try:
             payload_path = root / "ue1-subscriber.json"
             payload_path.write_text(
-                json.dumps({"ueId": "imsi-208930000000001", "plmnID": "20893"}),
+                json.dumps(
+                    {
+                        "ueId": "imsi-208930000000001",
+                        "plmnID": "20893",
+                        "SmPolicyData": {
+                            "smPolicySnssaiData": {
+                                "01000001": {
+                                    "smPolicyDnnData": {
+                                        "internet": {"dnn": "internet"},
+                                    }
+                                }
+                            }
+                        },
+                    }
+                ),
                 encoding="utf-8",
             )
             with mock.patch(
                 "adapters.free5gc_ueransim.subscriber_bootstrap._put_subscriber",
                 side_effect=[ConnectionResetError("reset"), 204],
             ) as patched:
-                results = upsert_subscriber_payloads(
-                    [payload_path],
-                    base_url="http://127.0.0.1:5000",
-                    timeout_seconds=2,
-                    interval_seconds=0,
-                )
+                with mock.patch(
+                    "adapters.free5gc_ueransim.subscriber_bootstrap._get_subscriber",
+                    return_value={
+                        "SmPolicyData": {
+                            "smPolicySnssaiData": {
+                                "01000001": {
+                                    "smPolicyDnnData": {
+                                        "internet": {"dnn": "internet"},
+                                    }
+                                }
+                            }
+                        }
+                    },
+                ):
+                    results = upsert_subscriber_payloads(
+                        [payload_path],
+                        base_url="http://127.0.0.1:5000",
+                        timeout_seconds=2,
+                        interval_seconds=0,
+                    )
 
             self.assertEqual(patched.call_count, 2)
             self.assertEqual(results[0]["status"], 204)
             self.assertEqual(results[0]["attempts"], 2)
+            self.assertTrue(results[0]["verified_sm_policy_data"])
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_retries_until_sm_policy_data_is_visible_in_readback(self) -> None:
+        root = Path(tempfile.mkdtemp(prefix="subscriber-bootstrap-"))
+        try:
+            payload_path = root / "ue1-subscriber.json"
+            payload_path.write_text(
+                json.dumps(
+                    {
+                        "ueId": "imsi-208930000000001",
+                        "plmnID": "20893",
+                        "SmPolicyData": {
+                            "smPolicySnssaiData": {
+                                "01000001": {
+                                    "smPolicyDnnData": {
+                                        "internet": {"dnn": "internet"},
+                                    }
+                                }
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch(
+                "adapters.free5gc_ueransim.subscriber_bootstrap._put_subscriber",
+                return_value=204,
+            ) as put_patched:
+                with mock.patch(
+                    "adapters.free5gc_ueransim.subscriber_bootstrap._get_subscriber",
+                    side_effect=[
+                        {"SmPolicyData": {"smPolicySnssaiData": {}}},
+                        {
+                            "SmPolicyData": {
+                                "smPolicySnssaiData": {
+                                    "01000001": {
+                                        "smPolicyDnnData": {
+                                            "internet": {"dnn": "internet"},
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                    ],
+                ) as get_patched:
+                    results = upsert_subscriber_payloads(
+                        [payload_path],
+                        base_url="http://127.0.0.1:5000",
+                        timeout_seconds=2,
+                        interval_seconds=0,
+                    )
+
+            self.assertEqual(put_patched.call_count, 2)
+            self.assertEqual(get_patched.call_count, 2)
+            self.assertEqual(results[0]["attempts"], 2)
+            self.assertTrue(results[0]["verified_sm_policy_data"])
         finally:
             shutil.rmtree(root, ignore_errors=True)
 

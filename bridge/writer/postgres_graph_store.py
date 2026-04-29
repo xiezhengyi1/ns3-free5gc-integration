@@ -218,6 +218,119 @@ class PostgresGraphStore:
             row = session.execute(statement, {"snapshot_id": snapshot_id}).mappings().one_or_none()
             return dict(row) if row is not None else None
 
+    def snapshot_exists(self, snapshot_id: str) -> bool:
+        NetworkGraphSnapshot = self.models["NetworkGraphSnapshot"]
+        with self.models["Session"](self.engine) as session:
+            return (
+                session.query(NetworkGraphSnapshot.id)
+                .filter_by(snapshot_id=str(snapshot_id))
+                .first()
+                is not None
+            )
+
+    def latest_snapshot_id(self) -> str | None:
+        NetworkGraphSnapshot = self.models["NetworkGraphSnapshot"]
+        with self.models["Session"](self.engine) as session:
+            row = (
+                session.query(NetworkGraphSnapshot.snapshot_id)
+                .order_by(NetworkGraphSnapshot.created_at.desc(), NetworkGraphSnapshot.id.desc())
+                .first()
+            )
+            if row is None:
+                return None
+            return str(row[0]) if row[0] is not None else None
+
+    def delete_snapshot(self, snapshot_id: str) -> dict[str, object]:
+        GraphNode = self.models["GraphNode"]
+        GraphEdge = self.models["GraphEdge"]
+        GraphMetric = self.models["GraphMetric"]
+        NetworkGraphSnapshot = self.models["NetworkGraphSnapshot"]
+        normalized_snapshot_id = str(snapshot_id)
+
+        with self.models["Session"](self.engine) as session:
+            deleted_metric_count = (
+                session.query(GraphMetric)
+                .filter_by(snapshot_id=normalized_snapshot_id)
+                .delete(synchronize_session=False)
+            )
+            deleted_edge_count = (
+                session.query(GraphEdge)
+                .filter_by(snapshot_id=normalized_snapshot_id)
+                .delete(synchronize_session=False)
+            )
+            deleted_node_count = (
+                session.query(GraphNode)
+                .filter_by(snapshot_id=normalized_snapshot_id)
+                .delete(synchronize_session=False)
+            )
+            deleted_snapshot_count = (
+                session.query(NetworkGraphSnapshot)
+                .filter_by(snapshot_id=normalized_snapshot_id)
+                .delete(synchronize_session=False)
+            )
+            session.commit()
+
+        return {
+            "snapshot_id": normalized_snapshot_id,
+            "deleted_snapshot_count": int(deleted_snapshot_count),
+            "deleted_node_count": int(deleted_node_count),
+            "deleted_edge_count": int(deleted_edge_count),
+            "deleted_metric_count": int(deleted_metric_count),
+        }
+
+    def prune_snapshots(self, *, keep_snapshot_ids: list[str] | set[str] | tuple[str, ...]) -> dict[str, object]:
+        GraphNode = self.models["GraphNode"]
+        GraphEdge = self.models["GraphEdge"]
+        GraphMetric = self.models["GraphMetric"]
+        NetworkGraphSnapshot = self.models["NetworkGraphSnapshot"]
+        keep_ids = {str(item).strip() for item in keep_snapshot_ids if str(item).strip()}
+
+        with self.models["Session"](self.engine) as session:
+            snapshot_query = session.query(NetworkGraphSnapshot.snapshot_id)
+            if keep_ids:
+                snapshot_query = snapshot_query.filter(~NetworkGraphSnapshot.snapshot_id.in_(sorted(keep_ids)))
+            snapshot_ids_to_delete = [str(row[0]) for row in snapshot_query.all()]
+            if not snapshot_ids_to_delete:
+                return {
+                    "kept_snapshot_ids": sorted(keep_ids),
+                    "deleted_snapshot_ids": [],
+                    "deleted_snapshot_count": 0,
+                    "deleted_node_count": 0,
+                    "deleted_edge_count": 0,
+                    "deleted_metric_count": 0,
+                }
+
+            deleted_metric_count = (
+                session.query(GraphMetric)
+                .filter(GraphMetric.snapshot_id.in_(snapshot_ids_to_delete))
+                .delete(synchronize_session=False)
+            )
+            deleted_edge_count = (
+                session.query(GraphEdge)
+                .filter(GraphEdge.snapshot_id.in_(snapshot_ids_to_delete))
+                .delete(synchronize_session=False)
+            )
+            deleted_node_count = (
+                session.query(GraphNode)
+                .filter(GraphNode.snapshot_id.in_(snapshot_ids_to_delete))
+                .delete(synchronize_session=False)
+            )
+            deleted_snapshot_count = (
+                session.query(NetworkGraphSnapshot)
+                .filter(NetworkGraphSnapshot.snapshot_id.in_(snapshot_ids_to_delete))
+                .delete(synchronize_session=False)
+            )
+            session.commit()
+
+        return {
+            "kept_snapshot_ids": sorted(keep_ids),
+            "deleted_snapshot_ids": snapshot_ids_to_delete,
+            "deleted_snapshot_count": int(deleted_snapshot_count),
+            "deleted_node_count": int(deleted_node_count),
+            "deleted_edge_count": int(deleted_edge_count),
+            "deleted_metric_count": int(deleted_metric_count),
+        }
+
     def _load_effective_node_rows(
         self,
         run_id: str,

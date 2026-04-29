@@ -504,14 +504,18 @@ def _read_payload(path: Path) -> dict[str, object]:
     return payload
 
 
+def _subscriber_endpoint(base_url: str, ue_id: str, plmn_id: str) -> str:
+    return (
+        f"{base_url.rstrip('/')}/api/subscriber/"
+        f"{parse.quote(ue_id, safe='')}/{parse.quote(plmn_id, safe='')}"
+    )
+
+
 def _put_subscriber(base_url: str, payload: dict[str, object]) -> int:
     sanitized_payload = _sanitize_payload_for_webui(payload)
     ue_id = str(sanitized_payload["ueId"])
     plmn_id = str(sanitized_payload["plmnID"])
-    target_url = (
-        f"{base_url.rstrip('/')}/api/subscriber/"
-        f"{parse.quote(ue_id, safe='')}/{parse.quote(plmn_id, safe='')}"
-    )
+    target_url = _subscriber_endpoint(base_url, ue_id, plmn_id)
     request_body = json.dumps(sanitized_payload, ensure_ascii=False).encode("utf-8")
     http_request = request.Request(
         target_url,
@@ -522,6 +526,69 @@ def _put_subscriber(base_url: str, payload: dict[str, object]) -> int:
     # Ignore host HTTP(S) proxy settings; WebUI is expected to be local to the run.
     with _WEBUI_OPENER.open(http_request, timeout=10) as response:
         return response.status
+
+
+def _get_subscriber(base_url: str, payload: dict[str, object]) -> dict[str, object]:
+    sanitized_payload = _sanitize_payload_for_webui(payload)
+    target_url = _subscriber_endpoint(
+        base_url,
+        str(sanitized_payload["ueId"]),
+        str(sanitized_payload["plmnID"]),
+    )
+    http_request = request.Request(
+        target_url,
+        headers={"Accept": "application/json"},
+        method="GET",
+    )
+    with _WEBUI_OPENER.open(http_request, timeout=10) as response:
+        response_payload = json.loads(response.read().decode("utf-8"))
+    if not isinstance(response_payload, dict):
+        raise ValueError(f"subscriber readback returned non-object payload: {target_url}")
+    return response_payload
+
+
+def _verify_sm_policy_readback(payload: dict[str, object], subscriber_payload: dict[str, object]) -> None:
+    expected = payload.get("SmPolicyData")
+    if not isinstance(expected, dict):
+        return
+    expected_snssai = expected.get("smPolicySnssaiData")
+    if not isinstance(expected_snssai, dict) or not expected_snssai:
+        return
+
+    observed = subscriber_payload.get("SmPolicyData")
+    if not isinstance(observed, dict):
+        raise ValueError("subscriber readback is missing SmPolicyData")
+    observed_snssai = observed.get("smPolicySnssaiData")
+    if not isinstance(observed_snssai, dict):
+        raise ValueError("subscriber readback is missing SmPolicyData.smPolicySnssaiData")
+
+    # Confirm every expected SNSSAI->DNN entry is visible through WebUI readback
+    # before the run continues. This prevents races where the PUT returns first
+    # but PCF/UDR still cannot read the subscriber's SM policy data.
+    missing_entries: list[str] = []
+    for snssai_key, snssai_payload in expected_snssai.items():
+        if not isinstance(snssai_payload, dict):
+            continue
+        expected_dnn_data = snssai_payload.get("smPolicyDnnData")
+        if not isinstance(expected_dnn_data, dict) or not expected_dnn_data:
+            continue
+        observed_snssai_payload = observed_snssai.get(snssai_key)
+        if not isinstance(observed_snssai_payload, dict):
+            missing_entries.extend(f"{snssai_key}:{dnn}" for dnn in expected_dnn_data)
+            continue
+        observed_dnn_data = observed_snssai_payload.get("smPolicyDnnData")
+        if not isinstance(observed_dnn_data, dict):
+            missing_entries.extend(f"{snssai_key}:{dnn}" for dnn in expected_dnn_data)
+            continue
+        for dnn_name in expected_dnn_data:
+            if dnn_name not in observed_dnn_data:
+                missing_entries.append(f"{snssai_key}:{dnn_name}")
+
+    if missing_entries:
+        raise ValueError(
+            "subscriber readback is missing expected SmPolicyData entries: "
+            + ", ".join(missing_entries)
+        )
 
 
 def upsert_subscriber_payloads(
@@ -552,6 +619,14 @@ def upsert_subscriber_payloads(
                 time.sleep(interval_seconds)
                 continue
 
+            try:
+                readback_payload = _get_subscriber(base_url, payload)
+                _verify_sm_policy_readback(payload, readback_payload)
+            except (error.HTTPError, error.URLError, ConnectionResetError, TimeoutError, OSError, ValueError) as exc:
+                last_error = exc
+                time.sleep(interval_seconds)
+                continue
+
             result = {
                 "payload": str(payload_path),
                 "ue_id": payload["ueId"],
@@ -559,12 +634,13 @@ def upsert_subscriber_payloads(
                 "status": status,
                 "attempts": attempts,
                 "base_url": base_url,
+                "verified_sm_policy_data": True,
             }
             results.append(result)
             break
         else:
             raise TimeoutError(
-                f"timed out while upserting subscriber {payload.get('ueId')} via {base_url}: {last_error}"
+                f"timed out while upserting/verifying subscriber {payload.get('ueId')} via {base_url}: {last_error}"
             )
     return results
 

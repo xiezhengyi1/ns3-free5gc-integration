@@ -8,6 +8,8 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
+import requests
+
 from bridge.policy_acceptor import PolicyError, PolicyRuntime, RequestsUpstreamPcfDispatcher, _clear_port_binding
 
 
@@ -108,6 +110,9 @@ class StubDispatcher:
         if self.error is not None:
             raise self.error
         return dict(self.result)
+
+    def healthcheck(self) -> tuple[bool, str]:
+        return True, "stub-ok"
 
 
 class PolicyGatewayTest(unittest.TestCase):
@@ -458,6 +463,7 @@ class PolicyGatewayTest(unittest.TestCase):
                 "snapshot_id": "snapshot-6",
                 "policy_id": "smp-mismatch",
                 "policy_type": "SmPolicyDecision",
+                "timeout_ms": 150,
                 "policy_details": {
                     "policy_id": "smp-mismatch",
                     "target_type": "flow",
@@ -471,6 +477,60 @@ class PolicyGatewayTest(unittest.TestCase):
         self.assertEqual(response["phase"], "ns3_apply")
         self.assertEqual(response["execution_status"], "FAILED")
         self.assertEqual(response["compliance_status"], "VIOLATED")
+        self.assertIn("did not converge", response["error"])
+
+    def test_launch_healthcheck_reports_upstream_state(self) -> None:
+        _write_profiles(
+            self.flow_profile_file,
+            [_base_row(flow_id="flow-1", supi="imsi-208930000000001", slice_ref="slice-1-000001", slice_snssai="01000001")],
+        )
+        self._write_snapshot({"run_id": "run-hc", "tick_index": 1, "flows": [], "ues": [], "slices": []})
+        runtime = self._build_runtime(StubDispatcher())
+
+        response = runtime.launch_healthcheck()
+
+        self.assertTrue(response["healthy"])
+        self.assertTrue(response["flow_profile_exists"])
+        self.assertTrue(response["latest_snapshot_exists"])
+        self.assertTrue(response["upstream_ok"])
+
+    @mock.patch("requests.Session.post")
+    def test_requests_dispatcher_retries_transient_transport_error(self, mock_post: mock.Mock) -> None:
+        ok_response = mock.Mock()
+        ok_response.ok = True
+        ok_response.status_code = 201
+        ok_response.reason = "Created"
+        ok_response.json.return_value = {"policyId": "ok"}
+        mock_post.side_effect = [
+            requests.exceptions.ConnectionError("connection reset"),
+            ok_response,
+        ]
+
+        dispatcher = RequestsUpstreamPcfDispatcher(
+            base_url="http://pcf.example",
+            request_retry_count=2,
+            retry_backoff_sec=0.0,
+        )
+
+        result = dispatcher.dispatch(
+            {
+                "policy_id": "am-1",
+                "policy_type": "PcfAmPolicyControlPolicyAssociation",
+                "policy_details": {
+                    "request": {
+                        "supi": "imsi-208930000000001",
+                        "notificationUri": "http://callback.example/notify",
+                        "accessType": "3GPP_ACCESS",
+                        "servingPlmn": {"mcc": "208", "mnc": "93"},
+                        "guami": {"plmnId": {"mcc": "208", "mnc": "93"}, "amfId": "000001"},
+                        "userLoc": {"nrLocation": {"tai": {"plmnId": {"mcc": "208", "mnc": "93"}, "tac": "000001"}}},
+                    }
+                },
+            }
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(mock_post.call_count, 2)
 
     def test_invalid_snapshot_file_returns_failed(self) -> None:
         _write_profiles(

@@ -178,6 +178,7 @@ def render_compose_for_run(
 
     if scenario.free5gc.mode == "single_upf" and "free5gc-upf" in services:
         upf_service = services["free5gc-upf"]
+        upf_service["command"] = "bash -c \"bash ./upf-iptables.sh && ./upf -c ./config/upfcfg.yaml\""
         _replace_volume_source(upf_service, "/free5gc/config/upfcfg.yaml", generated_config_dir / "upfcfg.yaml")
         _ensure_network_entry(upf_service, "privnet")["ipv4_address"] = UPF_CONTROL_IP
     elif scenario.free5gc.mode == "ulcl":

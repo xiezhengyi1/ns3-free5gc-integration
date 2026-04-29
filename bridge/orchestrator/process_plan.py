@@ -23,6 +23,7 @@ class CommandSpec:
 class RunManifest:
     run_id: str
     scenario_id: str
+    live_graph_snapshot_id: str | None
     run_dir: str
     compose_file: str
     compose_project_name: str
@@ -68,6 +69,7 @@ def build_run_manifest(
     subscriber_payloads: list[Path],
     free5gc_webui_url: str,
     resolved_topology: ResolvedScenarioTopology,
+    live_graph_snapshot_id: str | None = None,
 ) -> RunManifest:
     python_executable = project_root / ".venv" / "bin" / "python3"
     python_command = str(python_executable) if python_executable.exists() else "python3"
@@ -108,6 +110,7 @@ def build_run_manifest(
         )
         for ue in scenario.ues
     )
+    resolved_live_graph_snapshot_id = str(live_graph_snapshot_id or "").strip() or f"live-{scenario.scenario_id}"
     commands = [
         CommandSpec(
             name="compose-up-core",
@@ -289,6 +292,8 @@ def build_run_manifest(
                 str(state_db),
                 "--archive-dir",
                 str(archive_dir),
+                "--tick-ms",
+                str(scenario.tick_ms),
             ],
             background=True,
         ),
@@ -441,7 +446,7 @@ def build_run_manifest(
                 "--graph-db-url",
                 scenario.writer.graph_db_url,
                 "--live-graph-snapshot-id",
-                f"live-{scenario.scenario_id}",
+                resolved_live_graph_snapshot_id,
             ]
         )
     if resolved_topology.source_graph_file:
@@ -452,6 +457,7 @@ def build_run_manifest(
     return RunManifest(
         run_id=run_id,
         scenario_id=scenario.scenario_id,
+        live_graph_snapshot_id=(resolved_live_graph_snapshot_id if scenario.writer.graph_db_url else None),
         run_dir=str(run_dir),
         compose_file=str(compose_file),
         compose_project_name=scenario.free5gc.project_name,

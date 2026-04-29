@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from bridge.common.schema import TickSnapshot
 from bridge.writer.http_sink import HttpIngestionClient
@@ -44,6 +46,102 @@ class Ns3ClockReference:
         return self._tick_index
 
 
+class RealTrafficStateReader:
+    def __init__(self, path: str, timeout_seconds: float) -> None:
+        self.path = Path(path).expanduser().resolve()
+        self.timeout_seconds = max(0.0, float(timeout_seconds))
+        self._offset = 0
+        self._pending: deque[dict[str, Any]] = deque()
+        self._latest_payload: dict[str, Any] | None = None
+
+    def payload_for_tick(self, target_tick: int) -> dict[str, Any] | None:
+        deadline = time.monotonic() + self.timeout_seconds
+        normalized_target = int(target_tick)
+        while True:
+            self._read_available()
+            self._advance_to_tick(normalized_target)
+
+            latest_tick = self._tick_of(self._latest_payload)
+            if latest_tick >= normalized_target:
+                return self._latest_payload
+            if time.monotonic() >= deadline:
+                return self._latest_payload
+            time.sleep(0.05)
+
+    def _advance_to_tick(self, target_tick: int) -> None:
+        while self._pending:
+            next_tick = self._tick_of(self._pending[0])
+            if next_tick > target_tick:
+                break
+            self._latest_payload = self._pending.popleft()
+
+    def _read_available(self) -> None:
+        try:
+            file_size = self.path.stat().st_size
+        except FileNotFoundError:
+            return
+
+        if file_size < self._offset:
+            self._offset = 0
+            self._pending.clear()
+            self._latest_payload = None
+
+        with self.path.open("r", encoding="utf-8") as handle:
+            handle.seek(self._offset)
+            while True:
+                line_start = handle.tell()
+                line = handle.readline()
+                if not line:
+                    break
+                if not line.endswith("\n"):
+                    handle.seek(line_start)
+                    break
+                self._offset = handle.tell()
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    payload = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                tick_index = payload.get("tick_index")
+                if tick_index is None:
+                    continue
+                try:
+                    payload["tick_index"] = int(tick_index)
+                except (TypeError, ValueError):
+                    continue
+                self._pending.append(payload)
+
+    @staticmethod
+    def _tick_of(payload: dict[str, Any] | None) -> int:
+        if not isinstance(payload, dict):
+            return -1
+        tick_index = payload.get("tick_index")
+        try:
+            return int(tick_index)
+        except (TypeError, ValueError):
+            return -1
+
+
+def _get_real_traffic_reader(args: argparse.Namespace) -> RealTrafficStateReader | None:
+    state_file = getattr(args, "real_traffic_state_file", None)
+    if not state_file:
+        return None
+
+    path = Path(state_file).expanduser().resolve()
+    timeout_seconds = float(getattr(args, "real_traffic_timeout_seconds", 15.0))
+    reader = getattr(args, "_real_traffic_reader", None)
+    if isinstance(reader, RealTrafficStateReader) and reader.path == path:
+        return reader
+
+    reader = RealTrafficStateReader(str(path), timeout_seconds)
+    setattr(args, "_real_traffic_reader", reader)
+    return reader
+
+
 def _as_float(value: object) -> float | None:
     if value is None:
         return None
@@ -51,6 +149,79 @@ def _as_float(value: object) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _stable_hash(value: str) -> int:
+    result = 0
+    for char in value:
+        result = ((result * 131) + ord(char)) & 0xFFFFFFFF
+    return result
+
+
+def _deterministic_unit(*parts: object) -> float:
+    token = ":".join(str(part) for part in parts)
+    return _stable_hash(token) / float(0xFFFFFFFF)
+
+
+def _resolve_flow_target_bandwidth(flow: Any, direction: str) -> float:
+    allocation = dict(getattr(flow, "allocation", {}) or {})
+    sla = dict(getattr(flow, "sla", {}) or {})
+    allocation_key = f"allocated_bandwidth_{direction}"
+    sla_key = f"bandwidth_{direction}"
+    target = _as_float(allocation.get(allocation_key))
+    if target is not None and target > 0.0:
+        return target
+    target = _as_float(sla.get(sla_key))
+    if target is not None and target > 0.0:
+        return target
+    return 0.0
+
+
+def _estimate_runtime_loss_rate(
+    flow: Any,
+    *,
+    throughput_ul_mbps: float,
+    throughput_dl_mbps: float,
+    packet_sent: int,
+    tick_index: int,
+) -> float:
+    sla = dict(getattr(flow, "sla", {}) or {})
+    target_loss = max(0.0, min(1.0, _as_float(sla.get("loss_rate")) or 0.0))
+    target_ul = _resolve_flow_target_bandwidth(flow, "ul")
+    target_dl = _resolve_flow_target_bandwidth(flow, "dl")
+
+    pressure_samples: list[float] = []
+    if target_ul > 0.0:
+        pressure_samples.append(max(0.0, 1.0 - throughput_ul_mbps / target_ul))
+    if target_dl > 0.0:
+        pressure_samples.append(max(0.0, 1.0 - throughput_dl_mbps / target_dl))
+    pressure = max(pressure_samples, default=0.0)
+
+    # Use the SLA value as a target baseline, then introduce a small deterministic
+    # runtime variation plus an additional penalty when measured throughput falls
+    # below the current target bandwidth.
+    base_multiplier = 0.92 + 0.16 * _deterministic_unit(flow.flow_id, tick_index, "loss-base")
+    pressure_penalty = pressure * (0.02 + 0.18 * _deterministic_unit(flow.flow_id, tick_index, "loss-pressure"))
+    sample_penalty = 0.0
+    if packet_sent > 0:
+        sample_penalty = min(
+            0.01,
+            (0.5 + _deterministic_unit(flow.flow_id, tick_index, "loss-sample")) /
+            max(100.0, float(packet_sent * 8)),
+        )
+
+    return max(0.0, min(1.0, target_loss * base_multiplier + pressure_penalty + sample_penalty))
+
+
+def _estimate_received_packets(flow_id: str, tick_index: int, packet_sent: int, loss_rate: float) -> int:
+    if packet_sent <= 0:
+        return 0
+    exact_received = packet_sent * max(0.0, 1.0 - loss_rate)
+    received = int(exact_received)
+    fractional = exact_received - received
+    if _deterministic_unit(flow_id, tick_index, "loss-rx") < fractional:
+        received += 1
+    return max(0, min(packet_sent, received))
 
 
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
@@ -96,29 +267,11 @@ def _build_writer(
 
 
 def _merge_real_traffic_state(snapshot: TickSnapshot, args: argparse.Namespace) -> TickSnapshot:
-    state_file = getattr(args, "real_traffic_state_file", None)
-    if not state_file:
+    reader = _get_real_traffic_reader(args)
+    if reader is None:
         return snapshot
 
-    path = Path(state_file).expanduser().resolve()
-    deadline = time.monotonic() + float(getattr(args, "real_traffic_timeout_seconds", 15.0))
-    state_payload: dict[str, object] | None = None
-    while time.monotonic() <= deadline:
-        try:
-            with path.open("r", encoding="utf-8") as handle:
-                for line in handle:
-                    if not line.strip():
-                        continue
-                    payload = json.loads(line)
-                    tick_index = int(payload.get("tick_index", -1))
-                    if tick_index <= snapshot.tick_index:
-                        state_payload = payload
-        except FileNotFoundError:
-            pass
-        if state_payload is not None:
-            break
-        time.sleep(0.05)
-
+    state_payload = reader.payload_for_tick(snapshot.tick_index)
     if state_payload is None:
         return snapshot
 
@@ -149,10 +302,15 @@ def _merge_real_traffic_state(snapshot: TickSnapshot, args: argparse.Namespace) 
             if packet_size_bytes > 0
             else 0.0
         )
-        baseline_loss = _as_float(flow.sla.get("loss_rate")) if isinstance(flow.sla, dict) else None
-        loss_rate = baseline_loss if baseline_loss is not None else 0.0
         packet_sent = ul_packets_sent + dl_packets_sent
-        packet_received = max(0, int(round(packet_sent * max(0.0, 1.0 - loss_rate))))
+        loss_rate = _estimate_runtime_loss_rate(
+            flow,
+            throughput_ul_mbps=throughput_ul_mbps,
+            throughput_dl_mbps=throughput_dl_mbps,
+            packet_sent=packet_sent,
+            tick_index=snapshot.tick_index,
+        )
+        packet_received = _estimate_received_packets(flow.flow_id, snapshot.tick_index, packet_sent, loss_rate)
         traffic = dict(flow.traffic)
         traffic["five_tuple"] = {
             "protocol": 17,
@@ -374,6 +532,42 @@ def _follow_jsonl(args: argparse.Namespace) -> int:
     return 0
 
 
+def _graph_snapshot_exists(args: argparse.Namespace) -> int:
+    store = PostgresGraphStore(args.graph_db_url, ensure_schema=args.ensure_graph_schema)
+    print(
+        json.dumps(
+            {
+                "snapshot_id": args.snapshot_id,
+                "exists": store.snapshot_exists(args.snapshot_id),
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+def _delete_graph_snapshot(args: argparse.Namespace) -> int:
+    store = PostgresGraphStore(args.graph_db_url, ensure_schema=args.ensure_graph_schema)
+    print(json.dumps(store.delete_snapshot(args.snapshot_id), ensure_ascii=False))
+    return 0
+
+
+def _prune_graph_snapshots(args: argparse.Namespace) -> int:
+    store = PostgresGraphStore(args.graph_db_url, ensure_schema=args.ensure_graph_schema)
+    keep_snapshot_ids: list[str] = []
+    if args.keep_snapshot_id:
+        keep_snapshot_ids.append(args.keep_snapshot_id)
+    if args.keep_latest:
+        latest_snapshot_id = store.latest_snapshot_id()
+        if latest_snapshot_id:
+            keep_snapshot_ids.append(latest_snapshot_id)
+    result = store.prune_snapshots(keep_snapshot_ids=keep_snapshot_ids)
+    if args.keep_latest:
+        result["latest_snapshot_id"] = store.latest_snapshot_id()
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Ingest ns-3 snapshots and core/RAN observations")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -392,6 +586,7 @@ def build_parser() -> argparse.ArgumentParser:
     follow.add_argument("--poll-interval", type=float, default=1.0, help="polling interval in seconds")
     follow.add_argument("--from-end", action="store_true", help="start tailing from EOF")
     follow.add_argument("--stop-at-eof", action="store_true", help="exit after current EOF")
+    follow.add_argument("--tick-ms", type=int, default=1000, help="tick duration in milliseconds")
     _add_common_arguments(follow)
     follow.set_defaults(handler=_follow_jsonl)
 
@@ -424,6 +619,41 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common_arguments(follow_logs)
     follow_logs.set_defaults(handler=_follow_compose_logs)
+
+    graph_exists = subparsers.add_parser("graph-snapshot-exists", help="check whether a graph snapshot id exists")
+    graph_exists.add_argument("--graph-db-url", required=True, help="PostgreSQL graph database URL")
+    graph_exists.add_argument("--snapshot-id", required=True, help="graph snapshot id to inspect")
+    graph_exists.add_argument(
+        "--ensure-graph-schema",
+        action="store_true",
+        help="create graph tables if they do not already exist",
+    )
+    graph_exists.set_defaults(handler=_graph_snapshot_exists)
+
+    delete_graph = subparsers.add_parser("delete-graph-snapshot", help="delete one graph snapshot and its rows")
+    delete_graph.add_argument("--graph-db-url", required=True, help="PostgreSQL graph database URL")
+    delete_graph.add_argument("--snapshot-id", required=True, help="graph snapshot id to delete")
+    delete_graph.add_argument(
+        "--ensure-graph-schema",
+        action="store_true",
+        help="create graph tables if they do not already exist",
+    )
+    delete_graph.set_defaults(handler=_delete_graph_snapshot)
+
+    prune_graph = subparsers.add_parser("prune-graph-snapshots", help="delete all graph snapshots except the kept ones")
+    prune_graph.add_argument("--graph-db-url", required=True, help="PostgreSQL graph database URL")
+    prune_graph.add_argument("--keep-snapshot-id", help="graph snapshot id to keep")
+    prune_graph.add_argument(
+        "--keep-latest",
+        action="store_true",
+        help="keep the latest graph snapshot row instead of deleting everything",
+    )
+    prune_graph.add_argument(
+        "--ensure-graph-schema",
+        action="store_true",
+        help="create graph tables if they do not already exist",
+    )
+    prune_graph.set_defaults(handler=_prune_graph_snapshots)
 
     return parser
 

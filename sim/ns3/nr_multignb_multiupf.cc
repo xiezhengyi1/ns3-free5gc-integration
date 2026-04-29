@@ -189,6 +189,10 @@ struct SliceResourceProfile
     double guaranteedDlMbps = 0.0;
     double guaranteedUlMbps = 0.0;
     uint32_t priority = 1;
+    double latencyMs = 0.0;
+    double jitterMs = 0.0;
+    double lossRate = 0.0;
+    double processingDelayMs = 0.0;
 };
 
 struct SliceRuntimeTelemetry
@@ -456,6 +460,10 @@ LoadSliceResources(const std::string& path)
         profile.guaranteedDlMbps = ParseOptionalDouble(GetColumnValue(headerIndex, columns, "guaranteed_dl_mbps"), 0.0);
         profile.guaranteedUlMbps = ParseOptionalDouble(GetColumnValue(headerIndex, columns, "guaranteed_ul_mbps"), 0.0);
         profile.priority = ParseOptionalUint(GetColumnValue(headerIndex, columns, "priority"), 1);
+        profile.latencyMs = ParseOptionalDouble(GetColumnValue(headerIndex, columns, "latency_ms"), 0.0);
+        profile.jitterMs = ParseOptionalDouble(GetColumnValue(headerIndex, columns, "jitter_ms"), 0.0);
+        profile.lossRate = ParseOptionalDouble(GetColumnValue(headerIndex, columns, "loss_rate"), 0.0);
+        profile.processingDelayMs = ParseOptionalDouble(GetColumnValue(headerIndex, columns, "processing_delay_ms"), 0.0);
         if (profile.sliceId.empty() || profile.capacityDlMbps <= 0.0 || profile.capacityUlMbps <= 0.0)
         {
             NS_FATAL_ERROR("invalid slice resource row in " << path);
@@ -645,6 +653,46 @@ double
 PriorityWeight(const FlowProfile& profile)
 {
     return 1.0 / static_cast<double>(std::max<uint32_t>(1, profile.priority == 0 ? 1 : profile.priority));
+}
+
+const SliceResourceProfile*
+ResolveSliceProfile(const SnapshotContext* context, const FlowProfile& profile)
+{
+    auto bySliceRef = context->sliceResources.find(profile.sliceRef);
+    if (bySliceRef != context->sliceResources.end())
+    {
+        return &bySliceRef->second;
+    }
+    if (!profile.sliceSnssai.empty())
+    {
+        for (const auto& [sliceId, resource] : context->sliceResources)
+        {
+            if (resource.sliceSnssai == profile.sliceSnssai)
+            {
+                return &resource;
+            }
+        }
+    }
+    return nullptr;
+}
+
+double
+ClampMetricFactor(double factor)
+{
+    return std::clamp(factor, 0.9, 1.1);
+}
+
+double
+ComputeMetricFactor(const SnapshotContext* context,
+                    uint16_t port,
+                    double congestionRatio,
+                    double phaseOffset)
+{
+    const double wave =
+        std::sin((static_cast<double>(context->tickIndex) + static_cast<double>(port % 17)) * 0.55 + phaseOffset);
+    const double oscillation = 0.05 * wave;
+    const double congestionPenalty = 0.05 * std::clamp(congestionRatio, 0.0, 1.0);
+    return ClampMetricFactor(1.0 + oscillation + congestionPenalty);
 }
 
 void
@@ -1282,10 +1330,28 @@ EmitSnapshot(SnapshotContext* context)
                     ? std::max(runtime.profile.lossRate, std::max(0.0, 1.0 - throughputDl / offeredMbps))
                     : 0.0;
             const double lossRate = std::min(1.0, (lossUl + lossDl) / 2.0);
+            const auto* sliceProfile = ResolveSliceProfile(context, runtime.profile);
+            const double baseLatencyMs =
+                sliceProfile != nullptr
+                    ? std::max(0.0, sliceProfile->latencyMs + sliceProfile->processingDelayMs)
+                    : runtime.profile.latencyMs;
+            const double baseJitterMs =
+                sliceProfile != nullptr ? sliceProfile->jitterMs : runtime.profile.jitterMs;
+            const double baseLossRate =
+                sliceProfile != nullptr ? std::max(runtime.profile.lossRate, sliceProfile->lossRate) : runtime.profile.lossRate;
+            const double effectiveLossRate = std::max(lossRate, baseLossRate);
+            const double shortfallRatio =
+                offeredMbps > 0.0
+                    ? std::max(0.0, 1.0 - std::min(throughputUl, throughputDl) / offeredMbps)
+                    : 0.0;
+            const double latencyFactor = ComputeMetricFactor(context, port, shortfallRatio, 0.0);
+            const double jitterFactor = ComputeMetricFactor(context, port, shortfallRatio, 1.1);
+            const double lossFactor = ComputeMetricFactor(context, port, shortfallRatio, 2.2);
             const double delayMs =
-                std::max(context->bridgeLinkDelayMs,
-                         runtime.profile.latencyMs + context->bridgeLinkDelayMs * 2.0 + lossRate * 10.0);
-            const double jitterMs = std::max(0.1, runtime.profile.jitterMs + lossRate * 2.0);
+                std::max(0.1,
+                         std::max(baseLatencyMs, context->bridgeLinkDelayMs) * latencyFactor);
+            const double jitterMs = std::max(0.1, std::max(baseJitterMs, 0.1) * jitterFactor);
+            const double observedLossRate = std::min(1.0, std::max(0.0, effectiveLossRate * lossFactor));
             const auto packets = static_cast<uint64_t>(
                 std::max(0.0, std::floor(runtime.profile.arrivalRatePps * elapsedSeconds)));
             const auto rxPacketsUl = static_cast<uint64_t>(
@@ -1301,7 +1367,7 @@ EmitSnapshot(SnapshotContext* context)
                        port,
                        delayMs,
                        jitterMs,
-                       lossRate,
+                       observedLossRate,
                        throughputUl,
                        throughputDl,
                        packets * 2,
@@ -1329,30 +1395,44 @@ EmitSnapshot(SnapshotContext* context)
              << Quote("sst") << ":" << sst << ","
              << Quote("sd") << ":" << Quote(sd) << ","
              << Quote("label") << ":" << Quote("slice-" + std::to_string(index + 1));
+        const auto resourceIt = context->sliceResources.find(sliceId);
         const auto telemetryIt = context->sliceTelemetry.find(sliceId);
-        if (telemetryIt != context->sliceTelemetry.end())
-        {
-            const auto& telemetry = telemetryIt->second;
-            const double utilizationDl = telemetry.capacityDlMbps > 0.0
-                                             ? telemetry.allocatedDlMbps / telemetry.capacityDlMbps
-                                             : 0.0;
-            const double utilizationUl = telemetry.capacityUlMbps > 0.0
-                                             ? telemetry.allocatedUlMbps / telemetry.capacityUlMbps
-                                             : 0.0;
-            json << "," << Quote("resource") << ":{" << Quote("capacity_dl_mbps") << ":"
-                 << telemetry.capacityDlMbps << "," << Quote("capacity_ul_mbps") << ":"
-                 << telemetry.capacityUlMbps << "," << Quote("guaranteed_dl_mbps") << ":"
-                 << telemetry.guaranteedDlMbps << "," << Quote("guaranteed_ul_mbps") << ":"
-                 << telemetry.guaranteedUlMbps << "},"
-                 << Quote("telemetry") << ":{" << Quote("demand_dl_mbps") << ":"
-                 << telemetry.demandDlMbps << "," << Quote("demand_ul_mbps") << ":"
-                 << telemetry.demandUlMbps << "," << Quote("allocated_dl_mbps") << ":"
-                 << telemetry.allocatedDlMbps << "," << Quote("allocated_ul_mbps") << ":"
-                 << telemetry.allocatedUlMbps << "," << Quote("utilization_dl") << ":"
-                 << utilizationDl << "," << Quote("utilization_ul") << ":" << utilizationUl << ","
-                 << Quote("queue_bytes") << ":" << telemetry.queueBytes << ","
-                 << Quote("dropped_packets") << ":" << telemetry.droppedPackets << "}";
-        }
+        const double capacityDl = resourceIt != context->sliceResources.end() ? resourceIt->second.capacityDlMbps : 0.0;
+        const double capacityUl = resourceIt != context->sliceResources.end() ? resourceIt->second.capacityUlMbps : 0.0;
+        const double guaranteedDl = resourceIt != context->sliceResources.end() ? resourceIt->second.guaranteedDlMbps : 0.0;
+        const double guaranteedUl = resourceIt != context->sliceResources.end() ? resourceIt->second.guaranteedUlMbps : 0.0;
+        const double qosLatency = resourceIt != context->sliceResources.end() ? resourceIt->second.latencyMs : 0.0;
+        const double qosJitter = resourceIt != context->sliceResources.end() ? resourceIt->second.jitterMs : 0.0;
+        const double qosLoss = resourceIt != context->sliceResources.end() ? resourceIt->second.lossRate : 0.0;
+        const double qosProcessingDelay =
+            resourceIt != context->sliceResources.end() ? resourceIt->second.processingDelayMs : 0.0;
+        const double demandDl = telemetryIt != context->sliceTelemetry.end() ? telemetryIt->second.demandDlMbps : 0.0;
+        const double demandUl = telemetryIt != context->sliceTelemetry.end() ? telemetryIt->second.demandUlMbps : 0.0;
+        const double allocatedDl = telemetryIt != context->sliceTelemetry.end() ? telemetryIt->second.allocatedDlMbps : 0.0;
+        const double allocatedUl = telemetryIt != context->sliceTelemetry.end() ? telemetryIt->second.allocatedUlMbps : 0.0;
+        const double queueBytes = telemetryIt != context->sliceTelemetry.end() ? telemetryIt->second.queueBytes : 0.0;
+        const double droppedPackets =
+            telemetryIt != context->sliceTelemetry.end() ? telemetryIt->second.droppedPackets : 0.0;
+        const double utilizationDl = capacityDl > 0.0 ? allocatedDl / capacityDl : 0.0;
+        const double utilizationUl = capacityUl > 0.0 ? allocatedUl / capacityUl : 0.0;
+        json << "," << Quote("resource") << ":{" << Quote("capacity_dl_mbps") << ":"
+             << capacityDl << "," << Quote("capacity_ul_mbps") << ":"
+             << capacityUl << "," << Quote("guaranteed_dl_mbps") << ":"
+             << guaranteedDl << "," << Quote("guaranteed_ul_mbps") << ":"
+             << guaranteedUl << "},"
+             << Quote("qos") << ":{"
+             << Quote("latency") << ":" << qosLatency << ","
+             << Quote("jitter") << ":" << qosJitter << ","
+             << Quote("loss_rate") << ":" << qosLoss << ","
+             << Quote("processing_delay") << ":" << qosProcessingDelay << "},"
+             << Quote("telemetry") << ":{" << Quote("demand_dl_mbps") << ":"
+             << demandDl << "," << Quote("demand_ul_mbps") << ":"
+             << demandUl << "," << Quote("allocated_dl_mbps") << ":"
+             << allocatedDl << "," << Quote("allocated_ul_mbps") << ":"
+             << allocatedUl << "," << Quote("utilization_dl") << ":"
+             << utilizationDl << "," << Quote("utilization_ul") << ":" << utilizationUl << ","
+             << Quote("queue_bytes") << ":" << queueBytes << ","
+             << Quote("dropped_packets") << ":" << droppedPackets << "}";
         json << "}";
     }
     json << "],";

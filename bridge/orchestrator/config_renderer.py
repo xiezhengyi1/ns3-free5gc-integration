@@ -1083,6 +1083,10 @@ def _render_ns3_slice_resources(scenario: ScenarioConfig, output_path: Path) -> 
         "guaranteed_dl_mbps",
         "guaranteed_ul_mbps",
         "priority",
+        "latency_ms",
+        "jitter_ms",
+        "loss_rate",
+        "processing_delay_ms",
     ]
     lines = ["\t".join(header)]
     for slice_config in scenario.slices:
@@ -1097,6 +1101,10 @@ def _render_ns3_slice_resources(scenario: ScenarioConfig, output_path: Path) -> 
             resource.guaranteed_dl_mbps,
             resource.guaranteed_ul_mbps,
             resource.priority,
+            slice_config.qos.latency_ms if slice_config.qos is not None else 0.0,
+            slice_config.qos.jitter_ms if slice_config.qos is not None else 0.0,
+            slice_config.qos.loss_rate if slice_config.qos is not None else 0.0,
+            slice_config.qos.processing_delay_ms if slice_config.qos is not None else 0.0,
         ]
         lines.append("\t".join(_format_tsv_value(value) for value in values))
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1106,6 +1114,7 @@ def render_run_assets(
     project_root: Path,
     scenario: ScenarioConfig,
     run_id: str,
+    live_graph_snapshot_id: str | None = None,
 ) -> RenderedRun:
     run_dir = project_root / "artifacts" / "runs" / run_id
     generated_dir = run_dir / "generated"
@@ -1178,6 +1187,7 @@ def render_run_assets(
         subscriber_payloads=subscriber_assets.payload_files,
         free5gc_webui_url=subscriber_assets.webui_base_url,
         resolved_topology=resolved_topology,
+        live_graph_snapshot_id=live_graph_snapshot_id,
     )
 
     manifest_path = run_dir / "run-manifest.json"
