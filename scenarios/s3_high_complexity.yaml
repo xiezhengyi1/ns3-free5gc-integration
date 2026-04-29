@@ -1,54 +1,79 @@
-name: graph-snapshot-387-ulcl-4upf-live
-scenario_id: graph-snapshot-387-ulcl-4upf-live
+name: high-complexity-ulcl-4upf
+scenario_id: high-complexity-ulcl-4upf
 tick_ms: 100
 seed: 37
 
 slices:
   - sst: 1
     sd: "000001"
-    label: slice-1
+    label: slice-1-000001
     resource:
-      capacity_dl_mbps: 70.0
-      capacity_ul_mbps: 35.0
-      guaranteed_dl_mbps: 40.0
-      guaranteed_ul_mbps: 20.0
+      capacity_dl_mbps: 66.0
+      capacity_ul_mbps: 54.0
+      guaranteed_dl_mbps: 50.0
+      guaranteed_ul_mbps: 42.0
       priority: 1
+    qos:
+      latency_ms: 8.0
+      jitter_ms: 4.0
+      loss_rate: 0.001
+      processing_delay_ms: 0.5
   - sst: 1
     sd: "000002"
-    label: slice-2
+    label: slice-1-000002
     resource:
-      capacity_dl_mbps: 45.0
-      capacity_ul_mbps: 24.0
-      guaranteed_dl_mbps: 25.0
-      guaranteed_ul_mbps: 12.0
+      capacity_dl_mbps: 82.0
+      capacity_ul_mbps: 22.0
+      guaranteed_dl_mbps: 64.0
+      guaranteed_ul_mbps: 13.0
       priority: 2
+    qos:
+      latency_ms: 18.0
+      jitter_ms: 6.0
+      loss_rate: 0.0015
+      processing_delay_ms: 1.0
   - sst: 2
     sd: "000001"
-    label: slice-3
+    label: slice-2-000001
     resource:
-      capacity_dl_mbps: 55.0
+      capacity_dl_mbps: 68.0
       capacity_ul_mbps: 18.0
-      guaranteed_dl_mbps: 35.0
-      guaranteed_ul_mbps: 10.0
+      guaranteed_dl_mbps: 52.0
+      guaranteed_ul_mbps: 8.0
       priority: 2
+    qos:
+      latency_ms: 3.0
+      jitter_ms: 1.5
+      loss_rate: 0.0005
+      processing_delay_ms: 0.5
   - sst: 2
     sd: "000002"
-    label: slice-4
+    label: slice-2-000002
     resource:
       capacity_dl_mbps: 30.0
       capacity_ul_mbps: 14.0
       guaranteed_dl_mbps: 16.0
       guaranteed_ul_mbps: 8.0
       priority: 3
+    qos:
+      latency_ms: 6.0
+      jitter_ms: 2.5
+      loss_rate: 0.0008
+      processing_delay_ms: 0.8
   - sst: 3
     sd: "000001"
-    label: slice-5
+    label: slice-3-000001
     resource:
-      capacity_dl_mbps: 80.0
-      capacity_ul_mbps: 30.0
-      guaranteed_dl_mbps: 50.0
-      guaranteed_ul_mbps: 16.0
+      capacity_dl_mbps: 86.0
+      capacity_ul_mbps: 34.0
+      guaranteed_dl_mbps: 70.0
+      guaranteed_ul_mbps: 24.0
       priority: 1
+    qos:
+      latency_ms: 60.0
+      jitter_ms: 20.0
+      loss_rate: 0.02
+      processing_delay_ms: 3.0
 
 upfs:
   - name: i-upf-a
@@ -811,7 +836,7 @@ writer:
   graph_db_url: postgresql://postgres:123456@localhost:5432/multiagents_db
 
 topology:
-  graph_file: graphs/new_scenatios_4upf.yaml
+  graph_file: graphs/s3_high_complexity.yaml
 
 bridge:
   enable_inline_harness: true

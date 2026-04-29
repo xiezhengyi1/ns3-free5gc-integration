@@ -1,0 +1,634 @@
+name: medium-complexity
+scenario_id: medium-complexity
+tick_ms: 100
+seed: 23
+
+slices:
+  - sst: 2
+    sd: "000001"
+    label: slice-2-000001
+    resource:
+      capacity_dl_mbps: 78.0
+      capacity_ul_mbps: 34.0
+      guaranteed_dl_mbps: 60.0
+      guaranteed_ul_mbps: 22.0
+      priority: 1
+    qos:
+      latency_ms: 3.0
+      jitter_ms: 1.5
+      loss_rate: 0.0005
+      processing_delay_ms: 0.5
+  - sst: 1
+    sd: "000001"
+    label: slice-1-000001
+    resource:
+      capacity_dl_mbps: 112.0
+      capacity_ul_mbps: 56.0
+      guaranteed_dl_mbps: 90.0
+      guaranteed_ul_mbps: 42.0
+      priority: 2
+    qos:
+      latency_ms: 8.0
+      jitter_ms: 4.0
+      loss_rate: 0.001
+      processing_delay_ms: 0.5
+  - sst: 3
+    sd: "000001"
+    label: slice-3-000001
+    resource:
+      capacity_dl_mbps: 54.0
+      capacity_ul_mbps: 20.0
+      guaranteed_dl_mbps: 37.0
+      guaranteed_ul_mbps: 12.0
+      priority: 3
+    qos:
+      latency_ms: 60.0
+      jitter_ms: 20.0
+      loss_rate: 0.02
+      processing_delay_ms: 3.0
+
+upfs:
+  - name: i-upf-1
+    role: branching-upf
+    dnn: internet
+  - name: psa-upf-1
+    role: anchor-upf
+    dnn: internet
+
+gnbs:
+  - name: gNB-1
+    alias: gnb1.free5gc.org
+    tac: 1
+    nci: "0x000000001"
+    slices:
+      - slice-2-000001
+      - slice-1-000001
+    backhaul_upf: i-upf-1
+  - name: gNB-2
+    alias: gnb2.free5gc.org
+    tac: 1
+    nci: "0x000000002"
+    slices:
+      - slice-1-000001
+      - slice-3-000001
+    backhaul_upf: i-upf-1
+  - name: gNB-3
+    alias: gnb3.free5gc.org
+    tac: 1
+    nci: "0x000000003"
+    slices:
+      - slice-2-000001
+      - slice-3-000001
+      - slice-1-000001
+    backhaul_upf: i-upf-1
+
+ues:
+  - name: ue1
+    supi: imsi-208930000000001
+    gnb: gNB-1
+    key: 8baf473f2f8fd09487cccbd7097c6862
+    op: 8e27b6af0e692e750f32667a3b14605d
+    op_type: OPC
+    amf: "8000"
+    free5gc_policy:
+      target_gnb: gNB-1
+      preferred_gnbs:
+        - gNB-1
+        - gNB-3
+    sessions:
+      - slice_ref: slice-1-000001
+        session_ref: imsi-208930000000001:app-remote-drive:slice-1-000001:internet
+        apn: internet
+        type: IPv4
+        five_qi: 9
+        app_id: app-remote-drive
+  - name: ue2
+    supi: imsi-208930000000006
+    gnb: gNB-3
+    key: 8baf473f2f8fd09487cccbd7097c6862
+    op: 8e27b6af0e692e750f32667a3b14605d
+    op_type: OPC
+    amf: "8000"
+    free5gc_policy:
+      target_gnb: gNB-3
+      preferred_gnbs:
+        - gNB-3
+        - gNB-1
+    sessions:
+      - slice_ref: slice-1-000001
+        session_ref: imsi-208930000000006:app-factory-robot:slice-1-000001:internet
+        apn: internet
+        type: IPv4
+        five_qi: 9
+        app_id: app-factory-robot
+      - slice_ref: slice-3-000001
+        session_ref: imsi-208930000000006:app-iot-sensor:slice-3-000001:internet
+        apn: internet
+        type: IPv4
+        five_qi: 6
+        app_id: app-iot-sensor
+  - name: ue3
+    supi: imsi-208930000000005
+    gnb: gNB-3
+    key: 8baf473f2f8fd09487cccbd7097c6862
+    op: 8e27b6af0e692e750f32667a3b14605d
+    op_type: OPC
+    amf: "8000"
+    free5gc_policy:
+      target_gnb: gNB-3
+      preferred_gnbs:
+        - gNB-3
+        - gNB-2
+    sessions:
+      - slice_ref: slice-2-000001
+        session_ref: imsi-208930000000005:app-ar-gaming:slice-2-000001:internet
+        apn: internet
+        type: IPv4
+        five_qi: 7
+        app_id: app-ar-gaming
+      - slice_ref: slice-3-000001
+        session_ref: imsi-208930000000005:app-ar-gaming-video:slice-3-000001:internet
+        apn: internet
+        type: IPv4
+        five_qi: 6
+        app_id: app-ar-gaming
+  - name: ue4
+    supi: imsi-208930000000008
+    gnb: gNB-2
+    key: 8baf473f2f8fd09487cccbd7097c6862
+    op: 8e27b6af0e692e750f32667a3b14605d
+    op_type: OPC
+    amf: "8000"
+    free5gc_policy:
+      target_gnb: gNB-2
+      preferred_gnbs:
+        - gNB-2
+        - gNB-3
+    sessions:
+      - slice_ref: slice-2-000001
+        session_ref: imsi-208930000000008:app-telemedicine:slice-2-000001:internet
+        apn: internet
+        type: IPv4
+        five_qi: 7
+        app_id: app-telemedicine
+      - slice_ref: slice-3-000001
+        session_ref: imsi-208930000000008:app-web-browse:slice-3-000001:internet
+        apn: internet
+        type: IPv4
+        five_qi: 6
+        app_id: app-web-browse
+  - name: ue5
+    supi: imsi-208930000000009
+    gnb: gNB-2
+    key: 8baf473f2f8fd09487cccbd7097c6862
+    op: 8e27b6af0e692e750f32667a3b14605d
+    op_type: OPC
+    amf: "8000"
+    free5gc_policy:
+      target_gnb: gNB-2
+      preferred_gnbs:
+        - gNB-2
+        - gNB-1
+    sessions:
+      - slice_ref: slice-1-000001
+        session_ref: imsi-208930000000009:app-drone-control:slice-1-000001:internet
+        apn: internet
+        type: IPv4
+        five_qi: 9
+        app_id: app-drone-control
+      - slice_ref: slice-1-000001
+        session_ref: imsi-208930000000009:app-4k-video:slice-1-000001:internet
+        apn: internet
+        type: IPv4
+        five_qi: 9
+        app_id: app-4k-video
+      - slice_ref: slice-2-000001
+        session_ref: imsi-208930000000009:app-4k-video-control:slice-2-000001:internet
+        apn: internet
+        type: IPv4
+        five_qi: 7
+        app_id: app-4k-video
+  - name: ue6
+    supi: imsi-208930000000010
+    gnb: gNB-1
+    key: 8baf473f2f8fd09487cccbd7097c6862
+    op: 8e27b6af0e692e750f32667a3b14605d
+    op_type: OPC
+    amf: "8000"
+    free5gc_policy:
+      target_gnb: gNB-1
+      preferred_gnbs:
+        - gNB-1
+        - gNB-2
+    sessions:
+      - slice_ref: slice-2-000001
+        session_ref: imsi-208930000000010:app-cloud-render:slice-2-000001:internet
+        apn: internet
+        type: IPv4
+        five_qi: 7
+        app_id: app-cloud-render
+      - slice_ref: slice-1-000001
+        session_ref: imsi-208930000000010:app-cloud-render-telemetry:slice-1-000001:internet
+        apn: internet
+        type: IPv4
+        five_qi: 9
+        app_id: app-cloud-render
+
+apps:
+  - app_id: app-remote-drive
+    name: Remote_Drive
+    supi: imsi-208930000000001
+    ue_name: ue1
+    flow_ids:
+      - flow-9649
+  - app_id: app-factory-robot
+    name: Factory_Robot
+    supi: imsi-208930000000006
+    ue_name: ue2
+    flow_ids:
+      - flow-3232
+  - app_id: app-iot-sensor
+    name: IoT_Sensor
+    supi: imsi-208930000000006
+    ue_name: ue2
+    flow_ids:
+      - flow-2926
+  - app_id: app-ar-gaming
+    name: AR_Gaming
+    supi: imsi-208930000000005
+    ue_name: ue3
+    flow_ids:
+      - flow-7528
+      - flow-4493
+  - app_id: app-telemedicine
+    name: Telemedicine
+    supi: imsi-208930000000008
+    ue_name: ue4
+    flow_ids:
+      - flow-3521
+  - app_id: app-web-browse
+    name: Web_Browse
+    supi: imsi-208930000000008
+    ue_name: ue4
+    flow_ids:
+      - flow-1634
+  - app_id: app-drone-control
+    name: Drone_Control
+    supi: imsi-208930000000009
+    ue_name: ue5
+    flow_ids:
+      - flow-8178
+  - app_id: app-4k-video
+    name: 4K_Video
+    supi: imsi-208930000000009
+    ue_name: ue5
+    flow_ids:
+      - flow-8036
+      - flow-7178
+  - app_id: app-cloud-render
+    name: Cloud_Render
+    supi: imsi-208930000000010
+    ue_name: ue6
+    flow_ids:
+      - flow-9218
+      - flow-4806
+
+flows:
+  - flow_id: flow-9649
+    name: Remote_Drive_video_1
+    supi: imsi-208930000000001
+    app_id: app-remote-drive
+    slice_ref: slice-1-000001
+    session_ref: imsi-208930000000001:app-remote-drive:slice-1-000001:internet
+    ue_name: ue1
+    app_name: Remote_Drive
+    five_qi: 9
+    service_type: eMBB
+    service_type_id: 1
+    packet_size_bytes: 12000.0
+    arrival_rate_pps: 500.0
+    current_slice_snssai: "01000001"
+    allocated_bandwidth_dl_mbps: 18.0
+    allocated_bandwidth_ul_mbps: 16.0
+    optimize_requested: false
+    sla_target:
+      latency_ms: 12.0
+      jitter_ms: 2.0
+      loss_rate: 0.0005
+      bandwidth_dl_mbps: 18.0
+      bandwidth_ul_mbps: 16.0
+      guaranteed_bandwidth_dl_mbps: 14.0
+      guaranteed_bandwidth_ul_mbps: 12.0
+      priority: 1
+  - flow_id: flow-3232
+    name: Factory_Robot_video_1
+    supi: imsi-208930000000006
+    app_id: app-factory-robot
+    slice_ref: slice-1-000001
+    session_ref: imsi-208930000000006:app-factory-robot:slice-1-000001:internet
+    ue_name: ue2
+    app_name: Factory_Robot
+    five_qi: 9
+    service_type: eMBB
+    service_type_id: 1
+    packet_size_bytes: 12000.0
+    arrival_rate_pps: 500.0
+    current_slice_snssai: "01000001"
+    allocated_bandwidth_dl_mbps: 20.0
+    allocated_bandwidth_ul_mbps: 20.0
+    optimize_requested: false
+    sla_target:
+      latency_ms: 10.0
+      jitter_ms: 1.5
+      loss_rate: 0.0003
+      bandwidth_dl_mbps: 20.0
+      bandwidth_ul_mbps: 20.0
+      guaranteed_bandwidth_dl_mbps: 18.0
+      guaranteed_bandwidth_ul_mbps: 18.0
+      priority: 1
+  - flow_id: flow-2926
+    name: IoT_Sensor_video_1
+    supi: imsi-208930000000006
+    app_id: app-iot-sensor
+    slice_ref: slice-3-000001
+    session_ref: imsi-208930000000006:app-iot-sensor:slice-3-000001:internet
+    ue_name: ue2
+    app_name: IoT_Sensor
+    five_qi: 6
+    service_type: mMTC
+    service_type_id: 3
+    packet_size_bytes: 24000.0
+    arrival_rate_pps: 50.0
+    current_slice_snssai: "03000001"
+    allocated_bandwidth_dl_mbps: 8.0
+    allocated_bandwidth_ul_mbps: 5.0
+    optimize_requested: false
+    sla_target:
+      latency_ms: 120.0
+      jitter_ms: 30.0
+      loss_rate: 0.02
+      bandwidth_dl_mbps: 8.0
+      bandwidth_ul_mbps: 5.0
+      guaranteed_bandwidth_dl_mbps: 5.0
+      guaranteed_bandwidth_ul_mbps: 3.0
+      priority: 8
+  - flow_id: flow-7528
+    name: AR_Gaming_control_1
+    supi: imsi-208930000000005
+    app_id: app-ar-gaming
+    slice_ref: slice-2-000001
+    session_ref: imsi-208930000000005:app-ar-gaming:slice-2-000001:internet
+    ue_name: ue3
+    app_name: AR_Gaming
+    five_qi: 7
+    service_type: URLLC
+    service_type_id: 2
+    packet_size_bytes: 8000.0
+    arrival_rate_pps: 50.0
+    current_slice_snssai: "02000001"
+    allocated_bandwidth_dl_mbps: 12.0
+    allocated_bandwidth_ul_mbps: 8.0
+    optimize_requested: false
+    sla_target:
+      latency_ms: 8.0
+      jitter_ms: 2.0
+      loss_rate: 0.0008
+      bandwidth_dl_mbps: 12.0
+      bandwidth_ul_mbps: 8.0
+      guaranteed_bandwidth_dl_mbps: 10.0
+      guaranteed_bandwidth_ul_mbps: 6.0
+      priority: 2
+  - flow_id: flow-4493
+    name: AR_Gaming_video_2
+    supi: imsi-208930000000005
+    app_id: app-ar-gaming
+    slice_ref: slice-3-000001
+    session_ref: imsi-208930000000005:app-ar-gaming-video:slice-3-000001:internet
+    ue_name: ue3
+    app_name: AR_Gaming
+    five_qi: 6
+    service_type: mMTC
+    service_type_id: 3
+    packet_size_bytes: 24000.0
+    arrival_rate_pps: 100.0
+    current_slice_snssai: "03000001"
+    allocated_bandwidth_dl_mbps: 34.0
+    allocated_bandwidth_ul_mbps: 12.0
+    optimize_requested: true
+    sla_target:
+      latency_ms: 15.0
+      jitter_ms: 4.0
+      loss_rate: 0.0015
+      bandwidth_dl_mbps: 34.0
+      bandwidth_ul_mbps: 12.0
+      guaranteed_bandwidth_dl_mbps: 28.0
+      guaranteed_bandwidth_ul_mbps: 8.0
+      priority: 3
+  - flow_id: flow-3521
+    name: Telemedicine_control_1
+    supi: imsi-208930000000008
+    app_id: app-telemedicine
+    slice_ref: slice-2-000001
+    session_ref: imsi-208930000000008:app-telemedicine:slice-2-000001:internet
+    ue_name: ue4
+    app_name: Telemedicine
+    five_qi: 7
+    service_type: URLLC
+    service_type_id: 2
+    packet_size_bytes: 12000.0
+    arrival_rate_pps: 200.0
+    current_slice_snssai: "02000001"
+    allocated_bandwidth_dl_mbps: 25.0
+    allocated_bandwidth_ul_mbps: 12.0
+    optimize_requested: false
+    sla_target:
+      latency_ms: 15.0
+      jitter_ms: 2.0
+      loss_rate: 0.0005
+      bandwidth_dl_mbps: 25.0
+      bandwidth_ul_mbps: 12.0
+      guaranteed_bandwidth_dl_mbps: 20.0
+      guaranteed_bandwidth_ul_mbps: 9.0
+      priority: 1
+  - flow_id: flow-1634
+    name: Web_Browse_control_1
+    supi: imsi-208930000000008
+    app_id: app-web-browse
+    slice_ref: slice-3-000001
+    session_ref: imsi-208930000000008:app-web-browse:slice-3-000001:internet
+    ue_name: ue4
+    app_name: Web_Browse
+    five_qi: 6
+    service_type: mMTC
+    service_type_id: 3
+    packet_size_bytes: 12000.0
+    arrival_rate_pps: 200.0
+    current_slice_snssai: "03000001"
+    allocated_bandwidth_dl_mbps: 6.0
+    allocated_bandwidth_ul_mbps: 1.0
+    optimize_requested: false
+    sla_target:
+      latency_ms: 90.0
+      jitter_ms: 35.0
+      loss_rate: 0.03
+      bandwidth_dl_mbps: 6.0
+      bandwidth_ul_mbps: 1.0
+      guaranteed_bandwidth_dl_mbps: 2.0
+      guaranteed_bandwidth_ul_mbps: 0.5
+      priority: 10
+  - flow_id: flow-8178
+    name: Drone_Control_video_1
+    supi: imsi-208930000000009
+    app_id: app-drone-control
+    slice_ref: slice-1-000001
+    session_ref: imsi-208930000000009:app-drone-control:slice-1-000001:internet
+    ue_name: ue5
+    app_name: Drone_Control
+    five_qi: 9
+    service_type: eMBB
+    service_type_id: 1
+    packet_size_bytes: 16000.0
+    arrival_rate_pps: 100.0
+    current_slice_snssai: "01000001"
+    allocated_bandwidth_dl_mbps: 30.0
+    allocated_bandwidth_ul_mbps: 10.0
+    optimize_requested: false
+    sla_target:
+      latency_ms: 20.0
+      jitter_ms: 5.0
+      loss_rate: 0.001
+      bandwidth_dl_mbps: 30.0
+      bandwidth_ul_mbps: 10.0
+      guaranteed_bandwidth_dl_mbps: 24.0
+      guaranteed_bandwidth_ul_mbps: 7.0
+      priority: 2
+  - flow_id: flow-8036
+    name: 4K_Video_stream_1
+    supi: imsi-208930000000009
+    app_id: app-4k-video
+    slice_ref: slice-1-000001
+    session_ref: imsi-208930000000009:app-4k-video:slice-1-000001:internet
+    ue_name: ue5
+    app_name: 4K_Video
+    five_qi: 9
+    service_type: eMBB
+    service_type_id: 1
+    packet_size_bytes: 60000.0
+    arrival_rate_pps: 800.0
+    current_slice_snssai: "01000001"
+    allocated_bandwidth_dl_mbps: 36.0
+    allocated_bandwidth_ul_mbps: 6.0
+    optimize_requested: false
+    sla_target:
+      latency_ms: 35.0
+      jitter_ms: 12.0
+      loss_rate: 0.003
+      bandwidth_dl_mbps: 36.0
+      bandwidth_ul_mbps: 6.0
+      guaranteed_bandwidth_dl_mbps: 30.0
+      guaranteed_bandwidth_ul_mbps: 3.0
+      priority: 5
+  - flow_id: flow-7178
+    name: 4K_Video_control_2
+    supi: imsi-208930000000009
+    app_id: app-4k-video
+    slice_ref: slice-2-000001
+    session_ref: imsi-208930000000009:app-4k-video-control:slice-2-000001:internet
+    ue_name: ue5
+    app_name: 4K_Video
+    five_qi: 7
+    service_type: URLLC
+    service_type_id: 2
+    packet_size_bytes: 12000.0
+    arrival_rate_pps: 200.0
+    current_slice_snssai: "02000001"
+    allocated_bandwidth_dl_mbps: 2.5
+    allocated_bandwidth_ul_mbps: 2.0
+    optimize_requested: false
+    sla_target:
+      latency_ms: 25.0
+      jitter_ms: 6.0
+      loss_rate: 0.0015
+      bandwidth_dl_mbps: 2.5
+      bandwidth_ul_mbps: 2.0
+      guaranteed_bandwidth_dl_mbps: 1.2
+      guaranteed_bandwidth_ul_mbps: 1.0
+      priority: 4
+  - flow_id: flow-9218
+    name: Cloud_Render_control_1
+    supi: imsi-208930000000010
+    app_id: app-cloud-render
+    slice_ref: slice-2-000001
+    session_ref: imsi-208930000000010:app-cloud-render:slice-2-000001:internet
+    ue_name: ue6
+    app_name: Cloud_Render
+    five_qi: 7
+    service_type: URLLC
+    service_type_id: 2
+    packet_size_bytes: 60000.0
+    arrival_rate_pps: 800.0
+    current_slice_snssai: "02000001"
+    allocated_bandwidth_dl_mbps: 32.0
+    allocated_bandwidth_ul_mbps: 8.0
+    optimize_requested: false
+    sla_target:
+      latency_ms: 12.0
+      jitter_ms: 6.0
+      loss_rate: 0.002
+      bandwidth_dl_mbps: 32.0
+      bandwidth_ul_mbps: 8.0
+      guaranteed_bandwidth_dl_mbps: 26.0
+      guaranteed_bandwidth_ul_mbps: 5.0
+      priority: 4
+  - flow_id: flow-4806
+    name: Cloud_Render_telemetry_2
+    supi: imsi-208930000000010
+    app_id: app-cloud-render
+    slice_ref: slice-1-000001
+    session_ref: imsi-208930000000010:app-cloud-render-telemetry:slice-1-000001:internet
+    ue_name: ue6
+    app_name: Cloud_Render
+    five_qi: 9
+    service_type: eMBB
+    service_type_id: 1
+    packet_size_bytes: 4000.0
+    arrival_rate_pps: 100.0
+    current_slice_snssai: "01000001"
+    allocated_bandwidth_dl_mbps: 0.5
+    allocated_bandwidth_ul_mbps: 1.2
+    optimize_requested: false
+    sla_target:
+      latency_ms: 180.0
+      jitter_ms: 50.0
+      loss_rate: 0.02
+      bandwidth_dl_mbps: 0.5
+      bandwidth_ul_mbps: 1.2
+      guaranteed_bandwidth_dl_mbps: 0.2
+      guaranteed_bandwidth_ul_mbps: 0.7
+      priority: 9
+
+free5gc:
+  compose_file: /home/yyx/6gcore/free5gc-compose/docker-compose-ulcl.yaml
+  config_root: /home/yyx/6gcore/free5gc-compose/config
+  mode: ulcl
+  bridge_name: br-free5gc
+  project_name: nrint-s2-medium-complexity
+
+ns3:
+  ns3_root: /home/yyx/6gcore/ns-allinone-3.46.1/ns-3.46.1
+  scratch_name: nr_medium_multignb
+  output_subdir: ns3
+  simulator: RealtimeSimulatorImpl
+  sim_time_ms: 600000
+  slice_isolation: true
+
+writer:
+  archive_dir: archive
+  state_db: state/writer.db
+  graph_db_url: postgresql://postgres:123456@localhost:5432/multiagents_db
+
+topology:
+  graph_file: graphs/s2_medium_complexity.yaml
+
+bridge:
+  enable_inline_harness: true

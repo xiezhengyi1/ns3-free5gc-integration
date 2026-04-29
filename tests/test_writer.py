@@ -49,7 +49,7 @@ class WriterStoreTest(unittest.TestCase):
         self.assertEqual(pending, "")
         self.assertEqual(line, '{"tick_index": 1}')
 
-    def test_merge_real_traffic_state_preserves_snapshot_loss_metrics(self) -> None:
+    def test_merge_real_traffic_state_preserves_snapshot_measured_metrics(self) -> None:
         root = Path(tempfile.mkdtemp(prefix="writer-real-traffic-"))
         try:
             state_file = root / "real-traffic.jsonl"
@@ -101,20 +101,20 @@ class WriterStoreTest(unittest.TestCase):
             flow = merged.flows[0]
             self.assertEqual(flow.traffic["direction"], "bidirectional")
             self.assertEqual(flow.traffic["five_tuple"]["source_ip"], "10.60.0.1")
-            self.assertAlmostEqual(flow.throughput_ul_mbps, 0.8)
-            self.assertAlmostEqual(flow.throughput_dl_mbps, 0.4)
+            self.assertAlmostEqual(flow.throughput_ul_mbps, 9.9)
+            self.assertAlmostEqual(flow.throughput_dl_mbps, 8.8)
             self.assertAlmostEqual(flow.loss_rate, 0.2)
             self.assertEqual(flow.telemetry["packet_sent"], 15)
             self.assertEqual(flow.telemetry["packet_received"], 12)
-            self.assertAlmostEqual(flow.telemetry["throughput_ul"], 0.8)
-            self.assertAlmostEqual(flow.telemetry["throughput_dl"], 0.4)
+            self.assertAlmostEqual(flow.telemetry["throughput_ul"], 9.9)
+            self.assertAlmostEqual(flow.telemetry["throughput_dl"], 8.8)
             self.assertEqual(merged.ues[0].ip_address, "10.60.0.1")
             self.assertAlmostEqual(merged.kpis["active_flows"], 1.0)
             self.assertAlmostEqual(merged.kpis["mean_loss_rate"], flow.loss_rate)
-            self.assertAlmostEqual(merged.kpis["throughput_ul_mbps_total"], 0.8)
-            self.assertAlmostEqual(merged.kpis["throughput_dl_mbps_total"], 0.4)
+            self.assertAlmostEqual(merged.kpis["throughput_ul_mbps_total"], 9.9)
+            self.assertAlmostEqual(merged.kpis["throughput_dl_mbps_total"], 8.8)
             self.assertAlmostEqual(merged.reward_inputs["loss_penalty"], flow.loss_rate)
-            self.assertAlmostEqual(merged.reward_inputs["throughput_score"], 1.2)
+            self.assertAlmostEqual(merged.reward_inputs["throughput_score"], 18.7)
         finally:
             shutil.rmtree(root, ignore_errors=True)
 

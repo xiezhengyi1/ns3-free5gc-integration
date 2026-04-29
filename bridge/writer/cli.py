@@ -202,7 +202,6 @@ def _merge_real_traffic_state(snapshot: TickSnapshot, args: argparse.Namespace) 
     if state_payload is None:
         return snapshot
 
-    tick_seconds = max(0.001, float(getattr(args, "tick_ms", 1000)) / 1000.0)
     real_flows = {
         str(item["flow_id"]): item
         for item in state_payload.get("flows", [])
@@ -216,23 +215,14 @@ def _merge_real_traffic_state(snapshot: TickSnapshot, args: argparse.Namespace) 
         ue_ip = str(real_flow["ue_ip"])
         source_port = int(real_flow["source_port"])
         destination_port = int(real_flow["destination_port"])
-        packet_size_bytes = int(real_flow.get("packet_size_bytes", 0) or 0)
         ul_packets_sent = int(real_flow.get("ul_packets_sent", 0) or 0)
         dl_packets_sent = int(real_flow.get("dl_packets_sent", 0) or 0)
-        throughput_ul_mbps = (
-            ul_packets_sent * packet_size_bytes * 8.0 / tick_seconds / 1e6
-            if packet_size_bytes > 0
-            else 0.0
-        )
-        throughput_dl_mbps = (
-            dl_packets_sent * packet_size_bytes * 8.0 / tick_seconds / 1e6
-            if packet_size_bytes > 0
-            else 0.0
-        )
         packet_sent = ul_packets_sent + dl_packets_sent
         loss_rate = float(flow.loss_rate)
         telemetry = dict(flow.telemetry)
         packet_received = int(telemetry.get("packet_received", 0) or 0)
+        throughput_ul_mbps = float(flow.throughput_ul_mbps)
+        throughput_dl_mbps = float(flow.throughput_dl_mbps)
         traffic = dict(flow.traffic)
         traffic["five_tuple"] = {
             "protocol": 17,
