@@ -10,6 +10,7 @@
 #include "ns3/mobility-module.h"
 #include "ns3/nr-module.h"
 #include "ns3/error-model.h"
+#include "ns3/epc-gtpu-header.h"
 #include "ns3/ethernet-header.h"
 #include "ns3/point-to-point-module.h"
 #include "ns3/tap-bridge-module.h"
@@ -628,31 +629,29 @@ struct SnapshotContext
 };
 
 bool
-ExtractExternalFlowKey(const SnapshotContext* context,
-                       Ptr<const Packet> packet,
-                       uint16_t* port,
-                       bool* uplink)
+ExtractUdpTupleFromPacket(Ptr<const Packet> packet, uint16_t* sourcePort, uint16_t* destinationPort)
 {
-    NS_ASSERT(context != nullptr);
-    NS_ASSERT(port != nullptr);
-    NS_ASSERT(uplink != nullptr);
+    NS_ASSERT(sourcePort != nullptr);
+    NS_ASSERT(destinationPort != nullptr);
+
+    Ptr<Packet> packetCopy = packet->Copy();
 
     EthernetHeader ethernetHeader;
-    Ptr<Packet> packetCopy = packet->Copy();
-    if (!packetCopy->RemoveHeader(ethernetHeader))
+    if (packetCopy->PeekHeader(ethernetHeader))
     {
-        return false;
-    }
-    if (ethernetHeader.GetLengthType() != 0x0800)
-    {
-        return false;
+        packetCopy->RemoveHeader(ethernetHeader);
+        if (ethernetHeader.GetLengthType() != 0x0800)
+        {
+            return false;
+        }
     }
 
     Ipv4Header ipv4Header;
-    if (!packetCopy->RemoveHeader(ipv4Header))
+    if (!packetCopy->PeekHeader(ipv4Header))
     {
         return false;
     }
+    packetCopy->RemoveHeader(ipv4Header);
     if (ipv4Header.GetProtocol() != 17)
     {
         return false;
@@ -664,8 +663,61 @@ ExtractExternalFlowKey(const SnapshotContext* context,
         return false;
     }
 
-    const uint16_t destinationPort = udpHeader.GetDestinationPort();
-    const uint16_t sourcePort = udpHeader.GetSourcePort();
+    *sourcePort = udpHeader.GetSourcePort();
+    *destinationPort = udpHeader.GetDestinationPort();
+    // The bridged gNB<->UPF N3 link carries GTP-U, so the first UDP header is often the
+    // outer transport (typically port 2152) rather than the UE application's inner flow.
+    if (*sourcePort == 2152 || *destinationPort == 2152)
+    {
+        packetCopy->RemoveHeader(udpHeader);
+
+        GtpuHeader gtpuHeader;
+        if (!packetCopy->PeekHeader(gtpuHeader))
+        {
+            return false;
+        }
+        packetCopy->RemoveHeader(gtpuHeader);
+
+        Ipv4Header innerIpv4Header;
+        if (!packetCopy->PeekHeader(innerIpv4Header))
+        {
+            return false;
+        }
+        packetCopy->RemoveHeader(innerIpv4Header);
+        if (innerIpv4Header.GetProtocol() != 17)
+        {
+            return false;
+        }
+
+        UdpHeader innerUdpHeader;
+        if (!packetCopy->PeekHeader(innerUdpHeader))
+        {
+            return false;
+        }
+        *sourcePort = innerUdpHeader.GetSourcePort();
+        *destinationPort = innerUdpHeader.GetDestinationPort();
+    }
+
+    return true;
+}
+
+bool
+ExtractExternalFlowKey(const SnapshotContext* context,
+                       Ptr<const Packet> packet,
+                       uint16_t* port,
+                       bool* uplink)
+{
+    NS_ASSERT(context != nullptr);
+    NS_ASSERT(port != nullptr);
+    NS_ASSERT(uplink != nullptr);
+
+    uint16_t sourcePort = 0;
+    uint16_t destinationPort = 0;
+    if (!ExtractUdpTupleFromPacket(packet, &sourcePort, &destinationPort))
+    {
+        return false;
+    }
+
     if (context->flowRuntimeByPort.find(destinationPort) != context->flowRuntimeByPort.end())
     {
         *port = destinationPort;
@@ -1889,12 +1941,15 @@ main(int argc, char* argv[])
                 }
             }
             devices.Get(0)->TraceConnectWithoutContext("MacTx", MakeBoundCallback(&OnBridgeMacTx, &context, true));
-            devices.Get(0)->TraceConnectWithoutContext("MacRx", MakeBoundCallback(&OnBridgeMacRx, &context, true));
-            devices.Get(0)->TraceConnectWithoutContext("MacRxDrop",
+            // TapBridge UseBridge receives through the bridged device's promiscuous path.
+            devices.Get(0)->TraceConnectWithoutContext("MacPromiscRx",
+                                                       MakeBoundCallback(&OnBridgeMacRx, &context, true));
+            devices.Get(0)->TraceConnectWithoutContext("PhyRxDrop",
                                                        MakeBoundCallback(&OnBridgeMacRxDrop, &context, true));
             devices.Get(1)->TraceConnectWithoutContext("MacTx", MakeBoundCallback(&OnBridgeMacTx, &context, false));
-            devices.Get(1)->TraceConnectWithoutContext("MacRx", MakeBoundCallback(&OnBridgeMacRx, &context, false));
-            devices.Get(1)->TraceConnectWithoutContext("MacRxDrop",
+            devices.Get(1)->TraceConnectWithoutContext("MacPromiscRx",
+                                                       MakeBoundCallback(&OnBridgeMacRx, &context, false));
+            devices.Get(1)->TraceConnectWithoutContext("PhyRxDrop",
                                                        MakeBoundCallback(&OnBridgeMacRxDrop, &context, false));
             tapBridge.SetAttribute("DeviceName", StringValue(bridgeGnbTaps[index]));
             tapBridge.Install(pair.Get(0), devices.Get(0));
