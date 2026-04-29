@@ -66,6 +66,27 @@ def _resolve_ue_interface(container: str, session_index: int) -> tuple[dict[str,
     }, used_fallback
 
 
+def _effective_tick_window_ms(
+    *,
+    last_tick: int | None,
+    last_sim_time_ms: int | None,
+    tick_index: int,
+    sim_time_ms: int,
+    nominal_tick_ms: int,
+) -> tuple[int, int]:
+    nominal = max(1, int(nominal_tick_ms))
+    if last_tick is None or last_sim_time_ms is None:
+        return nominal, 0
+
+    tick_gap = max(0, int(tick_index) - int(last_tick) - 1)
+    sim_gap = max(0, int(sim_time_ms) - int(last_sim_time_ms))
+    if sim_gap <= 0:
+        return 0, tick_gap
+    if sim_gap > nominal:
+        return nominal, tick_gap
+    return sim_gap, tick_gap
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Generate real UE UDP traffic from ns-3 flow profiles")
     parser.add_argument("--flow-profile-file", required=True)
@@ -194,11 +215,23 @@ def main(argv: list[str] | None = None) -> int:
                 time.sleep(0.05)
                 continue
 
-            elapsed_ms = args.tick_ms if last_sim_time_ms is None else sim_time_ms - last_sim_time_ms
+            elapsed_ms, skipped_ticks = _effective_tick_window_ms(
+                last_tick=last_tick,
+                last_sim_time_ms=last_sim_time_ms,
+                tick_index=tick_index,
+                sim_time_ms=sim_time_ms,
+                nominal_tick_ms=args.tick_ms,
+            )
             if elapsed_ms <= 0:
                 last_tick = tick_index
                 last_sim_time_ms = sim_time_ms
                 continue
+            if skipped_ticks > 0:
+                print(
+                    f"warning: skipped {skipped_ticks} real-traffic tick(s) before tick {tick_index}; "
+                    f"dropping backlog and using a single {elapsed_ms}ms send window",
+                    flush=True,
+                )
 
             scheduled: list[dict[str, object]] = []
             for flow in flows:
@@ -363,6 +396,8 @@ done
                         {
                             "tick_index": tick_index,
                             "sim_time_ms": sim_time_ms,
+                            "effective_tick_ms": elapsed_ms,
+                            "skipped_ticks": skipped_ticks,
                             "target_ip": args.target_ip,
                             "flows": [
                                 {

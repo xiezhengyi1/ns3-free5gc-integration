@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -578,13 +579,8 @@ struct SnapshotContext
         double lastDelayMsDl = 0.0;
         bool hasLastDelayUl = false;
         bool hasLastDelayDl = false;
-    };
-
-    struct ExternalPacketState
-    {
-        uint16_t port = 0;
-        bool uplink = false;
-        Time txTime = Seconds(0);
+        std::deque<Time> txTimesUl;
+        std::deque<Time> txTimesDl;
     };
 
     struct FlowRuntimeState
@@ -623,7 +619,6 @@ struct SnapshotContext
     std::vector<uint16_t> uePorts;
     std::map<uint16_t, FlowRuntimeState> flowRuntimeByPort;
     std::map<uint16_t, ExternalFlowCounters> externalFlowCountersByPort;
-    std::map<uint64_t, ExternalPacketState> externalPacketsInFlight;
     std::map<std::string, SliceResourceProfile> sliceResources;
     std::map<std::string, SliceRuntimeTelemetry> sliceTelemetry;
     Ptr<FlowMonitor> monitor;
@@ -699,12 +694,12 @@ OnBridgeMacTx(SnapshotContext* context, bool gnbSide, Ptr<const Packet> packet)
     if (gnbSide && uplink)
     {
         counters.txPacketsUl++;
-        context->externalPacketsInFlight[packet->GetUid()] = {port, true, Simulator::Now()};
+        counters.txTimesUl.push_back(Simulator::Now());
     }
     else if (!gnbSide && !uplink)
     {
         counters.txPacketsDl++;
-        context->externalPacketsInFlight[packet->GetUid()] = {port, false, Simulator::Now()};
+        counters.txTimesDl.push_back(Simulator::Now());
     }
 }
 
@@ -721,10 +716,10 @@ OnBridgeMacRx(SnapshotContext* context, bool gnbSide, Ptr<const Packet> packet)
     if (!gnbSide && uplink)
     {
         counters.rxPacketsUl++;
-        const auto packetIt = context->externalPacketsInFlight.find(packet->GetUid());
-        if (packetIt != context->externalPacketsInFlight.end())
+        if (!counters.txTimesUl.empty())
         {
-            const double delayMs = (Simulator::Now() - packetIt->second.txTime).GetSeconds() * 1000.0;
+            const double delayMs = (Simulator::Now() - counters.txTimesUl.front()).GetSeconds() * 1000.0;
+            counters.txTimesUl.pop_front();
             counters.delaySumMsUl += delayMs;
             counters.delaySamplesUl++;
             if (counters.hasLastDelayUl)
@@ -733,16 +728,15 @@ OnBridgeMacRx(SnapshotContext* context, bool gnbSide, Ptr<const Packet> packet)
             }
             counters.lastDelayMsUl = delayMs;
             counters.hasLastDelayUl = true;
-            context->externalPacketsInFlight.erase(packetIt);
         }
     }
     else if (gnbSide && !uplink)
     {
         counters.rxPacketsDl++;
-        const auto packetIt = context->externalPacketsInFlight.find(packet->GetUid());
-        if (packetIt != context->externalPacketsInFlight.end())
+        if (!counters.txTimesDl.empty())
         {
-            const double delayMs = (Simulator::Now() - packetIt->second.txTime).GetSeconds() * 1000.0;
+            const double delayMs = (Simulator::Now() - counters.txTimesDl.front()).GetSeconds() * 1000.0;
+            counters.txTimesDl.pop_front();
             counters.delaySumMsDl += delayMs;
             counters.delaySamplesDl++;
             if (counters.hasLastDelayDl)
@@ -751,7 +745,6 @@ OnBridgeMacRx(SnapshotContext* context, bool gnbSide, Ptr<const Packet> packet)
             }
             counters.lastDelayMsDl = delayMs;
             counters.hasLastDelayDl = true;
-            context->externalPacketsInFlight.erase(packetIt);
         }
     }
 }
@@ -769,12 +762,18 @@ OnBridgeMacRxDrop(SnapshotContext* context, bool gnbSide, Ptr<const Packet> pack
     if (!gnbSide && uplink)
     {
         counters.dropPacketsUl++;
-        context->externalPacketsInFlight.erase(packet->GetUid());
+        if (!counters.txTimesUl.empty())
+        {
+            counters.txTimesUl.pop_front();
+        }
     }
     else if (gnbSide && !uplink)
     {
         counters.dropPacketsDl++;
-        context->externalPacketsInFlight.erase(packet->GetUid());
+        if (!counters.txTimesDl.empty())
+        {
+            counters.txTimesDl.pop_front();
+        }
     }
 }
 

@@ -62,10 +62,10 @@ class RealTrafficStateReader:
             self._advance_to_tick(normalized_target)
 
             latest_tick = self._tick_of(self._latest_payload)
-            if latest_tick >= normalized_target:
+            if latest_tick == normalized_target:
                 return self._latest_payload
             if time.monotonic() >= deadline:
-                return self._latest_payload
+                return None
             time.sleep(0.05)
 
     def _advance_to_tick(self, target_tick: int) -> None:
