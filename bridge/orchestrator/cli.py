@@ -45,7 +45,7 @@ def _start_run(args: argparse.Namespace) -> int:
                 continue
             child_env = os.environ.copy()
             child_env.update(command.get("env", {}) or {})
-            stream_output = _should_stream_command(command)
+            stream_output = args.stream_output or _should_stream_command(command)
             if command.get("background"):
                 process = subprocess.Popen(
                     command["argv"],
@@ -155,6 +155,11 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("manifest", help="path to run-manifest.json")
     start.add_argument("--step", action="append", help="run only selected steps")
     start.add_argument("--dry-run", action="store_true", help="print commands only")
+    start.add_argument(
+        "--stream-output",
+        action="store_true",
+        help="stream stdout/stderr for all commands to the terminal",
+    )
     start.add_argument(
         "--wait-background",
         action="store_true",

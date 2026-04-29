@@ -228,6 +228,9 @@ def main() -> int:
         manifest_path = _capture_prepare_manifest(input_path, args.run_id, args.live_graph_snapshot_id)
 
     manifest = _load_manifest(manifest_path)
+    logs_dir = Path(str(manifest.get("run_dir") or "")).expanduser().resolve() / "logs"
+    print(f"manifest={manifest_path}")
+    print(f"logs={logs_dir}")
     if _should_cleanup_stack(args):
         try:
             _kill_residual_processes(manifest)
@@ -243,6 +246,7 @@ def main() -> int:
         argv.extend(["--step", step])
     if args.dry_run:
         argv.append("--dry-run")
+    argv.append("--stream-output")
     if args.wait_background:
         argv.append("--wait-background")
     try:

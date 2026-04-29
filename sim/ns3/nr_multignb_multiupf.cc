@@ -562,6 +562,28 @@ AppendUniqueString(std::vector<std::string>* values, const std::string& value)
 
 struct SnapshotContext
 {
+    struct ExternalTraceDebug
+    {
+        uint64_t macTxGnb = 0;
+        uint64_t macTxUpf = 0;
+        uint64_t macRxGnb = 0;
+        uint64_t macRxUpf = 0;
+        uint64_t macRxDropGnb = 0;
+        uint64_t macRxDropUpf = 0;
+        uint64_t parseNoIpv4 = 0;
+        uint64_t parseNonUdpOuter = 0;
+        uint64_t parseNoOuterUdp = 0;
+        uint64_t parseGtpuNoHeader = 0;
+        uint64_t parseGtpuNoInnerIpv4 = 0;
+        uint64_t parseGtpuInnerNonUdp = 0;
+        uint64_t parseGtpuNoInnerUdp = 0;
+        uint64_t parseOkOuterUdp = 0;
+        uint64_t parseOkGtpuInnerUdp = 0;
+        uint64_t matchDestinationPort = 0;
+        uint64_t matchSourcePort = 0;
+        uint64_t unmatchedPorts = 0;
+    };
+
     struct ExternalFlowCounters
     {
         uint64_t txPacketsUl = 0;
@@ -620,6 +642,7 @@ struct SnapshotContext
     std::vector<uint16_t> uePorts;
     std::map<uint16_t, FlowRuntimeState> flowRuntimeByPort;
     std::map<uint16_t, ExternalFlowCounters> externalFlowCountersByPort;
+    ExternalTraceDebug externalTraceDebug;
     std::map<std::string, SliceResourceProfile> sliceResources;
     std::map<std::string, SliceRuntimeTelemetry> sliceTelemetry;
     Ptr<FlowMonitor> monitor;
@@ -629,8 +652,12 @@ struct SnapshotContext
 };
 
 bool
-ExtractUdpTupleFromPacket(Ptr<const Packet> packet, uint16_t* sourcePort, uint16_t* destinationPort)
+ExtractUdpTupleFromPacket(SnapshotContext* context,
+                          Ptr<const Packet> packet,
+                          uint16_t* sourcePort,
+                          uint16_t* destinationPort)
 {
+    NS_ASSERT(context != nullptr);
     NS_ASSERT(sourcePort != nullptr);
     NS_ASSERT(destinationPort != nullptr);
 
@@ -649,17 +676,20 @@ ExtractUdpTupleFromPacket(Ptr<const Packet> packet, uint16_t* sourcePort, uint16
     Ipv4Header ipv4Header;
     if (!packetCopy->PeekHeader(ipv4Header))
     {
+        context->externalTraceDebug.parseNoIpv4++;
         return false;
     }
     packetCopy->RemoveHeader(ipv4Header);
     if (ipv4Header.GetProtocol() != 17)
     {
+        context->externalTraceDebug.parseNonUdpOuter++;
         return false;
     }
 
     UdpHeader udpHeader;
     if (!packetCopy->PeekHeader(udpHeader))
     {
+        context->externalTraceDebug.parseNoOuterUdp++;
         return false;
     }
 
@@ -674,6 +704,7 @@ ExtractUdpTupleFromPacket(Ptr<const Packet> packet, uint16_t* sourcePort, uint16
         GtpuHeader gtpuHeader;
         if (!packetCopy->PeekHeader(gtpuHeader))
         {
+            context->externalTraceDebug.parseGtpuNoHeader++;
             return false;
         }
         packetCopy->RemoveHeader(gtpuHeader);
@@ -681,23 +712,29 @@ ExtractUdpTupleFromPacket(Ptr<const Packet> packet, uint16_t* sourcePort, uint16
         Ipv4Header innerIpv4Header;
         if (!packetCopy->PeekHeader(innerIpv4Header))
         {
+            context->externalTraceDebug.parseGtpuNoInnerIpv4++;
             return false;
         }
         packetCopy->RemoveHeader(innerIpv4Header);
         if (innerIpv4Header.GetProtocol() != 17)
         {
+            context->externalTraceDebug.parseGtpuInnerNonUdp++;
             return false;
         }
 
         UdpHeader innerUdpHeader;
         if (!packetCopy->PeekHeader(innerUdpHeader))
         {
+            context->externalTraceDebug.parseGtpuNoInnerUdp++;
             return false;
         }
         *sourcePort = innerUdpHeader.GetSourcePort();
         *destinationPort = innerUdpHeader.GetDestinationPort();
+        context->externalTraceDebug.parseOkGtpuInnerUdp++;
+        return true;
     }
 
+    context->externalTraceDebug.parseOkOuterUdp++;
     return true;
 }
 
@@ -713,29 +750,40 @@ ExtractExternalFlowKey(const SnapshotContext* context,
 
     uint16_t sourcePort = 0;
     uint16_t destinationPort = 0;
-    if (!ExtractUdpTupleFromPacket(packet, &sourcePort, &destinationPort))
+    if (!ExtractUdpTupleFromPacket(const_cast<SnapshotContext*>(context), packet, &sourcePort, &destinationPort))
     {
         return false;
     }
 
     if (context->flowRuntimeByPort.find(destinationPort) != context->flowRuntimeByPort.end())
     {
+        const_cast<SnapshotContext*>(context)->externalTraceDebug.matchDestinationPort++;
         *port = destinationPort;
         *uplink = true;
         return true;
     }
     if (context->flowRuntimeByPort.find(sourcePort) != context->flowRuntimeByPort.end())
     {
+        const_cast<SnapshotContext*>(context)->externalTraceDebug.matchSourcePort++;
         *port = sourcePort;
         *uplink = false;
         return true;
     }
+    const_cast<SnapshotContext*>(context)->externalTraceDebug.unmatchedPorts++;
     return false;
 }
 
 void
 OnBridgeMacTx(SnapshotContext* context, bool gnbSide, Ptr<const Packet> packet)
 {
+    if (gnbSide)
+    {
+        context->externalTraceDebug.macTxGnb++;
+    }
+    else
+    {
+        context->externalTraceDebug.macTxUpf++;
+    }
     uint16_t port = 0;
     bool uplink = false;
     if (!ExtractExternalFlowKey(context, packet, &port, &uplink))
@@ -758,6 +806,14 @@ OnBridgeMacTx(SnapshotContext* context, bool gnbSide, Ptr<const Packet> packet)
 void
 OnBridgeMacRx(SnapshotContext* context, bool gnbSide, Ptr<const Packet> packet)
 {
+    if (gnbSide)
+    {
+        context->externalTraceDebug.macRxGnb++;
+    }
+    else
+    {
+        context->externalTraceDebug.macRxUpf++;
+    }
     uint16_t port = 0;
     bool uplink = false;
     if (!ExtractExternalFlowKey(context, packet, &port, &uplink))
@@ -804,6 +860,14 @@ OnBridgeMacRx(SnapshotContext* context, bool gnbSide, Ptr<const Packet> packet)
 void
 OnBridgeMacRxDrop(SnapshotContext* context, bool gnbSide, Ptr<const Packet> packet)
 {
+    if (gnbSide)
+    {
+        context->externalTraceDebug.macRxDropGnb++;
+    }
+    else
+    {
+        context->externalTraceDebug.macRxDropUpf++;
+    }
     uint16_t port = 0;
     bool uplink = false;
     if (!ExtractExternalFlowKey(context, packet, &port, &uplink))
@@ -1604,6 +1668,25 @@ EmitSnapshot(SnapshotContext* context)
                        "external_data_network",
                        runtime.profile.flowId);
         }
+        const auto& debug = context->externalTraceDebug;
+        std::cerr << "[external-trace] tick=" << context->tickIndex
+                  << " macTx(gnb=" << debug.macTxGnb << ",upf=" << debug.macTxUpf << ")"
+                  << " macRx(gnb=" << debug.macRxGnb << ",upf=" << debug.macRxUpf << ")"
+                  << " macRxDrop(gnb=" << debug.macRxDropGnb << ",upf=" << debug.macRxDropUpf << ")"
+                  << " parse(okOuter=" << debug.parseOkOuterUdp
+                  << ",okGtpu=" << debug.parseOkGtpuInnerUdp
+                  << ",noIpv4=" << debug.parseNoIpv4
+                  << ",nonUdpOuter=" << debug.parseNonUdpOuter
+                  << ",noOuterUdp=" << debug.parseNoOuterUdp
+                  << ",gtpuNoHeader=" << debug.parseGtpuNoHeader
+                  << ",gtpuNoInnerIpv4=" << debug.parseGtpuNoInnerIpv4
+                  << ",gtpuInnerNonUdp=" << debug.parseGtpuInnerNonUdp
+                  << ",gtpuNoInnerUdp=" << debug.parseGtpuNoInnerUdp << ")"
+                  << " match(dst=" << debug.matchDestinationPort
+                  << ",src=" << debug.matchSourcePort
+                  << ",unmatched=" << debug.unmatchedPorts << ")"
+                  << std::endl;
+        context->externalTraceDebug = SnapshotContext::ExternalTraceDebug{};
         context->externalFlowCountersByPort.clear();
     }
     json << "],";
