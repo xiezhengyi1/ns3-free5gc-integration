@@ -395,6 +395,8 @@ def build_run_manifest(
                 str(scenario.ns3.bridge_link_rate_mbps),
                 "--bridge-link-delay-ms",
                 str(scenario.ns3.bridge_link_delay_ms),
+                "--bridge-link-loss-rate",
+                str(scenario.ns3.bridge_link_loss_rate),
                 "--external-traffic-only",
                 "--external-traffic-target-ip",
                 "8.8.8.8",

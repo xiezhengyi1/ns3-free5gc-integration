@@ -78,7 +78,7 @@ bridge:
 
 `writer-follow-ns3` 会同步读取 `real-ue-flows.jsonl`，在写 SQLite/PostgreSQL 网络图前用真实 UE PDU IP、真实 `uesimtunN` 和 DL UPF 容器覆盖 ns-3 snapshot 中的五元组。这样网络图中的 flow 五元组对应真实 free5GC 用户面，而不是 ns-3 内部 EPC 地址。
 
-ns-3 external mode 不再使用内部 `UdpClient/UdpServer` 的 FlowMonitor 结果；它按 flow profile 的 offered load、已分配上下行带宽、SLA loss/jitter/latency 和 bridge delay 输出容量模型指标。因此 `throughput_ul_mbps`、`throughput_dl_mbps`、`loss_rate`、`delay_ms`、`jitter_ms` 不再是全理想值。真实发包明细以 `real-ue-flows.jsonl` 为准。
+ns-3 external mode 不再使用内部 `UdpClient/UdpServer` 的 FlowMonitor 结果；它按 flow profile 的 offered load、已分配上下行带宽和 bridge 设备观测输出外部模式指标。真实发包明细以 `real-ue-flows.jsonl` 为准。`ns3.bridge_link_loss_rate` 只会在 bridge `NetDevice` 上挂接 `ReceiveErrorModel`，不会把 flow SLA `loss_rate` 偷换成链路丢包参数；`loss_rate` 来自 bridge 设备上的真实发包/收包/丢包计数，`delay_ms` 和 `jitter_ms` 来自 bridge 设备上的真实过桥时间戳统计，因此语义是 bridge transit 指标，不是 UE 到外部数据网的端到端时延。
 
 ## Slice 级逻辑隔离
 

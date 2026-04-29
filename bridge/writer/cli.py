@@ -151,79 +151,6 @@ def _as_float(value: object) -> float | None:
         return None
 
 
-def _stable_hash(value: str) -> int:
-    result = 0
-    for char in value:
-        result = ((result * 131) + ord(char)) & 0xFFFFFFFF
-    return result
-
-
-def _deterministic_unit(*parts: object) -> float:
-    token = ":".join(str(part) for part in parts)
-    return _stable_hash(token) / float(0xFFFFFFFF)
-
-
-def _resolve_flow_target_bandwidth(flow: Any, direction: str) -> float:
-    allocation = dict(getattr(flow, "allocation", {}) or {})
-    sla = dict(getattr(flow, "sla", {}) or {})
-    allocation_key = f"allocated_bandwidth_{direction}"
-    sla_key = f"bandwidth_{direction}"
-    target = _as_float(allocation.get(allocation_key))
-    if target is not None and target > 0.0:
-        return target
-    target = _as_float(sla.get(sla_key))
-    if target is not None and target > 0.0:
-        return target
-    return 0.0
-
-
-def _estimate_runtime_loss_rate(
-    flow: Any,
-    *,
-    throughput_ul_mbps: float,
-    throughput_dl_mbps: float,
-    packet_sent: int,
-    tick_index: int,
-) -> float:
-    sla = dict(getattr(flow, "sla", {}) or {})
-    target_loss = max(0.0, min(1.0, _as_float(sla.get("loss_rate")) or 0.0))
-    target_ul = _resolve_flow_target_bandwidth(flow, "ul")
-    target_dl = _resolve_flow_target_bandwidth(flow, "dl")
-
-    pressure_samples: list[float] = []
-    if target_ul > 0.0:
-        pressure_samples.append(max(0.0, 1.0 - throughput_ul_mbps / target_ul))
-    if target_dl > 0.0:
-        pressure_samples.append(max(0.0, 1.0 - throughput_dl_mbps / target_dl))
-    pressure = max(pressure_samples, default=0.0)
-
-    # Use the SLA value as a target baseline, then introduce a small deterministic
-    # runtime variation plus an additional penalty when measured throughput falls
-    # below the current target bandwidth.
-    base_multiplier = 0.92 + 0.16 * _deterministic_unit(flow.flow_id, tick_index, "loss-base")
-    pressure_penalty = pressure * (0.02 + 0.18 * _deterministic_unit(flow.flow_id, tick_index, "loss-pressure"))
-    sample_penalty = 0.0
-    if packet_sent > 0:
-        sample_penalty = min(
-            0.01,
-            (0.5 + _deterministic_unit(flow.flow_id, tick_index, "loss-sample")) /
-            max(100.0, float(packet_sent * 8)),
-        )
-
-    return max(0.0, min(1.0, target_loss * base_multiplier + pressure_penalty + sample_penalty))
-
-
-def _estimate_received_packets(flow_id: str, tick_index: int, packet_sent: int, loss_rate: float) -> int:
-    if packet_sent <= 0:
-        return 0
-    exact_received = packet_sent * max(0.0, 1.0 - loss_rate)
-    received = int(exact_received)
-    fractional = exact_received - received
-    if _deterministic_unit(flow_id, tick_index, "loss-rx") < fractional:
-        received += 1
-    return max(0, min(packet_sent, received))
-
-
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--state-db", required=True, help="sqlite path for local state")
     parser.add_argument("--archive-dir", required=True, help="directory for archived ticks")
@@ -303,14 +230,9 @@ def _merge_real_traffic_state(snapshot: TickSnapshot, args: argparse.Namespace) 
             else 0.0
         )
         packet_sent = ul_packets_sent + dl_packets_sent
-        loss_rate = _estimate_runtime_loss_rate(
-            flow,
-            throughput_ul_mbps=throughput_ul_mbps,
-            throughput_dl_mbps=throughput_dl_mbps,
-            packet_sent=packet_sent,
-            tick_index=snapshot.tick_index,
-        )
-        packet_received = _estimate_received_packets(flow.flow_id, snapshot.tick_index, packet_sent, loss_rate)
+        loss_rate = float(flow.loss_rate)
+        telemetry = dict(flow.telemetry)
+        packet_received = int(telemetry.get("packet_received", 0) or 0)
         traffic = dict(flow.traffic)
         traffic["five_tuple"] = {
             "protocol": 17,
@@ -343,7 +265,6 @@ def _merge_real_traffic_state(snapshot: TickSnapshot, args: argparse.Namespace) 
         flow.throughput_ul_mbps = throughput_ul_mbps
         flow.throughput_dl_mbps = throughput_dl_mbps
         flow.loss_rate = loss_rate
-        telemetry = dict(flow.telemetry)
         telemetry["loss_rate"] = loss_rate
         telemetry["packet_sent"] = packet_sent
         telemetry["packet_received"] = packet_received

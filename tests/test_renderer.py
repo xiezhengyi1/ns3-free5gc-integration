@@ -34,6 +34,7 @@ class RendererTest(unittest.TestCase):
                 scenario.ns3,
                 bridge_link_rate_mbps=250.0,
                 bridge_link_delay_ms=2.0,
+                bridge_link_loss_rate=0.05,
             ),
         )
         run_id = generate_run_id("testinline")
@@ -58,6 +59,8 @@ class RendererTest(unittest.TestCase):
             self.assertIn("250.0", ns3_run["argv"])
             self.assertIn("--bridge-link-delay-ms", ns3_run["argv"])
             self.assertIn("2.0", ns3_run["argv"])
+            self.assertIn("--bridge-link-loss-rate", ns3_run["argv"])
+            self.assertIn("0.05", ns3_run["argv"])
 
             policy_acceptor = next(item for item in manifest["commands"] if item["name"] == "policy-acceptor")
             self.assertEqual(policy_acceptor["argv"][:2], ["bash", str(PROJECT_ROOT / "scripts" / "run_policy_acceptor.sh")])

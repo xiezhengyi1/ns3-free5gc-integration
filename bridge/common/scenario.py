@@ -185,6 +185,7 @@ class Ns3Config:
     sim_time_ms: int = 30000
     bridge_link_rate_mbps: float = 1000.0
     bridge_link_delay_ms: float = 1.0
+    bridge_link_loss_rate: float = 0.0
     policy_reload_ms: int = 1000
     slice_isolation: bool = False
 
@@ -333,6 +334,8 @@ class ScenarioConfig:
             raise ValueError("graph snapshot input requires topology.graph_db_url or writer.graph_db_url")
         if (self.policy.ue_context_table or self.policy.ue_context_query) and not self.policy.db_url:
             raise ValueError("ue_context policy loading requires policy.db_url or writer.graph_db_url")
+        if not 0.0 <= self.ns3.bridge_link_loss_rate <= 1.0:
+            raise ValueError("ns3.bridge_link_loss_rate must be within [0.0, 1.0]")
 
         ue_by_name = {ue.name: ue for ue in self.ues}
         ue_by_supi = {ue.supi: ue for ue in self.ues}
@@ -643,6 +646,7 @@ class ScenarioConfig:
                 sim_time_ms=int(ns3_payload.get("sim_time_ms", 30000)),
                 bridge_link_rate_mbps=float(ns3_payload.get("bridge_link_rate_mbps", 1000.0)),
                 bridge_link_delay_ms=float(ns3_payload.get("bridge_link_delay_ms", 1.0)),
+                bridge_link_loss_rate=float(ns3_payload.get("bridge_link_loss_rate", 0.0)),
                 policy_reload_ms=int(ns3_payload.get("policy_reload_ms", 1000)),
                 slice_isolation=bool(ns3_payload.get("slice_isolation", False)),
             ),

@@ -9,8 +9,11 @@
 #include "ns3/internet-module.h"
 #include "ns3/mobility-module.h"
 #include "ns3/nr-module.h"
+#include "ns3/error-model.h"
+#include "ns3/ethernet-header.h"
 #include "ns3/point-to-point-module.h"
 #include "ns3/tap-bridge-module.h"
+#include "ns3/udp-header.h"
 
 #include <algorithm>
 #include <cmath>
@@ -557,6 +560,33 @@ AppendUniqueString(std::vector<std::string>* values, const std::string& value)
 
 struct SnapshotContext
 {
+    struct ExternalFlowCounters
+    {
+        uint64_t txPacketsUl = 0;
+        uint64_t rxPacketsUl = 0;
+        uint64_t dropPacketsUl = 0;
+        uint64_t txPacketsDl = 0;
+        uint64_t rxPacketsDl = 0;
+        uint64_t dropPacketsDl = 0;
+        double delaySumMsUl = 0.0;
+        double delaySumMsDl = 0.0;
+        uint64_t delaySamplesUl = 0;
+        uint64_t delaySamplesDl = 0;
+        double jitterSumMsUl = 0.0;
+        double jitterSumMsDl = 0.0;
+        double lastDelayMsUl = 0.0;
+        double lastDelayMsDl = 0.0;
+        bool hasLastDelayUl = false;
+        bool hasLastDelayDl = false;
+    };
+
+    struct ExternalPacketState
+    {
+        uint16_t port = 0;
+        bool uplink = false;
+        Time txTime = Seconds(0);
+    };
+
     struct FlowRuntimeState
     {
         FlowProfile profile;
@@ -578,6 +608,7 @@ struct SnapshotContext
     uint32_t ueNum;
     double bridgeLinkRateMbps = 1000.0;
     double bridgeLinkDelayMs = 1.0;
+    double bridgeLinkLossRate = 0.0;
     bool externalTrafficOnly = false;
     std::string externalTrafficTargetIp = "8.8.8.8";
     uint32_t externalTrafficSourceBasePort = 15000;
@@ -591,6 +622,8 @@ struct SnapshotContext
     std::vector<std::string> ueSupis;
     std::vector<uint16_t> uePorts;
     std::map<uint16_t, FlowRuntimeState> flowRuntimeByPort;
+    std::map<uint16_t, ExternalFlowCounters> externalFlowCountersByPort;
+    std::map<uint64_t, ExternalPacketState> externalPacketsInFlight;
     std::map<std::string, SliceResourceProfile> sliceResources;
     std::map<std::string, SliceRuntimeTelemetry> sliceTelemetry;
     Ptr<FlowMonitor> monitor;
@@ -598,6 +631,152 @@ struct SnapshotContext
     Time appStartTime;
     Time simTime;
 };
+
+bool
+ExtractExternalFlowKey(const SnapshotContext* context,
+                       Ptr<const Packet> packet,
+                       uint16_t* port,
+                       bool* uplink)
+{
+    NS_ASSERT(context != nullptr);
+    NS_ASSERT(port != nullptr);
+    NS_ASSERT(uplink != nullptr);
+
+    EthernetHeader ethernetHeader;
+    Ptr<Packet> packetCopy = packet->Copy();
+    if (!packetCopy->RemoveHeader(ethernetHeader))
+    {
+        return false;
+    }
+    if (ethernetHeader.GetLengthType() != 0x0800)
+    {
+        return false;
+    }
+
+    Ipv4Header ipv4Header;
+    if (!packetCopy->RemoveHeader(ipv4Header))
+    {
+        return false;
+    }
+    if (ipv4Header.GetProtocol() != 17)
+    {
+        return false;
+    }
+
+    UdpHeader udpHeader;
+    if (!packetCopy->PeekHeader(udpHeader))
+    {
+        return false;
+    }
+
+    const uint16_t destinationPort = udpHeader.GetDestinationPort();
+    const uint16_t sourcePort = udpHeader.GetSourcePort();
+    if (context->flowRuntimeByPort.find(destinationPort) != context->flowRuntimeByPort.end())
+    {
+        *port = destinationPort;
+        *uplink = true;
+        return true;
+    }
+    if (context->flowRuntimeByPort.find(sourcePort) != context->flowRuntimeByPort.end())
+    {
+        *port = sourcePort;
+        *uplink = false;
+        return true;
+    }
+    return false;
+}
+
+void
+OnBridgeMacTx(SnapshotContext* context, bool gnbSide, Ptr<const Packet> packet)
+{
+    uint16_t port = 0;
+    bool uplink = false;
+    if (!ExtractExternalFlowKey(context, packet, &port, &uplink))
+    {
+        return;
+    }
+    auto& counters = context->externalFlowCountersByPort[port];
+    if (gnbSide && uplink)
+    {
+        counters.txPacketsUl++;
+        context->externalPacketsInFlight[packet->GetUid()] = {port, true, Simulator::Now()};
+    }
+    else if (!gnbSide && !uplink)
+    {
+        counters.txPacketsDl++;
+        context->externalPacketsInFlight[packet->GetUid()] = {port, false, Simulator::Now()};
+    }
+}
+
+void
+OnBridgeMacRx(SnapshotContext* context, bool gnbSide, Ptr<const Packet> packet)
+{
+    uint16_t port = 0;
+    bool uplink = false;
+    if (!ExtractExternalFlowKey(context, packet, &port, &uplink))
+    {
+        return;
+    }
+    auto& counters = context->externalFlowCountersByPort[port];
+    if (!gnbSide && uplink)
+    {
+        counters.rxPacketsUl++;
+        const auto packetIt = context->externalPacketsInFlight.find(packet->GetUid());
+        if (packetIt != context->externalPacketsInFlight.end())
+        {
+            const double delayMs = (Simulator::Now() - packetIt->second.txTime).GetSeconds() * 1000.0;
+            counters.delaySumMsUl += delayMs;
+            counters.delaySamplesUl++;
+            if (counters.hasLastDelayUl)
+            {
+                counters.jitterSumMsUl += std::abs(delayMs - counters.lastDelayMsUl);
+            }
+            counters.lastDelayMsUl = delayMs;
+            counters.hasLastDelayUl = true;
+            context->externalPacketsInFlight.erase(packetIt);
+        }
+    }
+    else if (gnbSide && !uplink)
+    {
+        counters.rxPacketsDl++;
+        const auto packetIt = context->externalPacketsInFlight.find(packet->GetUid());
+        if (packetIt != context->externalPacketsInFlight.end())
+        {
+            const double delayMs = (Simulator::Now() - packetIt->second.txTime).GetSeconds() * 1000.0;
+            counters.delaySumMsDl += delayMs;
+            counters.delaySamplesDl++;
+            if (counters.hasLastDelayDl)
+            {
+                counters.jitterSumMsDl += std::abs(delayMs - counters.lastDelayMsDl);
+            }
+            counters.lastDelayMsDl = delayMs;
+            counters.hasLastDelayDl = true;
+            context->externalPacketsInFlight.erase(packetIt);
+        }
+    }
+}
+
+void
+OnBridgeMacRxDrop(SnapshotContext* context, bool gnbSide, Ptr<const Packet> packet)
+{
+    uint16_t port = 0;
+    bool uplink = false;
+    if (!ExtractExternalFlowKey(context, packet, &port, &uplink))
+    {
+        return;
+    }
+    auto& counters = context->externalFlowCountersByPort[port];
+    if (!gnbSide && uplink)
+    {
+        counters.dropPacketsUl++;
+        context->externalPacketsInFlight.erase(packet->GetUid());
+    }
+    else if (gnbSide && !uplink)
+    {
+        counters.dropPacketsDl++;
+        context->externalPacketsInFlight.erase(packet->GetUid());
+    }
+}
 
 std::string
 NormalizeSimulatorType(const std::string& simulator)
@@ -1307,8 +1486,14 @@ EmitSnapshot(SnapshotContext* context)
     }
     else
     {
+        const double tickSeconds = std::max(0.001, static_cast<double>(context->tickMs) / 1000.0);
         for (const auto& [port, runtime] : context->flowRuntimeByPort)
         {
+            const auto countersIt = context->externalFlowCountersByPort.find(port);
+            const SnapshotContext::ExternalFlowCounters counters =
+                countersIt != context->externalFlowCountersByPort.end()
+                    ? countersIt->second
+                    : SnapshotContext::ExternalFlowCounters{};
             const double offeredMbps =
                 runtime.profile.packetSizeBytes * runtime.profile.arrivalRatePps * 8.0 / 1e6;
             const double capacityUl =
@@ -1319,45 +1504,36 @@ EmitSnapshot(SnapshotContext* context)
                 runtime.profile.allocatedBandwidthDlMbps > 0.0
                     ? runtime.profile.allocatedBandwidthDlMbps
                     : (runtime.profile.bandwidthDlMbps > 0.0 ? runtime.profile.bandwidthDlMbps : offeredMbps);
-            const double throughputUl = std::min(offeredMbps, capacityUl);
-            const double throughputDl = std::min(offeredMbps, capacityDl);
-            const double lossUl =
-                offeredMbps > 0.0
-                    ? std::max(runtime.profile.lossRate, std::max(0.0, 1.0 - throughputUl / offeredMbps))
-                    : 0.0;
-            const double lossDl =
-                offeredMbps > 0.0
-                    ? std::max(runtime.profile.lossRate, std::max(0.0, 1.0 - throughputDl / offeredMbps))
-                    : 0.0;
-            const double lossRate = std::min(1.0, (lossUl + lossDl) / 2.0);
-            const auto* sliceProfile = ResolveSliceProfile(context, runtime.profile);
-            const double baseLatencyMs =
-                sliceProfile != nullptr
-                    ? std::max(0.0, sliceProfile->latencyMs + sliceProfile->processingDelayMs)
-                    : runtime.profile.latencyMs;
-            const double baseJitterMs =
-                sliceProfile != nullptr ? sliceProfile->jitterMs : runtime.profile.jitterMs;
-            const double baseLossRate =
-                sliceProfile != nullptr ? std::max(runtime.profile.lossRate, sliceProfile->lossRate) : runtime.profile.lossRate;
-            const double effectiveLossRate = std::max(lossRate, baseLossRate);
+            const uint64_t txPacketsUl = counters.txPacketsUl;
+            const uint64_t rxPacketsUl = counters.rxPacketsUl;
+            const uint64_t txPacketsDl = counters.txPacketsDl;
+            const uint64_t rxPacketsDl = counters.rxPacketsDl;
+            const uint64_t txPackets = txPacketsUl + txPacketsDl;
+            const uint64_t rxPackets = rxPacketsUl + rxPacketsDl;
+            const uint64_t delaySamples = counters.delaySamplesUl + counters.delaySamplesDl;
+            const uint64_t jitterSamples =
+                (counters.hasLastDelayUl ? counters.delaySamplesUl - 1 : 0) +
+                (counters.hasLastDelayDl ? counters.delaySamplesDl - 1 : 0);
+            const double throughputUl =
+                rxPacketsUl * runtime.profile.packetSizeBytes * 8.0 / tickSeconds / 1e6;
+            const double throughputDl =
+                rxPacketsDl * runtime.profile.packetSizeBytes * 8.0 / tickSeconds / 1e6;
+            const double lossRate =
+                txPackets > 0 ? static_cast<double>(txPackets - rxPackets) / static_cast<double>(txPackets) : 0.0;
             const double shortfallRatio =
                 offeredMbps > 0.0
                     ? std::max(0.0, 1.0 - std::min(throughputUl, throughputDl) / offeredMbps)
                     : 0.0;
-            const double latencyFactor = ComputeMetricFactor(context, port, shortfallRatio, 0.0);
-            const double jitterFactor = ComputeMetricFactor(context, port, shortfallRatio, 1.1);
-            const double lossFactor = ComputeMetricFactor(context, port, shortfallRatio, 2.2);
-            const double delayMs =
-                std::max(0.1,
-                         std::max(baseLatencyMs, context->bridgeLinkDelayMs) * latencyFactor);
-            const double jitterMs = std::max(0.1, std::max(baseJitterMs, 0.1) * jitterFactor);
-            const double observedLossRate = std::min(1.0, std::max(0.0, effectiveLossRate * lossFactor));
-            const auto packets = static_cast<uint64_t>(
-                std::max(0.0, std::floor(runtime.profile.arrivalRatePps * elapsedSeconds)));
-            const auto rxPacketsUl = static_cast<uint64_t>(
-                std::floor(static_cast<double>(packets) * std::max(0.0, 1.0 - lossUl)));
-            const auto rxPacketsDl = static_cast<uint64_t>(
-                std::floor(static_cast<double>(packets) * std::max(0.0, 1.0 - lossDl)));
+            const double measuredDelayMs =
+                delaySamples > 0
+                    ? (counters.delaySumMsUl + counters.delaySumMsDl) / static_cast<double>(delaySamples)
+                    : 0.0;
+            const double measuredJitterMs =
+                jitterSamples > 0
+                    ? (counters.jitterSumMsUl + counters.jitterSumMsDl) / static_cast<double>(jitterSamples)
+                    : 0.0;
+            const double delayMs = measuredDelayMs > 0.0 ? measuredDelayMs : std::max(0.1, context->bridgeLinkDelayMs);
+            const double jitterMs = measuredJitterMs > 0.0 ? measuredJitterMs : 0.0;
             appendFlow(&runtime.profile,
                        runtime.ueIndex,
                        17,
@@ -1367,16 +1543,17 @@ EmitSnapshot(SnapshotContext* context)
                        port,
                        delayMs,
                        jitterMs,
-                       observedLossRate,
+                       lossRate,
                        throughputUl,
                        throughputDl,
-                       packets * 2,
-                       rxPacketsUl + rxPacketsDl,
+                       txPackets,
+                       rxPackets,
                        "bidirectional",
                        "ue_pdu_ip",
                        "external_data_network",
                        runtime.profile.flowId);
         }
+        context->externalFlowCountersByPort.clear();
     }
     json << "],";
 
@@ -1491,6 +1668,7 @@ main(int argc, char* argv[])
     std::string bridgeUpfTapsCsv;
     double bridgeLinkRateMbps = 1000.0;
     double bridgeLinkDelayMs = 1.0;
+    double bridgeLinkLossRate = 0.0;
     bool externalTrafficOnly = false;
     std::string externalTrafficTargetIp = "8.8.8.8";
     uint32_t externalTrafficSourceBasePort = 15000;
@@ -1520,6 +1698,7 @@ main(int argc, char* argv[])
     cmd.AddValue("bridgeUpfTaps", "Comma separated tap names attached to each UPF bridge", bridgeUpfTapsCsv);
     cmd.AddValue("bridgeLinkRateMbps", "Bridge link data rate in Mbps", bridgeLinkRateMbps);
     cmd.AddValue("bridgeLinkDelayMs", "Bridge link delay in milliseconds", bridgeLinkDelayMs);
+    cmd.AddValue("bridgeLinkLossRate", "Bridge link packet loss rate applied via ReceiveErrorModel", bridgeLinkLossRate);
     cmd.AddValue("externalTrafficOnly", "Use real UE UDP flows and disable built-in ns-3 UDP apps", externalTrafficOnly);
     cmd.AddValue("externalTrafficTargetIp", "Destination IP used by the real UE UDP generator", externalTrafficTargetIp);
     cmd.AddValue("externalTrafficSourceBasePort", "First source port used by the real UE UDP generator", externalTrafficSourceBasePort);
@@ -1613,6 +1792,8 @@ main(int argc, char* argv[])
         }
     }
 
+    SnapshotContext context;
+
     Time simTime = MilliSeconds(simTimeMs);
     Time appStartTime = MilliSeconds(400);
     uint16_t numerology = 0;
@@ -1698,6 +1879,24 @@ main(int argc, char* argv[])
             pair.Add(gnbBridgeNodes.Get(index));
             pair.Add(upfBridgeNodes.Get(index));
             NetDeviceContainer devices = bridgeCsma.Install(pair);
+            if (bridgeLinkLossRate > 0.0)
+            {
+                for (uint32_t deviceIndex = 0; deviceIndex < devices.GetN(); ++deviceIndex)
+                {
+                    Ptr<RateErrorModel> errorModel = CreateObject<RateErrorModel>();
+                    errorModel->SetUnit(RateErrorModel::ERROR_UNIT_PACKET);
+                    errorModel->SetRate(std::min(1.0, std::max(0.0, bridgeLinkLossRate)));
+                    devices.Get(deviceIndex)->SetAttribute("ReceiveErrorModel", PointerValue(errorModel));
+                }
+            }
+            devices.Get(0)->TraceConnectWithoutContext("MacTx", MakeBoundCallback(&OnBridgeMacTx, &context, true));
+            devices.Get(0)->TraceConnectWithoutContext("MacRx", MakeBoundCallback(&OnBridgeMacRx, &context, true));
+            devices.Get(0)->TraceConnectWithoutContext("MacRxDrop",
+                                                       MakeBoundCallback(&OnBridgeMacRxDrop, &context, true));
+            devices.Get(1)->TraceConnectWithoutContext("MacTx", MakeBoundCallback(&OnBridgeMacTx, &context, false));
+            devices.Get(1)->TraceConnectWithoutContext("MacRx", MakeBoundCallback(&OnBridgeMacRx, &context, false));
+            devices.Get(1)->TraceConnectWithoutContext("MacRxDrop",
+                                                       MakeBoundCallback(&OnBridgeMacRxDrop, &context, false));
             tapBridge.SetAttribute("DeviceName", StringValue(bridgeGnbTaps[index]));
             tapBridge.Install(pair.Get(0), devices.Get(0));
             tapBridge.SetAttribute("DeviceName", StringValue(bridgeUpfTaps[index]));
@@ -1822,7 +2021,6 @@ main(int argc, char* argv[])
     monitor->SetAttribute("PacketSizeBinWidth", DoubleValue(20));
     Ptr<Ipv4FlowClassifier> classifier = DynamicCast<Ipv4FlowClassifier>(flowMonitorHelper.GetClassifier());
 
-    SnapshotContext context;
     context.runId = runId;
     context.scenarioId = scenarioId;
     context.outputFile = outputFile;
@@ -1835,6 +2033,7 @@ main(int argc, char* argv[])
     context.ueNum = resolvedUeNum;
     context.bridgeLinkRateMbps = bridgeLinkRateMbps;
     context.bridgeLinkDelayMs = bridgeLinkDelayMs;
+    context.bridgeLinkLossRate = bridgeLinkLossRate;
     context.externalTrafficOnly = externalTrafficOnly;
     context.externalTrafficTargetIp = externalTrafficTargetIp;
     context.externalTrafficSourceBasePort = externalTrafficSourceBasePort;

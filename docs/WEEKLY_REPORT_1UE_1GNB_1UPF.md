@@ -139,13 +139,14 @@ ns-3 程序由 [scripts/build_ns3_twin.sh](scripts/build_ns3_twin.sh) 和 [scrip
 - --bridge-upf-taps=tupf1
 - --bridge-link-rate-mbps=250.0
 - --bridge-link-delay-ms=2.0
+- --bridge-link-loss-rate=0.05
 
 ns-3 收到这些参数后，会执行以下工作：
 
 1. 解析 bridgeGnbTaps 和 bridgeUpfTaps
 2. 为每个 gNB-UPF 对创建一段独立的 CSMA 链路
 3. 使用 TapBridge，模式为 UseBridge，把主机上的 TAP 设备挂到 ns-3 的设备上
-4. 用 bridgeLinkRateMbps 和 bridgeLinkDelayMs 给这段链路注入带宽和时延属性
+4. 用 bridgeLinkRateMbps、bridgeLinkDelayMs 和 bridgeLinkLossRate 给这段链路注入带宽、时延和链路级丢包属性
 
 在 1UE 1gNB 1UPF 下，这条用户面路径可以按下面理解：
 

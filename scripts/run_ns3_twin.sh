@@ -55,6 +55,7 @@ BRIDGE_GNB_TAPS=""
 BRIDGE_UPF_TAPS=""
 BRIDGE_LINK_RATE_MBPS="1000"
 BRIDGE_LINK_DELAY_MS="1"
+BRIDGE_LINK_LOSS_RATE="0"
 EXTERNAL_TRAFFIC_ONLY="false"
 EXTERNAL_TRAFFIC_TARGET_IP="8.8.8.8"
 EXTERNAL_TRAFFIC_SOURCE_BASE_PORT="15000"
@@ -157,6 +158,10 @@ while [[ $# -gt 0 ]]; do
       BRIDGE_LINK_DELAY_MS="$2"
       shift 2
       ;;
+    --bridge-link-loss-rate)
+      BRIDGE_LINK_LOSS_RATE="$2"
+      shift 2
+      ;;
     --external-traffic-only)
       EXTERNAL_TRAFFIC_ONLY="true"
       shift
@@ -203,7 +208,7 @@ fi
 cp "$PROJECT_ROOT/sim/ns3/nr_multignb_multiupf.cc" "$NS3_ROOT/scratch/nr_multignb_multiupf.cc"
 ensure_tap_creator_permissions
 
-NS3_ARGS="--runId=$RUN_ID --scenarioId=$SCENARIO_ID --gNbNum=$GNB_NUM --ueNumPerGnb=$UE_NUM_PER_GNB --tickMs=$TICK_MS --simTimeMs=$SIM_TIME_MS --simulator=$SIMULATOR --outputFile=$OUTPUT_FILE --upfNames=$UPF_NAMES --sliceSds=$SLICE_SDS --policyReloadMs=$POLICY_RELOAD_MS --bridgeLinkRateMbps=$BRIDGE_LINK_RATE_MBPS --bridgeLinkDelayMs=$BRIDGE_LINK_DELAY_MS"
+NS3_ARGS="--runId=$RUN_ID --scenarioId=$SCENARIO_ID --gNbNum=$GNB_NUM --ueNumPerGnb=$UE_NUM_PER_GNB --tickMs=$TICK_MS --simTimeMs=$SIM_TIME_MS --simulator=$SIMULATOR --outputFile=$OUTPUT_FILE --upfNames=$UPF_NAMES --sliceSds=$SLICE_SDS --policyReloadMs=$POLICY_RELOAD_MS --bridgeLinkRateMbps=$BRIDGE_LINK_RATE_MBPS --bridgeLinkDelayMs=$BRIDGE_LINK_DELAY_MS --bridgeLinkLossRate=$BRIDGE_LINK_LOSS_RATE"
 if [[ -n "$CLOCK_FILE" ]]; then
   NS3_ARGS="$NS3_ARGS --clockFile=$CLOCK_FILE"
 fi

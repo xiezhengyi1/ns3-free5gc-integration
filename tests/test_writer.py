@@ -49,7 +49,7 @@ class WriterStoreTest(unittest.TestCase):
         self.assertEqual(pending, "")
         self.assertEqual(line, '{"tick_index": 1}')
 
-    def test_merge_real_traffic_state_overrides_synthetic_flow_metrics(self) -> None:
+    def test_merge_real_traffic_state_preserves_snapshot_loss_metrics(self) -> None:
         root = Path(tempfile.mkdtemp(prefix="writer-real-traffic-"))
         try:
             state_file = root / "real-traffic.jsonl"
@@ -82,10 +82,10 @@ class WriterStoreTest(unittest.TestCase):
             )
 
             payload = build_payload()
-            payload["flows"][0]["loss_rate"] = 0.9
+            payload["flows"][0]["loss_rate"] = 0.2
             payload["flows"][0]["throughput_ul_mbps"] = 9.9
             payload["flows"][0]["throughput_dl_mbps"] = 8.8
-            payload["flows"][0]["telemetry"] = {"loss_rate": 0.9, "packet_sent": 999, "packet_received": 1}
+            payload["flows"][0]["telemetry"] = {"loss_rate": 0.2, "packet_sent": 999, "packet_received": 12}
             payload["flows"][0]["sla"] = {"loss_rate": 0.02}
             snapshot = TickSnapshot.from_dict(payload)
 
@@ -103,10 +103,9 @@ class WriterStoreTest(unittest.TestCase):
             self.assertEqual(flow.traffic["five_tuple"]["source_ip"], "10.60.0.1")
             self.assertAlmostEqual(flow.throughput_ul_mbps, 0.8)
             self.assertAlmostEqual(flow.throughput_dl_mbps, 0.4)
-            self.assertGreater(flow.loss_rate, 0.02)
-            self.assertLess(flow.loss_rate, 0.03)
+            self.assertAlmostEqual(flow.loss_rate, 0.2)
             self.assertEqual(flow.telemetry["packet_sent"], 15)
-            self.assertEqual(flow.telemetry["packet_received"], 15)
+            self.assertEqual(flow.telemetry["packet_received"], 12)
             self.assertAlmostEqual(flow.telemetry["throughput_ul"], 0.8)
             self.assertAlmostEqual(flow.telemetry["throughput_dl"], 0.4)
             self.assertEqual(merged.ues[0].ip_address, "10.60.0.1")
