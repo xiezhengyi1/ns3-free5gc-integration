@@ -29,6 +29,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--step", action="append", help="run only selected steps")
     parser.add_argument("--dry-run", action="store_true", help="print commands only")
     parser.add_argument(
+        "--stream-output",
+        action="store_true",
+        help="stream stdout/stderr to the terminal instead of relying on log files",
+    )
+    parser.add_argument(
         "--wait-background",
         action="store_true",
         help="wait for background commands before exiting",
@@ -246,7 +251,9 @@ def main() -> int:
         argv.extend(["--step", step])
     if args.dry_run:
         argv.append("--dry-run")
-    argv.append("--stream-output")
+    argv.extend(["--logs-dir", str(logs_dir)])
+    if args.stream_output:
+        argv.append("--stream-output")
     if args.wait_background:
         argv.append("--wait-background")
     try:

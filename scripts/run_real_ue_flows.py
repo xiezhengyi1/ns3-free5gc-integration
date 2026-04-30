@@ -12,17 +12,21 @@ import shlex
 import signal
 import subprocess
 import time
+
+
 def _rate_pps_from_bandwidth(target_mbps: float, packet_size: float) -> float:
     if target_mbps <= 0.0 or packet_size <= 0.0:
         return 0.0
     return target_mbps * 1e6 / 8.0 / packet_size
 
 
-def _select_interface_for_session(rows: list[list[str]], session_index: int) -> tuple[list[str], bool]:
+def _select_interface_for_session(rows: list[list[str]], session_index: int) -> list[str] | None:
     if not rows:
         raise ValueError("rows must not be empty")
-    selected_index = min(max(0, int(session_index)), len(rows) - 1)
-    return rows[selected_index], session_index >= len(rows)
+    selected_index = max(0, int(session_index))
+    if selected_index >= len(rows):
+        return None
+    return rows[selected_index]
 
 
 def _list_ue_interfaces(container: str) -> list[list[str]]:
@@ -55,15 +59,17 @@ done
     return rows
 
 
-def _resolve_ue_interface(container: str, session_index: int) -> tuple[dict[str, str], bool] | None:
+def _resolve_ue_interface(container: str, session_index: int) -> dict[str, str] | None:
     rows = _list_ue_interfaces(container)
     if not rows:
         return None
-    selected_row, used_fallback = _select_interface_for_session(rows, session_index)
+    selected_row = _select_interface_for_session(rows, session_index)
+    if selected_row is None:
+        return None
     return {
         "iface": selected_row[0],
         "ip": selected_row[1],
-    }, used_fallback
+    }
 
 
 def _effective_tick_window_ms(
@@ -189,7 +195,6 @@ def main(argv: list[str] | None = None) -> int:
 
     last_tick: int | None = None
     last_sim_time_ms: int | None = None
-    ue_interfaces: dict[tuple[str, int], dict[str, str]] = {}
     dl_routes: dict[str, dict[str, str]] = {}
     missing_interface_keys: set[tuple[str, int]] = set()
     missing_route_ips: set[str] = set()
@@ -234,6 +239,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
             scheduled: list[dict[str, object]] = []
+            tick_flow_state: list[dict[str, object]] = []
+            ue_interfaces: dict[tuple[str, int], dict[str, str] | None] = {}
             for flow in flows:
                 allocation = allocation_by_flow.get(str(flow["flow_id"]), {})
                 packet_size = float(flow["packet_size"])
@@ -258,29 +265,57 @@ def main(argv: list[str] | None = None) -> int:
                 flow["carry_ul"] = exact_ul_packets - ul_packets
                 flow["carry_dl"] = exact_dl_packets - dl_packets
                 if ul_packets <= 0 and dl_packets <= 0:
+                    tick_flow_state.append(
+                        {
+                            "flow_id": str(flow["flow_id"]),
+                            "ue_name": str(flow["ue_name"]),
+                            "session_ref": str(flow["session_ref"]),
+                            "container": str(flow["container"]),
+                            "interface": "",
+                            "ue_ip": "",
+                            "dl_container": "",
+                            "source_port": int(flow["source_port"]),
+                            "destination_port": int(flow["port"]),
+                            "packet_size_bytes": int(flow["packet_size"]),
+                            "ul_packets_sent": 0,
+                            "dl_packets_sent": 0,
+                        }
+                    )
                     continue
                 key = (str(flow["container"]), int(flow["session_index"]))
                 if key not in ue_interfaces:
-                    resolved = _resolve_ue_interface(str(flow["container"]), int(flow["session_index"]))
-                    if resolved is None:
+                    ue_interfaces[key] = _resolve_ue_interface(
+                        str(flow["container"]), int(flow["session_index"])
+                    )
+                    if ue_interfaces[key] is None:
                         if key not in missing_interface_keys:
                             print(
                                 f"waiting: {flow['container']} has no usable uesimtun interface for session index {flow['session_index']}",
                                 flush=True,
                             )
                             missing_interface_keys.add(key)
-                        continue
-                    selected_interface, used_fallback = resolved
-                    missing_interface_keys.discard(key)
-                    if used_fallback:
-                        print(
-                            f"warning: {flow['container']} is missing session index {flow['session_index']}; "
-                            f"using {selected_interface['iface']} instead",
-                            flush=True,
-                        )
-                    ue_interfaces[key] = selected_interface
-                flow["iface"] = ue_interfaces[key]["iface"]
-                flow["ue_ip"] = ue_interfaces[key]["ip"]
+                selected_interface = ue_interfaces[key]
+                if selected_interface is None:
+                    tick_flow_state.append(
+                        {
+                            "flow_id": str(flow["flow_id"]),
+                            "ue_name": str(flow["ue_name"]),
+                            "session_ref": str(flow["session_ref"]),
+                            "container": str(flow["container"]),
+                            "interface": "",
+                            "ue_ip": "",
+                            "dl_container": "",
+                            "source_port": int(flow["source_port"]),
+                            "destination_port": int(flow["port"]),
+                            "packet_size_bytes": int(flow["packet_size"]),
+                            "ul_packets_sent": 0,
+                            "dl_packets_sent": 0,
+                        }
+                    )
+                    continue
+                missing_interface_keys.discard(key)
+                flow["iface"] = selected_interface["iface"]
+                flow["ue_ip"] = selected_interface["ip"]
                 if str(flow["ue_ip"]) not in dl_routes:
                     for upf_container in upf_containers:
                         route = subprocess.check_output(
@@ -307,11 +342,45 @@ def main(argv: list[str] | None = None) -> int:
                                 flush=True,
                             )
                             missing_route_ips.add(str(flow["ue_ip"]))
+                        flow_without_dl = {**flow, "ul_packets": ul_packets, "dl_packets": 0}
+                        scheduled.append(flow_without_dl)
+                        tick_flow_state.append(
+                            {
+                                "flow_id": str(flow["flow_id"]),
+                                "ue_name": str(flow["ue_name"]),
+                                "session_ref": str(flow["session_ref"]),
+                                "container": str(flow["container"]),
+                                "interface": str(flow["iface"]),
+                                "ue_ip": str(flow["ue_ip"]),
+                                "dl_container": "",
+                                "source_port": int(flow["source_port"]),
+                                "destination_port": int(flow["port"]),
+                                "packet_size_bytes": int(flow["packet_size"]),
+                                "ul_packets_sent": int(ul_packets),
+                                "dl_packets_sent": 0,
+                            }
+                        )
                         continue
                 missing_route_ips.discard(str(flow["ue_ip"]))
                 flow["dl_container"] = dl_routes[str(flow["ue_ip"])]["container"]
                 flow["dl_iface"] = dl_routes[str(flow["ue_ip"])]["iface"]
                 scheduled.append({**flow, "ul_packets": ul_packets, "dl_packets": dl_packets})
+                tick_flow_state.append(
+                    {
+                        "flow_id": str(flow["flow_id"]),
+                        "ue_name": str(flow["ue_name"]),
+                        "session_ref": str(flow["session_ref"]),
+                        "container": str(flow["container"]),
+                        "interface": str(flow["iface"]),
+                        "ue_ip": str(flow["ue_ip"]),
+                        "dl_container": str(flow["dl_container"]),
+                        "source_port": int(flow["source_port"]),
+                        "destination_port": int(flow["port"]),
+                        "packet_size_bytes": int(flow["packet_size"]),
+                        "ul_packets_sent": int(ul_packets),
+                        "dl_packets_sent": int(dl_packets),
+                    }
+                )
 
             grouped_ul: dict[tuple[str, str], list[dict[str, object]]] = {}
             grouped_dl: dict[tuple[str, str], list[dict[str, object]]] = {}
@@ -337,8 +406,9 @@ iface={shlex.quote(iface)}
 ports=({ports})
 source_ports=({source_ports})
 sizes=({sizes})
-counts=({counts})
-flow_ids=({flow_ids})
+                counts=({counts})
+                flow_ids=({flow_ids})
+set -euo pipefail
 source_cidr=$(ip -4 -o addr show dev "$iface" | sed -n 's/.* inet \\([^ ]*\\).*/\\1/p' | head -n 1)
 source_ip=${{source_cidr%%/*}}
 for i in "${{!ports[@]}}"; do
@@ -368,9 +438,10 @@ iface={shlex.quote(iface)}
 ports=({ports})
 source_ports=({source_ports})
 target_ips=({target_ips})
-sizes=({sizes})
-counts=({counts})
-flow_ids=({flow_ids})
+                sizes=({sizes})
+                counts=({counts})
+                flow_ids=({flow_ids})
+set -euo pipefail
 for i in "${{!ports[@]}}"; do
   {shlex.quote(container_sender)} "${{target_ips[$i]}}" "${{ports[$i]}}" "${{source_ports[$i]}}" "$iface" "${{sizes[$i]}}" "${{counts[$i]}}"
   echo "direction=dl tick=$tick_index sim_ms=$sim_time_ms flow=${{flow_ids[$i]}} src=$HOSTNAME:${{source_ports[$i]}} dst=${{target_ips[$i]}}:${{ports[$i]}} iface=$iface size=${{sizes[$i]}} packets=${{counts[$i]}}"
@@ -399,23 +470,7 @@ done
                             "effective_tick_ms": elapsed_ms,
                             "skipped_ticks": skipped_ticks,
                             "target_ip": args.target_ip,
-                            "flows": [
-                                {
-                                    "flow_id": str(flow["flow_id"]),
-                                    "ue_name": str(flow["ue_name"]),
-                                    "session_ref": str(flow["session_ref"]),
-                                    "container": str(flow["container"]),
-                                    "interface": str(flow["iface"]),
-                                    "ue_ip": str(flow["ue_ip"]),
-                                    "dl_container": str(flow["dl_container"]),
-                                    "source_port": int(flow["source_port"]),
-                                    "destination_port": int(flow["port"]),
-                                    "packet_size_bytes": int(flow["packet_size"]),
-                                    "ul_packets_sent": int(flow["ul_packets"]),
-                                    "dl_packets_sent": int(flow["dl_packets"]),
-                                }
-                                for flow in scheduled
-                            ],
+                            "flows": tick_flow_state,
                         },
                         ensure_ascii=False,
                     )

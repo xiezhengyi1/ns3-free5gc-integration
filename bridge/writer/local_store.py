@@ -83,7 +83,7 @@ class SnapshotStore:
         topology_version: str = "v1",
         status: str = "running",
     ) -> None:
-        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        now = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
         with self._connect() as connection:
             connection.execute(
                 """
@@ -99,7 +99,7 @@ class SnapshotStore:
             )
 
     def mark_run_status(self, run_id: str, status: str) -> None:
-        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        now = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
         with self._connect() as connection:
             connection.execute(
                 "UPDATE sim_run SET status=?, ended_at=? WHERE run_id=?",
@@ -112,36 +112,71 @@ class SnapshotStore:
         seed: int | None = None,
         topology_version: str = "v1",
     ) -> dict[str, object]:
-        created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        created_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
         payload = snapshot.to_dict()
         payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         self.upsert_run(snapshot.run_id, snapshot.scenario_id, seed, topology_version)
 
         with self._connect() as connection:
-            cursor = connection.execute(
+            existing = connection.execute(
                 """
-                INSERT OR IGNORE INTO sim_tick (run_id, tick_index, sim_time_ms, payload_json, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                SELECT sim_time_ms, payload_json
+                FROM sim_tick
+                WHERE run_id=? AND tick_index=?
                 """,
-                (
-                    snapshot.run_id,
-                    snapshot.tick_index,
-                    snapshot.sim_time_ms,
-                    payload_json,
-                    created_at,
-                ),
+                (snapshot.run_id, snapshot.tick_index),
+            ).fetchone()
+            inserted = existing is None
+            updated = (
+                existing is not None
+                and (int(existing[0]) != snapshot.sim_time_ms or str(existing[1]) != payload_json)
             )
-            inserted = cursor.rowcount == 1
+            if inserted:
+                connection.execute(
+                    """
+                    INSERT INTO sim_tick (run_id, tick_index, sim_time_ms, payload_json, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot.run_id,
+                        snapshot.tick_index,
+                        snapshot.sim_time_ms,
+                        payload_json,
+                        created_at,
+                    ),
+                )
+            elif updated:
+                connection.execute(
+                    """
+                    UPDATE sim_tick
+                    SET sim_time_ms=?, payload_json=?, created_at=?
+                    WHERE run_id=? AND tick_index=?
+                    """,
+                    (
+                        snapshot.sim_time_ms,
+                        payload_json,
+                        created_at,
+                        snapshot.run_id,
+                        snapshot.tick_index,
+                    ),
+                )
+            latest_tick_row = connection.execute(
+                "SELECT MAX(tick_index) FROM sim_tick WHERE run_id=?",
+                (snapshot.run_id,),
+            ).fetchone()
+            latest_tick = int(latest_tick_row[0]) if latest_tick_row and latest_tick_row[0] is not None else -1
 
         archive_path = self.archive_dir / snapshot.run_id / "ticks" / f"{snapshot.tick_index:06d}.json"
         latest_path = self.archive_dir / snapshot.run_id / "latest.json"
-        if inserted:
+        if inserted or updated:
             archive_path.parent.mkdir(parents=True, exist_ok=True)
             archive_path.write_text(payload_json + "\n", encoding="utf-8")
+        if snapshot.tick_index >= latest_tick:
             latest_path.write_text(payload_json + "\n", encoding="utf-8")
 
         return {
             "inserted": inserted,
+            "updated": updated,
             "run_id": snapshot.run_id,
             "tick_index": snapshot.tick_index,
             "archive_path": str(archive_path),
@@ -173,3 +208,30 @@ class SnapshotStore:
             "entity_type": event.entity_type,
             "entity_id": event.entity_id,
         }
+
+    def latest_snapshot_tick(self, run_id: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT MAX(tick_index) FROM sim_tick WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+        if row is None or row[0] is None:
+            return -1
+        return int(row[0])
+
+    def resolve_tick_for_observed_at(self, run_id: str, observed_at: datetime) -> int:
+        observed_text = observed_at.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT tick_index
+                FROM sim_tick
+                WHERE run_id=? AND created_at<=?
+                ORDER BY created_at DESC, tick_index DESC
+                LIMIT 1
+                """,
+                (run_id, observed_text),
+            ).fetchone()
+        if row is None or row[0] is None:
+            return 0
+        return int(row[0])

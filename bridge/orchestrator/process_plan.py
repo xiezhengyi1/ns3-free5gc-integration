@@ -29,6 +29,7 @@ class RunManifest:
     compose_project_name: str
     free5gc_webui_url: str
     bridge_script: str
+    bridge_probe_script: str
     bridge_links: list[dict[str, object]]
     snapshot_file: str
     clock_file: str
@@ -56,6 +57,7 @@ def build_run_manifest(
     run_dir: Path,
     compose_file: Path,
     bridge_script: Path,
+    bridge_probe_script: Path,
     bridge_plans: list[BridgeInterfacePlan],
     snapshot_file: Path,
     clock_file: Path,
@@ -83,6 +85,13 @@ def build_run_manifest(
     ]
     upf_names = ",".join(upf.name for upf in scenario.upfs) or "upf"
     slice_sds = ",".join(slice_config.sd for slice_config in scenario.slices) or "010203"
+    upf_services = list(service_map["upf"].values())
+    gnb_services = list(service_map["gnb"].values())
+    ue_services = list(service_map["ue"].values())
+    smf_services = [service for service in core_services if service == "free5gc-smf"]
+    infra_core_services = [
+        service for service in core_services if service not in set(upf_services) and service not in set(smf_services)
+    ]
     gnb_index_by_name = {gnb.name: index for index, gnb in enumerate(scenario.gnbs, start=1)}
     upf_index_by_name = {upf.name: index for index, upf in enumerate(scenario.upfs, start=1)}
     ue_gnb_map = ",".join(
@@ -121,7 +130,7 @@ def build_run_manifest(
                 "-d",
                 "--force-recreate",
                 "--remove-orphans",
-                *core_services,
+                *infra_core_services,
             ],
         ),
         CommandSpec(
@@ -152,7 +161,7 @@ def build_run_manifest(
                 str(state_db),
                 "--archive-dir",
                 str(archive_dir),
-            ] + [item for service in core_services for item in ("--service", service)],
+            ] + [item for service in [*infra_core_services, *upf_services, *smf_services] for item in ("--service", service)],
             background=True,
         ),
         CommandSpec(
@@ -192,7 +201,7 @@ def build_run_manifest(
             else []
         ),
         CommandSpec(
-            name="compose-up-ran",
+            name="compose-up-upf",
             cwd=str(project_root),
             argv=[
                 *compose_base_argv,
@@ -200,7 +209,19 @@ def build_run_manifest(
                 "-d",
                 "--force-recreate",
                 "--remove-orphans",
-                *ran_services,
+                *upf_services,
+            ],
+        ),
+        CommandSpec(
+            name="compose-up-gnb",
+            cwd=str(project_root),
+            argv=[
+                *compose_base_argv,
+                "up",
+                "-d",
+                "--force-recreate",
+                "--remove-orphans",
+                *gnb_services,
             ],
         ),
         CommandSpec(
@@ -231,7 +252,7 @@ def build_run_manifest(
                 str(state_db),
                 "--archive-dir",
                 str(archive_dir),
-            ] + [item for service in ran_services for item in ("--service", service)],
+            ] + [item for service in [*gnb_services, *ue_services] for item in ("--service", service)],
             background=True,
         ),
         *(
@@ -278,6 +299,30 @@ def build_run_manifest(
             ]
             if scenario.bridge.enable_inline_harness
             else []
+        ),
+        CommandSpec(
+            name="compose-up-smf",
+            cwd=str(project_root),
+            argv=[
+                *compose_base_argv,
+                "up",
+                "-d",
+                "--force-recreate",
+                "--remove-orphans",
+                *smf_services,
+            ],
+        ),
+        CommandSpec(
+            name="compose-up-ue",
+            cwd=str(project_root),
+            argv=[
+                *compose_base_argv,
+                "up",
+                "-d",
+                "--force-recreate",
+                "--remove-orphans",
+                *ue_services,
+            ],
         ),
         CommandSpec(
             name="writer-follow-ns3",
@@ -413,11 +458,11 @@ def build_run_manifest(
                 "15",
             ]
         )
-        compose_up_ran_index = next(
-            index for index, command in enumerate(commands) if command.name == "compose-up-ran"
+        compose_up_gnb_index = next(
+            index for index, command in enumerate(commands) if command.name == "compose-up-gnb"
         )
         commands.insert(
-            compose_up_ran_index + 1,
+            compose_up_gnb_index + 1,
             CommandSpec(
                 name="bridge-setup",
                 cwd=str(project_root),
@@ -438,6 +483,35 @@ def build_run_manifest(
                     "bash",
                     str(bridge_script),
                 ],
+            ),
+        )
+        ns3_run_index = next(
+            index for index, command in enumerate(commands) if command.name == "ns3-run"
+        )
+        commands.insert(
+            ns3_run_index,
+            CommandSpec(
+                name="bridge-probe-post-ns3",
+                cwd=str(project_root),
+                argv=[
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--privileged",
+                    "--pid",
+                    "host",
+                    "--network",
+                    "host",
+                    "-v",
+                    "/:/host",
+                    "free5gc/base:latest",
+                    "chroot",
+                    "/host",
+                    "bash",
+                    str(bridge_probe_script),
+                    "12",
+                ],
+                background=True,
             ),
         )
     if scenario.writer.graph_db_url:
@@ -465,6 +539,7 @@ def build_run_manifest(
         compose_project_name=scenario.free5gc.project_name,
         free5gc_webui_url=free5gc_webui_url,
         bridge_script=str(bridge_script),
+        bridge_probe_script=str(bridge_probe_script),
         bridge_links=[plan.to_dict() for plan in bridge_plans],
         snapshot_file=str(snapshot_file),
         clock_file=str(clock_file),

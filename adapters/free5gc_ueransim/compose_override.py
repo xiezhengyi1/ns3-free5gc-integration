@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+import ipaddress
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,15 @@ class ComposeRenderResult:
     ran_services: list[str]
 
 
+@dataclass(slots=True)
+class N3NetworkPlan:
+    network_name: str
+    subnet_cidr: str
+    gateway_ip: str
+    gnb_ips: dict[str, str]
+    upf_ips: dict[str, str]
+
+
 def gnb_service_ip(index: int) -> str:
     return f"10.100.200.{_GNB_SERVICE_IP_BASE + index - 1}"
 
@@ -41,6 +51,42 @@ def gnb_service_ip(index: int) -> str:
 def upf_service_ip(index: int) -> str:
     host_octet = _UPF_SERVICE_IP_BASE if index == 1 else _UPF_SERVICE_IP_BASE + index
     return f"10.100.200.{host_octet}"
+
+
+def build_n3_network_plan(scenario: ScenarioConfig) -> N3NetworkPlan | None:
+    subnet_cidr = scenario.bridge.n3_network_cidr
+    if not subnet_cidr:
+        return None
+
+    network = ipaddress.ip_network(subnet_cidr, strict=True)
+    host_list = list(network.hosts())
+    if len(host_list) < 2:
+        raise ValueError(f"bridge.n3_network_cidr {subnet_cidr} must provide at least gateway + one endpoint")
+
+    gateway_ip = str(host_list[0])
+    host_iter = iter(host_list[1:])
+    gnb_ips: dict[str, str] = {}
+    upf_ips: dict[str, str] = {}
+
+    for gnb in scenario.gnbs:
+        try:
+            gnb_ips[gnb.name] = str(next(host_iter))
+        except StopIteration as exc:
+            raise ValueError(f"bridge.n3_network_cidr {subnet_cidr} cannot allocate gNB N3 IPs") from exc
+
+    for upf in scenario.upfs:
+        try:
+            upf_ips[upf.name] = str(next(host_iter))
+        except StopIteration as exc:
+            raise ValueError(f"bridge.n3_network_cidr {subnet_cidr} cannot allocate UPF N3 IPs") from exc
+
+    return N3NetworkPlan(
+        network_name=scenario.bridge.n3_network_name,
+        subnet_cidr=subnet_cidr,
+        gateway_ip=gateway_ip,
+        gnb_ips=gnb_ips,
+        upf_ips=upf_ips,
+    )
 
 
 def _absolutize_volume(item: str, compose_dir: Path) -> str:
@@ -105,6 +151,31 @@ def _upf_service_name(upf_name: str) -> str:
     return f"free5gc-{safe_name(upf_name)}"
 
 
+def _canonical_upf_service_names(scenario: ScenarioConfig) -> dict[str, str]:
+    service_names: dict[str, str] = {}
+    branching_count = 0
+    anchor_count = 0
+    used: set[str] = set()
+
+    for upf in scenario.upfs:
+        role = upf.role.lower()
+        if "branch" in role or upf.name.lower() in {"i-upf", "iupf"}:
+            branching_count += 1
+            service_name = "free5gc-i-upf" if branching_count == 1 else f"free5gc-i-upf-{branching_count}"
+        elif "anchor" in role or "psa" in role or upf.name.lower() in {"psa-upf", "psaupf"}:
+            anchor_count += 1
+            service_name = "free5gc-psa-upf" if anchor_count == 1 else f"free5gc-psa-upf-{anchor_count}"
+        else:
+            service_name = _upf_service_name(upf.name)
+
+        if service_name in used:
+            raise ValueError(f"duplicate rendered UPF service name {service_name} for UPF {upf.name}")
+        used.add(service_name)
+        service_names[upf.name] = service_name
+
+    return service_names
+
+
 def _filter_depends_on(service: dict[str, Any], known_services: set[str]) -> None:
     depends_on = service.get("depends_on")
     if isinstance(depends_on, list):
@@ -137,14 +208,35 @@ def render_compose_for_run(
     resolved_topology: ResolvedScenarioTopology | None = None,
 ) -> ComposeRenderResult:
     resolved_topology = resolved_topology or resolve_scenario_topology(scenario)
+    upf_service_names = _canonical_upf_service_names(scenario)
+    n3_network_plan = build_n3_network_plan(scenario)
     compose_path = Path(scenario.free5gc.compose_file)
     with compose_path.open("r", encoding="utf-8") as handle:
         raw_compose = yaml.safe_load(handle)
     compose = _normalize_compose(raw_compose, compose_path.parent)
+    compose.pop("version", None)
 
     services = compose.setdefault("services", {})
+    networks = compose.setdefault("networks", {})
     if "ueransim" not in services:
         raise ValueError("base compose file must define a ueransim service")
+
+    if n3_network_plan is not None:
+        n3_network_payload = networks.get(n3_network_plan.network_name)
+        if not isinstance(n3_network_payload, dict):
+            n3_network_payload = {}
+        n3_network_payload["driver"] = "bridge"
+        ipam_payload = n3_network_payload.get("ipam")
+        if not isinstance(ipam_payload, dict):
+            ipam_payload = {}
+        ipam_payload["config"] = [
+            {
+                "subnet": n3_network_plan.subnet_cidr,
+                "gateway": n3_network_plan.gateway_ip,
+            }
+        ]
+        n3_network_payload["ipam"] = ipam_payload
+        networks[n3_network_plan.network_name] = n3_network_payload
 
     _prune_services_for_mode(services, scenario.free5gc.mode)
 
@@ -181,17 +273,27 @@ def render_compose_for_run(
         upf_service["command"] = "bash -c \"bash ./upf-iptables.sh && ./upf -c ./config/upfcfg.yaml\""
         _replace_volume_source(upf_service, "/free5gc/config/upfcfg.yaml", generated_config_dir / "upfcfg.yaml")
         _ensure_network_entry(upf_service, "privnet")["ipv4_address"] = UPF_CONTROL_IP
+        if n3_network_plan is not None and scenario.upfs:
+            _ensure_network_entry(upf_service, n3_network_plan.network_name)["ipv4_address"] = (
+                n3_network_plan.upf_ips[scenario.upfs[0].name]
+            )
     elif scenario.free5gc.mode == "ulcl":
         template_service = deepcopy(services["free5gc-i-upf"])
-        expected_upf_services = {_upf_service_name(upf.name) for upf in scenario.upfs}
+        expected_upf_services = {upf_service_names[upf.name] for upf in scenario.upfs}
         for index, upf in enumerate(scenario.upfs, start=1):
-            service_name = _upf_service_name(upf.name)
+            service_name = upf_service_names[upf.name]
             if service_name not in services:
                 service = deepcopy(template_service)
-                service["container_name"] = upf.name
-                service["networks"] = {"privnet": {"aliases": [f"{upf.name}.free5gc.org"]}}
                 services[service_name] = service
             upf_service = services[service_name]
+            upf_service["container_name"] = upf.name
+            upf_network = _ensure_network_entry(upf_service, "privnet")
+            existing_aliases = upf_network.get("aliases")
+            alias_list = list(existing_aliases) if isinstance(existing_aliases, list) else []
+            expected_alias = f"{upf.name}.free5gc.org"
+            if expected_alias not in alias_list:
+                alias_list.append(expected_alias)
+            upf_network["aliases"] = alias_list
             upf_service["command"] = "bash -c \"bash ./upf-iptables.sh && ./upf -c ./config/upfcfg.yaml\""
             _replace_volume_source(
                 upf_service,
@@ -199,6 +301,10 @@ def render_compose_for_run(
                 generated_config_dir / f"{upf.name}-upfcfg.yaml",
             )
             _ensure_network_entry(upf_service, "privnet")["ipv4_address"] = upf_service_ip(index)
+            if n3_network_plan is not None:
+                _ensure_network_entry(upf_service, n3_network_plan.network_name)["ipv4_address"] = (
+                    n3_network_plan.upf_ips[upf.name]
+                )
         for service_name, service in list(services.items()):
             image = str(service.get("image", ""))
             if service_name.startswith("free5gc-") and "upf" in service_name and service_name not in expected_upf_services:
@@ -219,7 +325,7 @@ def render_compose_for_run(
                 if not (isinstance(item, str) and item.startswith("free5gc-") and "upf" in item)
             ]
             for upf in scenario.upfs:
-                service_name = _upf_service_name(upf.name)
+                service_name = upf_service_names[upf.name]
                 if service_name not in depends_on:
                     depends_on.append(service_name)
             services["free5gc-smf"]["depends_on"] = depends_on
@@ -234,7 +340,7 @@ def render_compose_for_run(
         service_map["upf"][scenario.upfs[0].name] = "free5gc-upf"
     elif scenario.free5gc.mode == "ulcl":
         for upf in scenario.upfs:
-            service_name = _upf_service_name(upf.name)
+            service_name = upf_service_names[upf.name]
             if service_name in services:
                 service_map["upf"][upf.name] = service_name
 
@@ -257,6 +363,10 @@ def render_compose_for_run(
                 "ipv4_address": gnb_service_ip(index),
             }
         }
+        if n3_network_plan is not None:
+            _ensure_network_entry(service, n3_network_plan.network_name)["ipv4_address"] = (
+                n3_network_plan.gnb_ips[gnb.name]
+            )
 
         services[service_name] = service
         service_map["gnb"][gnb.name] = service_name

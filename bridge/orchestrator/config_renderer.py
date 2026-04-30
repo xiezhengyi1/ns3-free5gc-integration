@@ -11,11 +11,13 @@ from typing import Any
 
 import yaml
 
-from adapters.free5gc_ueransim.bridge_setup import build_bridge_plan, render_bridge_script
+from adapters.free5gc_ueransim.bridge_setup import build_bridge_plan, render_bridge_probe_script, render_bridge_script
 from adapters.free5gc_ueransim.compose_override import (
     AMF_CONTROL_IP,
+    N3NetworkPlan,
     SMF_CONTROL_IP,
     UPF_CONTROL_IP,
+    build_n3_network_plan,
     gnb_service_ip,
     render_compose_for_run,
     upf_service_ip,
@@ -325,11 +327,29 @@ def _compose_inspect_targets(compose_payload: dict[str, Any]) -> dict[str, str]:
     return payload
 
 
+def _bridge_plan_by_gnb_name(bridge_plans: list[Any]) -> dict[str, Any]:
+    return {plan.gnb_name: plan for plan in bridge_plans}
+
+
+def _gnb_n3_ip(index: int, gnb_name: str, n3_network_plan: N3NetworkPlan | None) -> str:
+    if n3_network_plan is None:
+        return gnb_service_ip(index)
+    return n3_network_plan.gnb_ips[gnb_name]
+
+
+def _upf_n3_ip(index: int, upf_name: str, n3_network_plan: N3NetworkPlan | None) -> str:
+    if n3_network_plan is None:
+        return upf_service_ip(index)
+    return n3_network_plan.upf_ips[upf_name]
+
+
 def _render_ulcl_smf_config(
     scenario: ScenarioConfig,
     config_dir: Path,
     ulcl_root: Path,
     resolved_topology: ResolvedScenarioTopology,
+    bridge_plans: list[Any],
+    n3_network_plan: N3NetworkPlan | None,
 ) -> None:
     slice_apn_map = _scenario_slice_apns(scenario)
     all_apns = sorted({apn for slice_apns in slice_apn_map.values() for apn in slice_apns})
@@ -414,7 +434,7 @@ def _render_ulcl_smf_config(
         node_name = f"gNB{index}"
         rendered_up_nodes[node_name] = {
             "type": "AN",
-            "nodeID": gnb_service_ip(index),
+            "nodeID": _gnb_n3_ip(index, gnb.name, n3_network_plan),
         }
         used_node_names.add(node_name)
         gnb_node_names[gnb.name] = node_name
@@ -428,13 +448,14 @@ def _render_ulcl_smf_config(
         if not template_payload:
             template_key = "I-UPF" if "branch" in upf.role.lower() else "PSA-UPF"
             template_payload = deepcopy(template_upf_nodes.get(template_key, {"type": "UPF"}))
-        template_payload["nodeID"] = upf_service_ip(index)
-        template_payload["addr"] = upf_service_ip(index)
+        upf_n3_ip = _upf_n3_ip(index, upf.name, n3_network_plan)
+        template_payload["nodeID"] = upf_n3_ip
+        template_payload["addr"] = upf_n3_ip
         interfaces = template_payload.get("interfaces")
         if isinstance(interfaces, list):
             for interface in interfaces:
                 if isinstance(interface, dict):
-                    interface["endpoints"] = [upf_service_ip(index)]
+                    interface["endpoints"] = [upf_n3_ip]
                     interface["networkInstances"] = all_apns
 
         template_snssai_infos = template_payload.get("sNssaiUpfInfos")
@@ -528,6 +549,8 @@ def _render_ulcl_upf_config(
     upf_name: str,
     upf_role: str,
     upf_index: int,
+    bridge_plans: list[Any],
+    n3_network_plan: N3NetworkPlan | None,
 ) -> None:
     slice_apn_map = _scenario_slice_apns(scenario)
     slice_count = len(scenario.slices)
@@ -554,9 +577,15 @@ def _render_ulcl_upf_config(
     if isinstance(gtpu, dict):
         if_list = gtpu.get("ifList")
         if isinstance(if_list, list):
+            rendered_if_list: list[dict[str, Any]] = []
+            upf_n3_ip = _upf_n3_ip(upf_index, upf_name, n3_network_plan)
             for interface in if_list:
-                if isinstance(interface, dict):
-                    interface["addr"] = upf_service_ip(upf_index)
+                if not isinstance(interface, dict):
+                    continue
+                rendered_interface = deepcopy(interface)
+                rendered_interface["addr"] = upf_n3_ip
+                rendered_if_list.append(rendered_interface)
+            gtpu["ifList"] = rendered_if_list
 
     template_entry = None
     existing_dnn_entries = upf_payload.get("dnnList")
@@ -719,6 +748,8 @@ def _render_single_upf_configs(
     scenario: ScenarioConfig,
     config_dir: Path,
     base_root: Path,
+    bridge_plans: list[Any],
+    n3_network_plan: N3NetworkPlan | None,
 ) -> None:
     slice_apn_map = _scenario_slice_apns(scenario)
     apns = sorted({apn for slice_apns in slice_apn_map.values() for apn in slice_apns})
@@ -788,12 +819,12 @@ def _render_single_upf_configs(
         if not isinstance(interface, dict):
             continue
         rendered_interface = deepcopy(interface)
-        rendered_interface["endpoints"] = [UPF_CONTROL_IP]
+        rendered_interface["endpoints"] = [_upf_n3_ip(1, scenario.upfs[0].name, n3_network_plan)]
         rendered_interface["networkInstances"] = apns
         rendered_interfaces.append(rendered_interface)
 
-    existing_upf["nodeID"] = UPF_CONTROL_IP
-    existing_upf["addr"] = UPF_CONTROL_IP
+    existing_upf["nodeID"] = _upf_n3_ip(1, scenario.upfs[0].name, n3_network_plan)
+    existing_upf["addr"] = _upf_n3_ip(1, scenario.upfs[0].name, n3_network_plan)
     existing_upf["interfaces"] = rendered_interfaces
     existing_upf["sNssaiUpfInfos"] = [
         {
@@ -813,8 +844,11 @@ def _render_single_upf_configs(
         for slice_config in scenario.slices
     ]
     up_nodes_payload = {
-        f"gNB{index}": {"type": "AN", "nodeID": gnb_service_ip(index)}
-        for index, _ in enumerate(scenario.gnbs, start=1)
+        f"gNB{index}": {
+            "type": "AN",
+            "nodeID": _gnb_n3_ip(index, gnb.name, n3_network_plan),
+        }
+        for index, gnb in enumerate(scenario.gnbs, start=1)
     }
     up_nodes_payload["UPF"] = existing_upf
     userplane_information["upNodes"] = up_nodes_payload
@@ -834,9 +868,14 @@ def _render_single_upf_configs(
     if isinstance(gtpu, dict):
         if_list = gtpu.get("ifList")
         if isinstance(if_list, list):
+            rendered_if_list: list[dict[str, Any]] = []
             for interface in if_list:
-                if isinstance(interface, dict):
-                    interface["addr"] = UPF_CONTROL_IP
+                if not isinstance(interface, dict):
+                    continue
+                rendered_interface = deepcopy(interface)
+                rendered_interface["addr"] = _upf_n3_ip(1, scenario.upfs[0].name, n3_network_plan)
+                rendered_if_list.append(rendered_interface)
+            upf_payload["gtpu"]["ifList"] = rendered_if_list
 
     existing_dnn_entries = upf_payload.get("dnnList")
     template_entry = None
@@ -861,6 +900,8 @@ def _render_core_configs(
     scenario: ScenarioConfig,
     config_dir: Path,
     resolved_topology: ResolvedScenarioTopology,
+    bridge_plans: list[Any],
+    n3_network_plan: N3NetworkPlan | None,
 ) -> None:
     base_root = Path(scenario.free5gc.config_root)
     _render_nrf_config(scenario, config_dir)
@@ -869,14 +910,23 @@ def _render_core_configs(
 
     if scenario.free5gc.mode == "ulcl":
         ulcl_root = base_root / "ULCL"
-        _render_ulcl_smf_config(scenario, config_dir, ulcl_root, resolved_topology)
+        _render_ulcl_smf_config(scenario, config_dir, ulcl_root, resolved_topology, bridge_plans, n3_network_plan)
 
         for index, upf in enumerate(scenario.upfs, start=1):
-            _render_ulcl_upf_config(scenario, config_dir, ulcl_root, upf.name, upf.role, index)
+            _render_ulcl_upf_config(
+                scenario,
+                config_dir,
+                ulcl_root,
+                upf.name,
+                upf.role,
+                index,
+                bridge_plans,
+                n3_network_plan,
+            )
         _render_ulcl_uerouting_config(scenario, config_dir, ulcl_root, resolved_topology)
         return
 
-    _render_single_upf_configs(scenario, config_dir, base_root)
+    _render_single_upf_configs(scenario, config_dir, base_root, bridge_plans, n3_network_plan)
 
 
 @dataclass(slots=True)
@@ -895,15 +945,16 @@ def _render_gnb_configs(
     scenario: ScenarioConfig,
     config_dir: Path,
     resolved_topology: ResolvedScenarioTopology,
+    bridge_plans: list[Any],
+    n3_network_plan: N3NetworkPlan | None,
 ) -> None:
     slice_map = scenario.slice_map()
     base_cfg = _yaml_load(Path(scenario.free5gc.config_root) / "gnbcfg.yaml")
-
     for index, gnb in enumerate(scenario.gnbs, start=1):
         payload = deepcopy(base_cfg)
         payload["linkIp"] = gnb_service_ip(index)
         payload["ngapIp"] = gnb_service_ip(index)
-        payload["gtpIp"] = gnb_service_ip(index)
+        payload["gtpIp"] = _gnb_n3_ip(index, gnb.name, n3_network_plan)
         payload["tac"] = gnb.tac
         payload["nci"] = gnb.nci
         amf_configs = payload.get("amfConfigs")
@@ -1127,6 +1178,7 @@ def render_run_assets(
     archive_dir = _resolve_output_path(run_dir, scenario.writer.archive_dir)
     state_db = _resolve_output_path(run_dir, scenario.writer.state_db)
     resolved_topology = resolve_scenario_topology(scenario)
+    n3_network_plan = build_n3_network_plan(scenario)
     initial_topology_file = generated_dir / "initial-topology.json"
     clock_file = ns3_dir / "ns3-clock.json"
 
@@ -1139,15 +1191,20 @@ def render_run_assets(
     )
 
     compose_render = render_compose_for_run(scenario, config_dir, resolved_topology)
-    bridge_plans = build_bridge_plan(
-        scenario,
-        compose_render.service_map,
-        resolved_topology,
-        inspect_targets=_compose_inspect_targets(compose_render.compose_payload),
+    bridge_plans = (
+        build_bridge_plan(
+            scenario,
+            compose_render.service_map,
+            n3_network_plan=n3_network_plan,
+            resolved_topology=resolved_topology,
+            inspect_targets=_compose_inspect_targets(compose_render.compose_payload),
+        )
+        if scenario.bridge.enable_inline_harness
+        else []
     )
 
-    _render_core_configs(scenario, config_dir, resolved_topology)
-    _render_gnb_configs(scenario, config_dir, resolved_topology)
+    _render_core_configs(scenario, config_dir, resolved_topology, bridge_plans, n3_network_plan)
+    _render_gnb_configs(scenario, config_dir, resolved_topology, bridge_plans, n3_network_plan)
     _render_ue_configs(scenario, config_dir, resolved_topology)
     _render_ns3_flow_profiles(scenario, flow_profile_file)
     _render_ns3_slice_resources(scenario, slice_resource_file)
@@ -1165,6 +1222,8 @@ def render_run_assets(
 
     bridge_script = generated_dir / "setup-inline-bridge.sh"
     render_bridge_script(bridge_plans, bridge_script)
+    bridge_probe_script = generated_dir / "probe-inline-bridge.sh"
+    render_bridge_probe_script(bridge_plans, bridge_probe_script)
 
     snapshot_file = ns3_dir / "tick-snapshots.jsonl"
     manifest = build_run_manifest(
@@ -1174,6 +1233,7 @@ def render_run_assets(
         run_dir=run_dir,
         compose_file=compose_file,
         bridge_script=bridge_script,
+        bridge_probe_script=bridge_probe_script,
         bridge_plans=bridge_plans,
         snapshot_file=snapshot_file,
         clock_file=clock_file,

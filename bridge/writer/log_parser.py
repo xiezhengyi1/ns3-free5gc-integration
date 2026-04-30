@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import re
 import time
 
@@ -11,6 +12,7 @@ from bridge.common.schema import SimEvent
 
 _COMPOSE_PREFIX_RE = re.compile(r"^(?P<service>[A-Za-z0-9_.-]+)\s+\|\s?(?P<body>.*)$")
 _DOCKER_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[^\s]+\s+")
+_DOCKER_TIMESTAMP_CAPTURE_RE = re.compile(r"^(?P<ts>\d{4}-\d{2}-\d{2}T[^\s]+)\s+")
 _FREE5GC_LEVEL_RE = re.compile(r"\[(TRACE|DEBUG|INFO|WARN|ERROR|FATAL)\]")
 _FREE5GC_NF_RE = re.compile(r"\[(?:TRACE|DEBUG|INFO|WARN|ERROR|FATAL)\]\[(?P<nf>[A-Z0-9-]+)\]")
 _UERANSIM_META_RE = re.compile(
@@ -74,6 +76,23 @@ def _split_compose_line(raw_line: str) -> tuple[str, str]:
 
 def _strip_docker_timestamp(body: str) -> str:
     return _DOCKER_TIMESTAMP_RE.sub("", body, count=1)
+
+
+def extract_compose_timestamp(raw_line: str) -> datetime | None:
+    _, body = _split_compose_line(raw_line)
+    match = _DOCKER_TIMESTAMP_CAPTURE_RE.match(body.rstrip("\n"))
+    if not match:
+        return None
+    timestamp_text = match.group("ts")
+    if timestamp_text.endswith("Z"):
+        timestamp_text = timestamp_text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(timestamp_text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _build_event(

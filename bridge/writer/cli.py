@@ -14,36 +14,12 @@ from typing import Any
 from bridge.common.schema import TickSnapshot
 from bridge.writer.http_sink import HttpIngestionClient
 from bridge.writer.log_parser import (
-    ObservationClock,
+    extract_compose_timestamp,
     parse_free5gc_compose_line,
     parse_ueransim_compose_line,
 )
 from bridge.writer.local_store import SnapshotStore
 from bridge.writer.postgres_graph_store import PostgresGraphStore
-
-
-class Ns3ClockReference:
-    def __init__(self, path: str) -> None:
-        self.path = Path(path).expanduser().resolve()
-        self._mtime_ns: int | None = None
-        self._tick_index = 0
-
-    def current_tick(self) -> int:
-        try:
-            stat = self.path.stat()
-        except FileNotFoundError:
-            return self._tick_index
-        if self._mtime_ns == stat.st_mtime_ns:
-            return self._tick_index
-        try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return self._tick_index
-        tick_index = payload.get("tick_index")
-        if tick_index is not None:
-            self._tick_index = int(tick_index)
-            self._mtime_ns = stat.st_mtime_ns
-        return self._tick_index
 
 
 class RealTrafficStateReader:
@@ -55,6 +31,12 @@ class RealTrafficStateReader:
         self._latest_payload: dict[str, Any] | None = None
 
     def payload_for_tick(self, target_tick: int) -> dict[str, Any] | None:
+        status, payload = self.payload_status_for_tick(target_tick)
+        if status != "exact":
+            return None
+        return payload
+
+    def payload_status_for_tick(self, target_tick: int) -> tuple[str, dict[str, Any] | None]:
         deadline = time.monotonic() + self.timeout_seconds
         normalized_target = int(target_tick)
         while True:
@@ -63,9 +45,12 @@ class RealTrafficStateReader:
 
             latest_tick = self._tick_of(self._latest_payload)
             if latest_tick == normalized_target:
-                return self._latest_payload
+                return "exact", self._latest_payload
+            next_tick = self._tick_of(self._pending[0]) if self._pending else -1
+            if next_tick > normalized_target:
+                return "skipped", None
             if time.monotonic() >= deadline:
-                return None
+                return "pending", None
             time.sleep(0.05)
 
     def _advance_to_tick(self, target_tick: int) -> None:
@@ -151,6 +136,12 @@ def _as_float(value: object) -> float | None:
         return None
 
 
+def _throughput_mbps(packet_count: int, packet_size_bytes: int, tick_ms: int) -> float:
+    normalized_tick_ms = max(1, int(tick_ms))
+    bits = max(0, int(packet_count)) * max(0, int(packet_size_bytes)) * 8
+    return bits / normalized_tick_ms / 1000.0
+
+
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--state-db", required=True, help="sqlite path for local state")
     parser.add_argument("--archive-dir", required=True, help="directory for archived ticks")
@@ -193,20 +184,29 @@ def _build_writer(
     return store, client, graph_store
 
 
-def _merge_real_traffic_state(snapshot: TickSnapshot, args: argparse.Namespace) -> TickSnapshot:
-    reader = _get_real_traffic_reader(args)
-    if reader is None:
-        return snapshot
-
-    state_payload = reader.payload_for_tick(snapshot.tick_index)
+def _merge_real_traffic_state(
+    snapshot: TickSnapshot,
+    args: argparse.Namespace,
+    *,
+    state_payload: dict[str, Any] | None = None,
+) -> TickSnapshot:
     if state_payload is None:
-        return snapshot
-
+        reader = _get_real_traffic_reader(args)
+        if reader is None:
+            return snapshot
+        state_payload = reader.payload_for_tick(snapshot.tick_index)
+        if state_payload is None:
+            return snapshot
     real_flows = {
         str(item["flow_id"]): item
         for item in state_payload.get("flows", [])
         if isinstance(item, dict) and "flow_id" in item
     }
+    effective_tick_ms = int(
+        state_payload.get("effective_tick_ms")
+        or getattr(args, "tick_ms", snapshot.sim_time_ms)
+        or 1
+    )
     ue_ip_by_supi: dict[str, str] = {}
     for flow in snapshot.flows:
         real_flow = real_flows.get(flow.flow_id)
@@ -215,14 +215,15 @@ def _merge_real_traffic_state(snapshot: TickSnapshot, args: argparse.Namespace) 
         ue_ip = str(real_flow["ue_ip"])
         source_port = int(real_flow["source_port"])
         destination_port = int(real_flow["destination_port"])
+        packet_size_bytes = int(real_flow.get("packet_size_bytes", 0) or 0)
         ul_packets_sent = int(real_flow.get("ul_packets_sent", 0) or 0)
         dl_packets_sent = int(real_flow.get("dl_packets_sent", 0) or 0)
         packet_sent = ul_packets_sent + dl_packets_sent
+        packet_received = packet_sent
         loss_rate = float(flow.loss_rate)
         telemetry = dict(flow.telemetry)
-        packet_received = int(telemetry.get("packet_received", 0) or 0)
-        throughput_ul_mbps = float(flow.throughput_ul_mbps)
-        throughput_dl_mbps = float(flow.throughput_dl_mbps)
+        throughput_ul_mbps = _throughput_mbps(ul_packets_sent, packet_size_bytes, effective_tick_ms)
+        throughput_dl_mbps = _throughput_mbps(dl_packets_sent, packet_size_bytes, effective_tick_ms)
         traffic = dict(flow.traffic)
         traffic["five_tuple"] = {
             "protocol": 17,
@@ -294,11 +295,29 @@ def _ingest_line(
     client: HttpIngestionClient | None,
     graph_store: PostgresGraphStore | None,
     args: argparse.Namespace,
-) -> None:
+) -> str:
     if not line.strip():
-        return
+        return "ingested"
     snapshot = TickSnapshot.from_dict(json.loads(line))
-    snapshot = _merge_real_traffic_state(snapshot, args)
+    reader = _get_real_traffic_reader(args)
+    if reader is not None:
+        status, state_payload = reader.payload_status_for_tick(snapshot.tick_index)
+        if status == "pending":
+            return "pending"
+        if status == "skipped":
+            print(
+                json.dumps(
+                    {
+                        "skipped": True,
+                        "run_id": snapshot.run_id,
+                        "tick_index": snapshot.tick_index,
+                        "reason": "real_traffic_tick_missing",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return "skipped"
+        snapshot = _merge_real_traffic_state(snapshot, args, state_payload=state_payload)
     result = store.ingest_snapshot(
         snapshot,
         seed=args.seed,
@@ -321,10 +340,23 @@ def _ingest_line(
             )
         result["graph"] = graph_result.to_dict()
     print(json.dumps(result, ensure_ascii=False))
+    return "ingested"
 
 
 def _append_event(store: SnapshotStore, event_payload: dict[str, object]) -> None:
     print(json.dumps(event_payload, ensure_ascii=False))
+
+
+def _current_event_tick(store: SnapshotStore, run_id: str) -> int:
+    latest_tick = store.latest_snapshot_tick(run_id)
+    return max(0, latest_tick)
+
+
+def _resolve_event_tick(store: SnapshotStore, run_id: str, raw_line: str) -> int:
+    observed_at = extract_compose_timestamp(raw_line)
+    if observed_at is None:
+        return _current_event_tick(store, run_id)
+    return store.resolve_tick_for_observed_at(run_id, observed_at)
 
 
 def _follow_compose_logs(args: argparse.Namespace) -> int:
@@ -339,8 +371,6 @@ def _follow_compose_logs(args: argparse.Namespace) -> int:
     parser = (
         parse_free5gc_compose_line if args.parser == "free5gc" else parse_ueransim_compose_line
     )
-    clock_reference = Ns3ClockReference(args.clock_file) if args.clock_file else None
-    clock = ObservationClock(args.tick_ms)
     command = ["docker", "compose"]
     if args.project_name:
         command.extend(["-p", args.project_name])
@@ -369,11 +399,12 @@ def _follow_compose_logs(args: argparse.Namespace) -> int:
     try:
         assert process.stdout is not None
         for line in process.stdout:
+            event_tick = _resolve_event_tick(store, args.run_id, line)
             events = parser(
                 line,
                 run_id=args.run_id,
                 scenario_id=args.scenario_id,
-                tick_index=(clock_reference.current_tick() if clock_reference else clock.current_tick()),
+                tick_index=event_tick,
             )
             for event in events:
                 result = store.append_event(event)
@@ -389,14 +420,18 @@ def _ingest_file(args: argparse.Namespace) -> int:
     store, client, graph_store = _build_writer(args)
     with Path(args.path).expanduser().resolve().open("r", encoding="utf-8") as handle:
         for line in handle:
-            _ingest_line(line, store, client, graph_store, args)
+            outcome = _ingest_line(line, store, client, graph_store, args)
+            if outcome == "pending":
+                raise RuntimeError(f"missing real traffic state for ingested tick in {args.path}")
     return 0
 
 
 def _ingest_stdin(args: argparse.Namespace) -> int:
     store, client, graph_store = _build_writer(args)
     for line in sys.stdin:
-        _ingest_line(line, store, client, graph_store, args)
+        outcome = _ingest_line(line, store, client, graph_store, args)
+        if outcome == "pending":
+            raise RuntimeError("missing real traffic state for ingested tick from stdin")
     return 0
 
 
@@ -428,14 +463,30 @@ def _follow_jsonl(args: argparse.Namespace) -> int:
         if args.from_end:
             handle.seek(0, 2)
         pending = ""
+        deferred_line: str | None = None
         while True:
+            current_size = path.stat().st_size
+            if current_size < handle.tell():
+                handle.seek(0)
+                pending = ""
+                if deferred_line is None:
+                    continue
+            if deferred_line is not None:
+                outcome = _ingest_line(deferred_line, store, client, graph_store, args)
+                if outcome in {"ingested", "skipped"}:
+                    deferred_line = None
+                    continue
+                time.sleep(args.poll_interval)
+                continue
             pending, line = _next_complete_jsonl_line(
                 handle,
                 pending,
                 flush_pending=bool(args.stop_at_eof),
             )
             if line is not None:
-                _ingest_line(line, store, client, graph_store, args)
+                outcome = _ingest_line(line, store, client, graph_store, args)
+                if outcome == "pending":
+                    deferred_line = line
                 continue
             if args.stop_at_eof:
                 break

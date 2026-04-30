@@ -620,6 +620,7 @@ ns3:
   output_subdir: ns3
   simulator: RealtimeSimulatorImpl
   sim_time_ms: 600000
+  bridge_mode: l2_inline
   slice_isolation: true
 
 writer:
@@ -632,3 +633,5 @@ topology:
 
 bridge:
   enable_inline_harness: true
+  n3_network_name: n3net
+  n3_network_cidr: 10.201.2.0/29
