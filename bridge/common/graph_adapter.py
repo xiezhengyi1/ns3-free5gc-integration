@@ -113,6 +113,10 @@ def _merge_flow_item(existing: dict[str, object], derived: dict[str, object]) ->
         "service_type_id",
         "packet_size_bytes",
         "arrival_rate_pps",
+        "dl_packet_size_bytes",
+        "ul_packet_size_bytes",
+        "dl_arrival_rate_pps",
+        "ul_arrival_rate_pps",
         "current_slice_snssai",
         "allocated_bandwidth_dl_mbps",
         "allocated_bandwidth_ul_mbps",
@@ -259,10 +263,14 @@ def _build_semantic_graph_payload(graph_summary: dict[str, Any]) -> dict[str, An
                     "capacity_dl_mbps": _maybe_float(capacity.get("capacity_dl_mbps") or capacity.get("total_bandwidth_dl")),
                     "capacity_ul_mbps": _maybe_float(capacity.get("capacity_ul_mbps") or capacity.get("total_bandwidth_ul")),
                     "guaranteed_dl_mbps": _maybe_float(
-                        capacity.get("guaranteed_dl_mbps") or capacity.get("reserved_bandwidth_dl")
+                        capacity.get("guaranteed_dl_mbps")
+                        or capacity.get("guaranteed_bandwidth_dl")
+                        or capacity.get("reserved_bandwidth_dl")
                     ),
                     "guaranteed_ul_mbps": _maybe_float(
-                        capacity.get("guaranteed_ul_mbps") or capacity.get("reserved_bandwidth_ul")
+                        capacity.get("guaranteed_ul_mbps")
+                        or capacity.get("guaranteed_bandwidth_ul")
+                        or capacity.get("reserved_bandwidth_ul")
                     ),
                     "priority": _maybe_int(capacity.get("priority")) or 1,
                 }
@@ -375,6 +383,14 @@ def _build_semantic_graph_payload(graph_summary: dict[str, Any]) -> dict[str, An
                     "service_type_id": _maybe_int(service.get("service_type_id")),
                     "packet_size_bytes": _maybe_float(traffic.get("packet_size")),
                     "arrival_rate_pps": _maybe_float(traffic.get("arrival_rate")),
+                    "dl_packet_size_bytes": _maybe_float(traffic.get("packet_size_dl"))
+                    or _maybe_float(traffic.get("packet_size")),
+                    "ul_packet_size_bytes": _maybe_float(traffic.get("packet_size_ul"))
+                    or _maybe_float(traffic.get("packet_size")),
+                    "dl_arrival_rate_pps": _maybe_float(traffic.get("arrival_rate_dl"))
+                    or _maybe_float(traffic.get("arrival_rate")),
+                    "ul_arrival_rate_pps": _maybe_float(traffic.get("arrival_rate_ul"))
+                    or _maybe_float(traffic.get("arrival_rate")),
                     "current_slice_snssai": current_slice_snssai,
                     "allocated_bandwidth_dl_mbps": _maybe_float(allocation.get("allocated_bandwidth_dl")),
                     "allocated_bandwidth_ul_mbps": _maybe_float(allocation.get("allocated_bandwidth_ul")),

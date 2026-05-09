@@ -87,7 +87,7 @@ apps:
 
 flows:
   - flow_id: flow-3521
-    name: Telemedicine_control_1
+    name: Telemedicine_video_1
     supi: imsi-208930000000008
     app_id: app-telemedicine
     slice_ref: slice-2-000001
@@ -97,20 +97,24 @@ flows:
     five_qi: 7
     service_type: URLLC
     service_type_id: 2
-    packet_size_bytes: 12000.0
-    arrival_rate_pps: 200.0
+    packet_size_bytes: 1000.0
+    arrival_rate_pps: 375.0
+    dl_packet_size_bytes: 1000.0
+    ul_packet_size_bytes: 1000.0
+    dl_arrival_rate_pps: 375.0
+    ul_arrival_rate_pps: 475.0
     current_slice_snssai: "02000001"
-    allocated_bandwidth_dl_mbps: 22.0
-    allocated_bandwidth_ul_mbps: 10.0
+    allocated_bandwidth_dl_mbps: 3.0
+    allocated_bandwidth_ul_mbps: 3.8
     optimize_requested: false
     sla_target:
       latency_ms: 15.0
       jitter_ms: 2.0
       loss_rate: 0.0005
-      bandwidth_dl_mbps: 22.0
-      bandwidth_ul_mbps: 10.0
-      guaranteed_bandwidth_dl_mbps: 18.0
-      guaranteed_bandwidth_ul_mbps: 8.0
+      bandwidth_dl_mbps: 3.0
+      bandwidth_ul_mbps: 3.8
+      guaranteed_bandwidth_dl_mbps: 2.4
+      guaranteed_bandwidth_ul_mbps: 3.0
       priority: 1
   - flow_id: flow-7528
     name: AR_Gaming_control_1
@@ -123,20 +127,24 @@ flows:
     five_qi: 7
     service_type: URLLC
     service_type_id: 2
-    packet_size_bytes: 8000.0
-    arrival_rate_pps: 50.0
+    packet_size_bytes: 250.0
+    arrival_rate_pps: 125.0
+    dl_packet_size_bytes: 250.0
+    ul_packet_size_bytes: 250.0
+    dl_arrival_rate_pps: 125.0
+    ul_arrival_rate_pps: 75.0
     current_slice_snssai: "02000001"
-    allocated_bandwidth_dl_mbps: 12.0
-    allocated_bandwidth_ul_mbps: 8.0
+    allocated_bandwidth_dl_mbps: 0.25
+    allocated_bandwidth_ul_mbps: 0.15
     optimize_requested: false
     sla_target:
       latency_ms: 8.0
       jitter_ms: 2.0
       loss_rate: 0.0008
-      bandwidth_dl_mbps: 12.0
-      bandwidth_ul_mbps: 8.0
-      guaranteed_bandwidth_dl_mbps: 10.0
-      guaranteed_bandwidth_ul_mbps: 6.0
+      bandwidth_dl_mbps: 0.25
+      bandwidth_ul_mbps: 0.15
+      guaranteed_bandwidth_dl_mbps: 0.2
+      guaranteed_bandwidth_ul_mbps: 0.1
       priority: 2
 
 free5gc:
@@ -152,6 +160,7 @@ ns3:
   output_subdir: ns3
   simulator: RealtimeSimulatorImpl
   sim_time_ms: 300000
+  bridge_mode: l2_inline
   slice_isolation: true
 
 writer:
@@ -164,3 +173,5 @@ topology:
 
 bridge:
   enable_inline_harness: true
+  n3_network_name: n3net
+  n3_network_cidr: 10.201.1.0/29

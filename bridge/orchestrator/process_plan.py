@@ -29,6 +29,7 @@ class RunManifest:
     compose_project_name: str
     free5gc_webui_url: str
     bridge_script: str
+    bridge_probe_script: str
     bridge_links: list[dict[str, object]]
     snapshot_file: str
     clock_file: str
@@ -56,6 +57,7 @@ def build_run_manifest(
     run_dir: Path,
     compose_file: Path,
     bridge_script: Path,
+    bridge_probe_script: Path,
     bridge_plans: list[BridgeInterfacePlan],
     snapshot_file: Path,
     clock_file: Path,
@@ -440,6 +442,35 @@ def build_run_manifest(
                 ],
             ),
         )
+        ns3_run_index = next(
+            index for index, command in enumerate(commands) if command.name == "ns3-run"
+        )
+        commands.insert(
+            ns3_run_index,
+            CommandSpec(
+                name="bridge-probe-post-ns3",
+                cwd=str(project_root),
+                argv=[
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--privileged",
+                    "--pid",
+                    "host",
+                    "--network",
+                    "host",
+                    "-v",
+                    "/:/host",
+                    "free5gc/base:latest",
+                    "chroot",
+                    "/host",
+                    "bash",
+                    str(bridge_probe_script),
+                    "12",
+                ],
+                background=True,
+            ),
+        )
     if scenario.writer.graph_db_url:
         next(
             command for command in commands if command.name == "writer-follow-ns3"
@@ -465,6 +496,7 @@ def build_run_manifest(
         compose_project_name=scenario.free5gc.project_name,
         free5gc_webui_url=free5gc_webui_url,
         bridge_script=str(bridge_script),
+        bridge_probe_script=str(bridge_probe_script),
         bridge_links=[plan.to_dict() for plan in bridge_plans],
         snapshot_file=str(snapshot_file),
         clock_file=str(clock_file),

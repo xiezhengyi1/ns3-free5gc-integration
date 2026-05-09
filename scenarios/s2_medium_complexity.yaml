@@ -29,8 +29,8 @@ slices:
       priority: 2
     qos:
       latency_ms: 8.0
-      jitter_ms: 4.0
-      loss_rate: 0.001
+      jitter_ms: 1.5
+      loss_rate: 0.0003
       processing_delay_ms: 0.5
   - sst: 3
     sd: "000001"
@@ -191,12 +191,6 @@ ues:
         - gNB-1
     sessions:
       - slice_ref: slice-1-000001
-        session_ref: imsi-208930000000009:app-drone-control:slice-1-000001:internet
-        apn: internet
-        type: IPv4
-        five_qi: 9
-        app_id: app-drone-control
-      - slice_ref: slice-1-000001
         session_ref: imsi-208930000000009:app-4k-video:slice-1-000001:internet
         apn: internet
         type: IPv4
@@ -305,20 +299,24 @@ flows:
     five_qi: 9
     service_type: eMBB
     service_type_id: 1
-    packet_size_bytes: 12000.0
-    arrival_rate_pps: 500.0
+    packet_size_bytes: 1000.0
+    arrival_rate_pps: 375.0
+    dl_packet_size_bytes: 1000.0
+    ul_packet_size_bytes: 1000.0
+    dl_arrival_rate_pps: 375.0
+    ul_arrival_rate_pps: 475.0
     current_slice_snssai: "01000001"
-    allocated_bandwidth_dl_mbps: 18.0
-    allocated_bandwidth_ul_mbps: 16.0
+    allocated_bandwidth_dl_mbps: 3.0
+    allocated_bandwidth_ul_mbps: 3.8
     optimize_requested: false
     sla_target:
       latency_ms: 12.0
       jitter_ms: 2.0
       loss_rate: 0.0005
-      bandwidth_dl_mbps: 18.0
-      bandwidth_ul_mbps: 16.0
-      guaranteed_bandwidth_dl_mbps: 14.0
-      guaranteed_bandwidth_ul_mbps: 12.0
+      bandwidth_dl_mbps: 3.0
+      bandwidth_ul_mbps: 3.8
+      guaranteed_bandwidth_dl_mbps: 2.4
+      guaranteed_bandwidth_ul_mbps: 3.0
       priority: 1
   - flow_id: flow-3232
     name: Factory_Robot_video_1
@@ -331,23 +329,27 @@ flows:
     five_qi: 9
     service_type: eMBB
     service_type_id: 1
-    packet_size_bytes: 12000.0
-    arrival_rate_pps: 500.0
+    packet_size_bytes: 1000.0
+    arrival_rate_pps: 375.0
+    dl_packet_size_bytes: 1000.0
+    ul_packet_size_bytes: 1000.0
+    dl_arrival_rate_pps: 375.0
+    ul_arrival_rate_pps: 475.0
     current_slice_snssai: "01000001"
-    allocated_bandwidth_dl_mbps: 20.0
-    allocated_bandwidth_ul_mbps: 20.0
+    allocated_bandwidth_dl_mbps: 3.0
+    allocated_bandwidth_ul_mbps: 3.8
     optimize_requested: false
     sla_target:
       latency_ms: 10.0
       jitter_ms: 1.5
       loss_rate: 0.0003
-      bandwidth_dl_mbps: 20.0
-      bandwidth_ul_mbps: 20.0
-      guaranteed_bandwidth_dl_mbps: 18.0
-      guaranteed_bandwidth_ul_mbps: 18.0
+      bandwidth_dl_mbps: 3.0
+      bandwidth_ul_mbps: 3.8
+      guaranteed_bandwidth_dl_mbps: 2.4
+      guaranteed_bandwidth_ul_mbps: 3.0
       priority: 1
   - flow_id: flow-2926
-    name: IoT_Sensor_video_1
+    name: IoT_Sensor_telemetry_1
     supi: imsi-208930000000006
     app_id: app-iot-sensor
     slice_ref: slice-3-000001
@@ -357,20 +359,24 @@ flows:
     five_qi: 6
     service_type: mMTC
     service_type_id: 3
-    packet_size_bytes: 24000.0
+    packet_size_bytes: 125.0
     arrival_rate_pps: 50.0
+    dl_packet_size_bytes: 125.0
+    ul_packet_size_bytes: 250.0
+    dl_arrival_rate_pps: 50.0
+    ul_arrival_rate_pps: 100.0
     current_slice_snssai: "03000001"
-    allocated_bandwidth_dl_mbps: 8.0
-    allocated_bandwidth_ul_mbps: 5.0
+    allocated_bandwidth_dl_mbps: 0.05
+    allocated_bandwidth_ul_mbps: 0.2
     optimize_requested: false
     sla_target:
       latency_ms: 120.0
       jitter_ms: 30.0
       loss_rate: 0.02
-      bandwidth_dl_mbps: 8.0
-      bandwidth_ul_mbps: 5.0
-      guaranteed_bandwidth_dl_mbps: 5.0
-      guaranteed_bandwidth_ul_mbps: 3.0
+      bandwidth_dl_mbps: 0.05
+      bandwidth_ul_mbps: 0.2
+      guaranteed_bandwidth_dl_mbps: 0.03
+      guaranteed_bandwidth_ul_mbps: 0.12
       priority: 8
   - flow_id: flow-7528
     name: AR_Gaming_control_1
@@ -383,20 +389,24 @@ flows:
     five_qi: 7
     service_type: URLLC
     service_type_id: 2
-    packet_size_bytes: 8000.0
-    arrival_rate_pps: 50.0
+    packet_size_bytes: 250.0
+    arrival_rate_pps: 125.0
+    dl_packet_size_bytes: 250.0
+    ul_packet_size_bytes: 250.0
+    dl_arrival_rate_pps: 125.0
+    ul_arrival_rate_pps: 75.0
     current_slice_snssai: "02000001"
-    allocated_bandwidth_dl_mbps: 12.0
-    allocated_bandwidth_ul_mbps: 8.0
+    allocated_bandwidth_dl_mbps: 0.25
+    allocated_bandwidth_ul_mbps: 0.15
     optimize_requested: false
     sla_target:
       latency_ms: 8.0
       jitter_ms: 2.0
       loss_rate: 0.0008
-      bandwidth_dl_mbps: 12.0
-      bandwidth_ul_mbps: 8.0
-      guaranteed_bandwidth_dl_mbps: 10.0
-      guaranteed_bandwidth_ul_mbps: 6.0
+      bandwidth_dl_mbps: 0.25
+      bandwidth_ul_mbps: 0.15
+      guaranteed_bandwidth_dl_mbps: 0.18
+      guaranteed_bandwidth_ul_mbps: 0.1
       priority: 2
   - flow_id: flow-4493
     name: AR_Gaming_video_2
@@ -409,23 +419,27 @@ flows:
     five_qi: 6
     service_type: mMTC
     service_type_id: 3
-    packet_size_bytes: 24000.0
-    arrival_rate_pps: 100.0
+    packet_size_bytes: 1250.0
+    arrival_rate_pps: 1500.0
+    dl_packet_size_bytes: 1250.0
+    ul_packet_size_bytes: 250.0
+    dl_arrival_rate_pps: 1500.0
+    ul_arrival_rate_pps: 250.0
     current_slice_snssai: "03000001"
-    allocated_bandwidth_dl_mbps: 34.0
-    allocated_bandwidth_ul_mbps: 12.0
+    allocated_bandwidth_dl_mbps: 15.0
+    allocated_bandwidth_ul_mbps: 0.5
     optimize_requested: true
     sla_target:
       latency_ms: 15.0
       jitter_ms: 4.0
       loss_rate: 0.0015
-      bandwidth_dl_mbps: 34.0
-      bandwidth_ul_mbps: 12.0
-      guaranteed_bandwidth_dl_mbps: 28.0
-      guaranteed_bandwidth_ul_mbps: 8.0
+      bandwidth_dl_mbps: 15.0
+      bandwidth_ul_mbps: 0.5
+      guaranteed_bandwidth_dl_mbps: 12.0
+      guaranteed_bandwidth_ul_mbps: 0.3
       priority: 3
   - flow_id: flow-3521
-    name: Telemedicine_control_1
+    name: Telemedicine_video_1
     supi: imsi-208930000000008
     app_id: app-telemedicine
     slice_ref: slice-2-000001
@@ -435,23 +449,27 @@ flows:
     five_qi: 7
     service_type: URLLC
     service_type_id: 2
-    packet_size_bytes: 12000.0
-    arrival_rate_pps: 200.0
+    packet_size_bytes: 1000.0
+    arrival_rate_pps: 375.0
+    dl_packet_size_bytes: 1000.0
+    ul_packet_size_bytes: 1000.0
+    dl_arrival_rate_pps: 375.0
+    ul_arrival_rate_pps: 475.0
     current_slice_snssai: "02000001"
-    allocated_bandwidth_dl_mbps: 25.0
-    allocated_bandwidth_ul_mbps: 12.0
+    allocated_bandwidth_dl_mbps: 3.0
+    allocated_bandwidth_ul_mbps: 3.8
     optimize_requested: false
     sla_target:
       latency_ms: 15.0
       jitter_ms: 2.0
       loss_rate: 0.0005
-      bandwidth_dl_mbps: 25.0
-      bandwidth_ul_mbps: 12.0
-      guaranteed_bandwidth_dl_mbps: 20.0
-      guaranteed_bandwidth_ul_mbps: 9.0
+      bandwidth_dl_mbps: 3.0
+      bandwidth_ul_mbps: 3.8
+      guaranteed_bandwidth_dl_mbps: 2.4
+      guaranteed_bandwidth_ul_mbps: 3.0
       priority: 1
   - flow_id: flow-1634
-    name: Web_Browse_control_1
+    name: Web_Browse_session_1
     supi: imsi-208930000000008
     app_id: app-web-browse
     slice_ref: slice-3-000001
@@ -461,47 +479,25 @@ flows:
     five_qi: 6
     service_type: mMTC
     service_type_id: 3
-    packet_size_bytes: 12000.0
-    arrival_rate_pps: 200.0
+    packet_size_bytes: 1250.0
+    arrival_rate_pps: 100.0
+    dl_packet_size_bytes: 1250.0
+    ul_packet_size_bytes: 250.0
+    dl_arrival_rate_pps: 100.0
+    ul_arrival_rate_pps: 50.0
     current_slice_snssai: "03000001"
-    allocated_bandwidth_dl_mbps: 6.0
-    allocated_bandwidth_ul_mbps: 1.0
+    allocated_bandwidth_dl_mbps: 1.0
+    allocated_bandwidth_ul_mbps: 0.1
     optimize_requested: false
     sla_target:
       latency_ms: 90.0
       jitter_ms: 35.0
       loss_rate: 0.03
-      bandwidth_dl_mbps: 6.0
-      bandwidth_ul_mbps: 1.0
-      guaranteed_bandwidth_dl_mbps: 2.0
-      guaranteed_bandwidth_ul_mbps: 0.5
+      bandwidth_dl_mbps: 1.0
+      bandwidth_ul_mbps: 0.1
+      guaranteed_bandwidth_dl_mbps: 0.6
+      guaranteed_bandwidth_ul_mbps: 0.05
       priority: 10
-  - flow_id: flow-8178
-    name: Drone_Control_video_1
-    supi: imsi-208930000000009
-    app_id: app-drone-control
-    slice_ref: slice-1-000001
-    session_ref: imsi-208930000000009:app-drone-control:slice-1-000001:internet
-    ue_name: ue5
-    app_name: Drone_Control
-    five_qi: 9
-    service_type: eMBB
-    service_type_id: 1
-    packet_size_bytes: 16000.0
-    arrival_rate_pps: 100.0
-    current_slice_snssai: "01000001"
-    allocated_bandwidth_dl_mbps: 30.0
-    allocated_bandwidth_ul_mbps: 10.0
-    optimize_requested: false
-    sla_target:
-      latency_ms: 20.0
-      jitter_ms: 5.0
-      loss_rate: 0.001
-      bandwidth_dl_mbps: 30.0
-      bandwidth_ul_mbps: 10.0
-      guaranteed_bandwidth_dl_mbps: 24.0
-      guaranteed_bandwidth_ul_mbps: 7.0
-      priority: 2
   - flow_id: flow-8036
     name: 4K_Video_stream_1
     supi: imsi-208930000000009
@@ -513,20 +509,24 @@ flows:
     five_qi: 9
     service_type: eMBB
     service_type_id: 1
-    packet_size_bytes: 60000.0
-    arrival_rate_pps: 800.0
+    packet_size_bytes: 1250.0
+    arrival_rate_pps: 2500.0
+    dl_packet_size_bytes: 1250.0
+    ul_packet_size_bytes: 250.0
+    dl_arrival_rate_pps: 2500.0
+    ul_arrival_rate_pps: 100.0
     current_slice_snssai: "01000001"
-    allocated_bandwidth_dl_mbps: 36.0
-    allocated_bandwidth_ul_mbps: 6.0
+    allocated_bandwidth_dl_mbps: 25.0
+    allocated_bandwidth_ul_mbps: 0.2
     optimize_requested: false
     sla_target:
       latency_ms: 35.0
       jitter_ms: 12.0
       loss_rate: 0.003
-      bandwidth_dl_mbps: 36.0
-      bandwidth_ul_mbps: 6.0
-      guaranteed_bandwidth_dl_mbps: 30.0
-      guaranteed_bandwidth_ul_mbps: 3.0
+      bandwidth_dl_mbps: 25.0
+      bandwidth_ul_mbps: 0.2
+      guaranteed_bandwidth_dl_mbps: 20.0
+      guaranteed_bandwidth_ul_mbps: 0.1
       priority: 5
   - flow_id: flow-7178
     name: 4K_Video_control_2
@@ -539,23 +539,27 @@ flows:
     five_qi: 7
     service_type: URLLC
     service_type_id: 2
-    packet_size_bytes: 12000.0
-    arrival_rate_pps: 200.0
+    packet_size_bytes: 250.0
+    arrival_rate_pps: 100.0
+    dl_packet_size_bytes: 250.0
+    ul_packet_size_bytes: 250.0
+    dl_arrival_rate_pps: 100.0
+    ul_arrival_rate_pps: 50.0
     current_slice_snssai: "02000001"
-    allocated_bandwidth_dl_mbps: 2.5
-    allocated_bandwidth_ul_mbps: 2.0
+    allocated_bandwidth_dl_mbps: 0.2
+    allocated_bandwidth_ul_mbps: 0.1
     optimize_requested: false
     sla_target:
       latency_ms: 25.0
       jitter_ms: 6.0
       loss_rate: 0.0015
-      bandwidth_dl_mbps: 2.5
-      bandwidth_ul_mbps: 2.0
-      guaranteed_bandwidth_dl_mbps: 1.2
-      guaranteed_bandwidth_ul_mbps: 1.0
+      bandwidth_dl_mbps: 0.2
+      bandwidth_ul_mbps: 0.1
+      guaranteed_bandwidth_dl_mbps: 0.1
+      guaranteed_bandwidth_ul_mbps: 0.05
       priority: 4
   - flow_id: flow-9218
-    name: Cloud_Render_control_1
+    name: Cloud_Render_stream_1
     supi: imsi-208930000000010
     app_id: app-cloud-render
     slice_ref: slice-2-000001
@@ -565,20 +569,24 @@ flows:
     five_qi: 7
     service_type: URLLC
     service_type_id: 2
-    packet_size_bytes: 60000.0
-    arrival_rate_pps: 800.0
+    packet_size_bytes: 1250.0
+    arrival_rate_pps: 2500.0
+    dl_packet_size_bytes: 1250.0
+    ul_packet_size_bytes: 250.0
+    dl_arrival_rate_pps: 2500.0
+    ul_arrival_rate_pps: 250.0
     current_slice_snssai: "02000001"
-    allocated_bandwidth_dl_mbps: 32.0
-    allocated_bandwidth_ul_mbps: 8.0
+    allocated_bandwidth_dl_mbps: 25.0
+    allocated_bandwidth_ul_mbps: 0.5
     optimize_requested: false
     sla_target:
       latency_ms: 12.0
       jitter_ms: 6.0
       loss_rate: 0.002
-      bandwidth_dl_mbps: 32.0
-      bandwidth_ul_mbps: 8.0
-      guaranteed_bandwidth_dl_mbps: 26.0
-      guaranteed_bandwidth_ul_mbps: 5.0
+      bandwidth_dl_mbps: 25.0
+      bandwidth_ul_mbps: 0.5
+      guaranteed_bandwidth_dl_mbps: 20.0
+      guaranteed_bandwidth_ul_mbps: 0.3
       priority: 4
   - flow_id: flow-4806
     name: Cloud_Render_telemetry_2
@@ -591,20 +599,24 @@ flows:
     five_qi: 9
     service_type: eMBB
     service_type_id: 1
-    packet_size_bytes: 4000.0
-    arrival_rate_pps: 100.0
+    packet_size_bytes: 125.0
+    arrival_rate_pps: 50.0
+    dl_packet_size_bytes: 125.0
+    ul_packet_size_bytes: 250.0
+    dl_arrival_rate_pps: 50.0
+    ul_arrival_rate_pps: 50.0
     current_slice_snssai: "01000001"
-    allocated_bandwidth_dl_mbps: 0.5
-    allocated_bandwidth_ul_mbps: 1.2
+    allocated_bandwidth_dl_mbps: 0.05
+    allocated_bandwidth_ul_mbps: 0.1
     optimize_requested: false
     sla_target:
       latency_ms: 180.0
       jitter_ms: 50.0
       loss_rate: 0.02
-      bandwidth_dl_mbps: 0.5
-      bandwidth_ul_mbps: 1.2
-      guaranteed_bandwidth_dl_mbps: 0.2
-      guaranteed_bandwidth_ul_mbps: 0.7
+      bandwidth_dl_mbps: 0.05
+      bandwidth_ul_mbps: 0.1
+      guaranteed_bandwidth_dl_mbps: 0.03
+      guaranteed_bandwidth_ul_mbps: 0.05
       priority: 9
 
 free5gc:
@@ -620,6 +632,7 @@ ns3:
   output_subdir: ns3
   simulator: RealtimeSimulatorImpl
   sim_time_ms: 600000
+  bridge_mode: l2_inline
   slice_isolation: true
 
 writer:
@@ -632,3 +645,5 @@ topology:
 
 bridge:
   enable_inline_harness: true
+  n3_network_name: n3net
+  n3_network_cidr: 10.201.2.0/29

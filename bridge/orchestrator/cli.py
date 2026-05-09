@@ -7,6 +7,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -36,6 +37,9 @@ def _start_run(args: argparse.Namespace) -> int:
     if args.step:
         wanted = set(args.step)
         commands = [command for command in commands if command["name"] in wanted]
+    logs_dir = Path(args.logs_dir).expanduser().resolve() if args.logs_dir else None
+    if logs_dir is not None:
+        logs_dir.mkdir(parents=True, exist_ok=True)
 
     processes: list[subprocess.Popen[str]] = []
     try:
@@ -46,19 +50,35 @@ def _start_run(args: argparse.Namespace) -> int:
             child_env = os.environ.copy()
             child_env.update(command.get("env", {}) or {})
             stream_output = args.stream_output or _should_stream_command(command)
+            log_path = None if stream_output else (logs_dir / f"{command['name']}.log" if logs_dir is not None else None)
             if command.get("background"):
-                process = subprocess.Popen(
-                    command["argv"],
-                    cwd=command["cwd"],
-                    env=child_env,
-                    text=True,
-                    start_new_session=True,
-                    stdout=None if stream_output else subprocess.DEVNULL,
-                    stderr=None if stream_output else subprocess.DEVNULL,
-                )
+                stdout_target = None if stream_output else subprocess.DEVNULL
+                stderr_target = None if stream_output else subprocess.DEVNULL
+                log_handle = None
+                if log_path is not None:
+                    log_handle = log_path.open("w", encoding="utf-8")
+                    stdout_target = log_handle
+                    stderr_target = subprocess.STDOUT
+                try:
+                    process = subprocess.Popen(
+                        command["argv"],
+                        cwd=command["cwd"],
+                        env=child_env,
+                        text=True,
+                        start_new_session=True,
+                        stdout=stdout_target,
+                        stderr=stderr_target,
+                    )
+                finally:
+                    if log_handle is not None:
+                        log_handle.close()
                 processes.append(process)
+                if log_path is not None:
+                    print(f"started {command['name']} pid={process.pid} log={log_path}")
             else:
-                _run_command(command, child_env, stream_output=stream_output)
+                _run_command(command, child_env, stream_output=stream_output, log_path=log_path)
+                if log_path is not None:
+                    print(f"finished {command['name']} log={log_path}")
         return 0
     except BaseException:
         _terminate_background_processes(processes)
@@ -69,25 +89,41 @@ def _start_run(args: argparse.Namespace) -> int:
                 process.wait()
 
 
-def _run_command(command: dict[str, object], child_env: dict[str, str], *, stream_output: bool) -> None:
+def _run_command(command: dict[str, object],
+                 child_env: dict[str, str],
+                 *,
+                 stream_output: bool,
+                 log_path: Path | None = None) -> None:
     argv = command["argv"]
     cwd = command["cwd"]
-    retries = 3 if _is_retryable_compose_up(argv) or _is_retryable_bridge_setup(command) else 1
+    retries = 3 if _is_retryable_compose_command(argv) else 1
     last_error: subprocess.CalledProcessError | None = None
     for attempt in range(1, retries + 1):
         try:
-            subprocess.run(
-                argv,
-                cwd=cwd,
-                env=child_env,
-                check=True,
-                text=True,
-                stdout=None if stream_output else subprocess.DEVNULL,
-                stderr=None if stream_output else subprocess.DEVNULL,
-            )
+            stdout_target = None if stream_output else subprocess.DEVNULL
+            stderr_target = None if stream_output else subprocess.DEVNULL
+            log_handle = None
+            if log_path is not None:
+                log_handle = log_path.open("w", encoding="utf-8")
+                stdout_target = log_handle
+                stderr_target = subprocess.STDOUT
+            try:
+                subprocess.run(
+                    argv,
+                    cwd=cwd,
+                    env=child_env,
+                    check=True,
+                    text=True,
+                    stdout=stdout_target,
+                    stderr=stderr_target,
+                )
+            finally:
+                if log_handle is not None:
+                    log_handle.close()
             return
         except subprocess.CalledProcessError as exc:
             last_error = exc
+            _emit_log_tail_on_failure(command, log_path)
             message = str(exc)
             if attempt >= retries or not _is_retryable_failure(command, message):
                 raise
@@ -96,12 +132,28 @@ def _run_command(command: dict[str, object], child_env: dict[str, str], *, strea
         raise last_error
 
 
-def _is_retryable_compose_up(argv: object) -> bool:
+def _emit_log_tail_on_failure(command: dict[str, object], log_path: Path | None, *, max_lines: int = 80) -> None:
+    if log_path is None or not log_path.exists():
+        return
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return
+    tail = lines[-max_lines:]
+    if not tail:
+        return
+    command_name = str(command.get("name") or "command")
+    print(f"\n[{command_name}] log tail from {log_path}:", file=sys.stderr)
+    for line in tail:
+        print(line, file=sys.stderr)
+
+
+def _is_retryable_compose_command(argv: object) -> bool:
     return (
         isinstance(argv, list)
-        and len(argv) >= 6
+        and len(argv) >= 4
         and argv[:2] == ["docker", "compose"]
-        and "up" in argv
+        and any(action in argv for action in ("up", "start"))
     )
 
 
@@ -109,13 +161,7 @@ def _is_retryable_compose_failure(message: str) -> bool:
     return "already in progress" in message or "No such container" in message
 
 
-def _is_retryable_bridge_setup(command: dict[str, object]) -> bool:
-    return str(command.get("name") or "").strip() == "bridge-setup"
-
-
 def _is_retryable_failure(command: dict[str, object], message: str) -> bool:
-    if _is_retryable_bridge_setup(command):
-        return True
     return _is_retryable_compose_failure(message)
 
 
@@ -155,6 +201,7 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("manifest", help="path to run-manifest.json")
     start.add_argument("--step", action="append", help="run only selected steps")
     start.add_argument("--dry-run", action="store_true", help="print commands only")
+    start.add_argument("--logs-dir", help="write per-command logs to this directory")
     start.add_argument(
         "--stream-output",
         action="store_true",

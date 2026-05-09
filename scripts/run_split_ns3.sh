@@ -59,6 +59,17 @@ BRIDGE_LINK_LOSS_RATE="0"
 EXTERNAL_TRAFFIC_ONLY="false"
 EXTERNAL_TRAFFIC_TARGET_IP="8.8.8.8"
 EXTERNAL_TRAFFIC_SOURCE_BASE_PORT="15000"
+SPLIT_MODE="false"
+NR_NUMEROLOGY="1"
+NR_BANDWIDTH_HZ="100000000"
+NR_CENTRAL_FREQUENCY_HZ="3500000000"
+NR_TX_POWER_DB="43"
+SCHEDULER_TYPE="pf"
+TDD_PATTERN="DL|UL|UL|F|DL|UL|UL|F|"
+UE_TX_POWER_DB="23"
+GNB_NOISE_FIGURE_DB="5"
+UE_NOISE_FIGURE_DB="7"
+ENABLE_UPLINK_POWER_CONTROL="true"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -174,6 +185,50 @@ while [[ $# -gt 0 ]]; do
       EXTERNAL_TRAFFIC_SOURCE_BASE_PORT="$2"
       shift 2
       ;;
+    --split-mode)
+      SPLIT_MODE="true"
+      shift
+      ;;
+    --nr-numerology)
+      NR_NUMEROLOGY="$2"
+      shift 2
+      ;;
+    --nr-bandwidth-hz)
+      NR_BANDWIDTH_HZ="$2"
+      shift 2
+      ;;
+    --nr-central-frequency-hz)
+      NR_CENTRAL_FREQUENCY_HZ="$2"
+      shift 2
+      ;;
+    --nr-tx-power-db)
+      NR_TX_POWER_DB="$2"
+      shift 2
+      ;;
+    --scheduler-type)
+      SCHEDULER_TYPE="$2"
+      shift 2
+      ;;
+    --tdd-pattern)
+      TDD_PATTERN="$2"
+      shift 2
+      ;;
+    --ue-tx-power-db)
+      UE_TX_POWER_DB="$2"
+      shift 2
+      ;;
+    --gnb-noise-figure-db)
+      GNB_NOISE_FIGURE_DB="$2"
+      shift 2
+      ;;
+    --ue-noise-figure-db)
+      UE_NOISE_FIGURE_DB="$2"
+      shift 2
+      ;;
+    --enable-uplink-power-control)
+      ENABLE_UPLINK_POWER_CONTROL="$2"
+      shift 2
+      ;;
     *)
       echo "Unknown argument: $1" >&2
       exit 1
@@ -205,7 +260,7 @@ mkdir -p "$(dirname "$OUTPUT_FILE")"
 if [[ -n "$CLOCK_FILE" ]]; then
   mkdir -p "$(dirname "$CLOCK_FILE")"
 fi
-cp "$PROJECT_ROOT/sim/ns3/nr_multignb_multiupf.cc" "$NS3_ROOT/scratch/nr_multignb_multiupf.cc"
+cp "$PROJECT_ROOT/sim/ns3/nr_multignb_multiupf_split.cc" "$NS3_ROOT/scratch/nr_multignb_multiupf_split.cc"
 ensure_tap_creator_permissions
 
 NS3_ARGS=(
@@ -223,6 +278,16 @@ NS3_ARGS=(
   "--bridgeLinkRateMbps=$BRIDGE_LINK_RATE_MBPS"
   "--bridgeLinkDelayMs=$BRIDGE_LINK_DELAY_MS"
   "--bridgeLinkLossRate=$BRIDGE_LINK_LOSS_RATE"
+  "--nrNumerology=$NR_NUMEROLOGY"
+  "--nrBandwidthHz=$NR_BANDWIDTH_HZ"
+  "--nrCentralFrequencyHz=$NR_CENTRAL_FREQUENCY_HZ"
+  "--nrTxPowerDb=$NR_TX_POWER_DB"
+  "--schedulerType=$SCHEDULER_TYPE"
+  "--tddPattern=$TDD_PATTERN"
+  "--ueTxPowerDb=$UE_TX_POWER_DB"
+  "--gnbNoiseFigureDb=$GNB_NOISE_FIGURE_DB"
+  "--ueNoiseFigureDb=$UE_NOISE_FIGURE_DB"
+  "--enableUplinkPowerControl=$ENABLE_UPLINK_POWER_CONTROL"
 )
 if [[ -n "$CLOCK_FILE" ]]; then
   NS3_ARGS+=("--clockFile=$CLOCK_FILE")
@@ -264,17 +329,15 @@ if [[ "$EXTERNAL_TRAFFIC_ONLY" == "true" ]]; then
     "--externalTrafficSourceBasePort=$EXTERNAL_TRAFFIC_SOURCE_BASE_PORT"
   )
 fi
+if [[ "$SPLIT_MODE" == "true" ]]; then
+  NS3_ARGS+=("--splitMode=true")
+fi
 
 cd "$NS3_ROOT"
-RUN_SPEC="scratch/nr_multignb_multiupf"
+NS3_BINARY="$(find "$NS3_ROOT/build/scratch" -maxdepth 1 -type f -name 'ns3.*-nr_multignb_multiupf_split-*' | head -n 1 || true)"
+if [[ -z "$NS3_BINARY" || ! -x "$NS3_BINARY" ]]; then
+  echo "unable to locate built split ns-3 binary under $NS3_ROOT/build/scratch" >&2
+  exit 1
+fi
 
-quote_run_spec_arg() {
-  local value="$1"
-  value="${value//\'/\'\\\'\'}"
-  printf "'%s'" "$value"
-}
-
-for arg in "${NS3_ARGS[@]}"; do
-  RUN_SPEC="$RUN_SPEC $(quote_run_spec_arg "$arg")"
-done
-./ns3 run "$RUN_SPEC"
+exec "$NS3_BINARY" "${NS3_ARGS[@]}"

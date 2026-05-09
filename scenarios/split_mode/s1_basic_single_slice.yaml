@@ -1,0 +1,24 @@
+name: basic-single-slice-split
+scenario_id: basic-single-slice-split
+base_scenario: ../s1_basic_single_slice.yaml
+
+ns3:
+  output_subdir: ns3-split
+  scratch_name: nr_multignb_multiupf_split
+  policy_reload_ms: 100
+  activation_poll_ms: 200
+  nr_numerology: 1
+  nr_bandwidth_hz: 100000000
+
+runtime:
+  startup_timeout_seconds: 180
+  state_poll_ms: 200
+
+radio:
+  scheduler_type: pf
+  tdd_pattern: ul_friendly
+  gnb_tx_power_dbm: 43
+  ue_tx_power_dbm: 23
+  enable_uplink_power_control: true
+  gnb_noise_figure_db: 5
+  ue_noise_figure_db: 7

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import ipaddress
 from pathlib import Path
 from typing import Any
 
@@ -118,6 +119,10 @@ class FlowConfig:
     service_type_id: int | None = None
     packet_size_bytes: float | None = None
     arrival_rate_pps: float | None = None
+    dl_packet_size_bytes: float | None = None
+    ul_packet_size_bytes: float | None = None
+    dl_arrival_rate_pps: float | None = None
+    ul_arrival_rate_pps: float | None = None
     current_slice_snssai: str | None = None
     allocated_bandwidth_dl_mbps: float | None = None
     allocated_bandwidth_ul_mbps: float | None = None
@@ -183,6 +188,7 @@ class Ns3Config:
     output_subdir: str = "ns3"
     simulator: str = "RealtimeSimulatorImpl"
     sim_time_ms: int = 30000
+    bridge_mode: str = "l2_inline"
     bridge_link_rate_mbps: float = 1000.0
     bridge_link_delay_ms: float = 1.0
     bridge_link_loss_rate: float = 0.0
@@ -208,6 +214,10 @@ class TopologyConfig:
 @dataclass(slots=True, frozen=True)
 class BridgeHarnessConfig:
     enable_inline_harness: bool = False
+    gnb_n3_ifname: str | None = None
+    upf_n3_ifname: str | None = None
+    n3_network_name: str = "n3net"
+    n3_network_cidr: str | None = None
     gnb_prefix: str = "tap-gnb"
     upf_prefix: str = "tap-upf"
     bridge_prefix: str = "br-ran"
@@ -334,8 +344,26 @@ class ScenarioConfig:
             raise ValueError("graph snapshot input requires topology.graph_db_url or writer.graph_db_url")
         if (self.policy.ue_context_table or self.policy.ue_context_query) and not self.policy.db_url:
             raise ValueError("ue_context policy loading requires policy.db_url or writer.graph_db_url")
+        if self.ns3.bridge_mode not in {"l2_inline"}:
+            raise ValueError("ns3.bridge_mode must currently be 'l2_inline'")
         if not 0.0 <= self.ns3.bridge_link_loss_rate <= 1.0:
             raise ValueError("ns3.bridge_link_loss_rate must be within [0.0, 1.0]")
+        if self.bridge.enable_inline_harness:
+            if not self.bridge.n3_network_cidr:
+                raise ValueError("bridge.n3_network_cidr is required when inline harness is enabled")
+        if self.bridge.n3_network_cidr:
+            try:
+                n3_network = ipaddress.ip_network(self.bridge.n3_network_cidr, strict=True)
+            except ValueError as exc:
+                raise ValueError(f"invalid bridge.n3_network_cidr: {self.bridge.n3_network_cidr}") from exc
+            if n3_network.version != 4:
+                raise ValueError("bridge.n3_network_cidr must be an IPv4 CIDR")
+            required_hosts = len(self.gnbs) + len(self.upfs) + 1
+            if len(list(n3_network.hosts())) < required_hosts:
+                raise ValueError(
+                    f"bridge.n3_network_cidr {self.bridge.n3_network_cidr} does not have enough host addresses "
+                    "for Docker gateway plus all gNB/UPF endpoints"
+                )
 
         ue_by_name = {ue.name: ue for ue in self.ues}
         ue_by_supi = {ue.supi: ue for ue in self.ues}
@@ -569,6 +597,14 @@ class ScenarioConfig:
                 service_type_id=_optional_int(item.get("service_type_id")),
                 packet_size_bytes=_optional_float(item.get("packet_size_bytes")),
                 arrival_rate_pps=_optional_float(item.get("arrival_rate_pps")),
+                dl_packet_size_bytes=_optional_float(item.get("dl_packet_size_bytes"))
+                or _optional_float(item.get("packet_size_bytes")),
+                ul_packet_size_bytes=_optional_float(item.get("ul_packet_size_bytes"))
+                or _optional_float(item.get("packet_size_bytes")),
+                dl_arrival_rate_pps=_optional_float(item.get("dl_arrival_rate_pps"))
+                or _optional_float(item.get("arrival_rate_pps")),
+                ul_arrival_rate_pps=_optional_float(item.get("ul_arrival_rate_pps"))
+                or _optional_float(item.get("arrival_rate_pps")),
                 current_slice_snssai=item.get("current_slice_snssai"),
                 allocated_bandwidth_dl_mbps=_optional_float(item.get("allocated_bandwidth_dl_mbps")),
                 allocated_bandwidth_ul_mbps=_optional_float(item.get("allocated_bandwidth_ul_mbps")),
@@ -644,6 +680,7 @@ class ScenarioConfig:
                 output_subdir=ns3_payload.get("output_subdir", "ns3"),
                 simulator=ns3_payload.get("simulator", "RealtimeSimulatorImpl"),
                 sim_time_ms=int(ns3_payload.get("sim_time_ms", 30000)),
+                bridge_mode=str(ns3_payload.get("bridge_mode", "l2_inline")),
                 bridge_link_rate_mbps=float(ns3_payload.get("bridge_link_rate_mbps", 1000.0)),
                 bridge_link_delay_ms=float(ns3_payload.get("bridge_link_delay_ms", 1.0)),
                 bridge_link_loss_rate=float(ns3_payload.get("bridge_link_loss_rate", 0.0)),
@@ -665,6 +702,10 @@ class ScenarioConfig:
                 enable_inline_harness=bool(
                     bridge_payload.get("enable_inline_harness", False)
                 ),
+                gnb_n3_ifname=bridge_payload.get("gnb_n3_ifname"),
+                upf_n3_ifname=bridge_payload.get("upf_n3_ifname"),
+                n3_network_name=bridge_payload.get("n3_network_name", "n3net"),
+                n3_network_cidr=bridge_payload.get("n3_network_cidr"),
                 gnb_prefix=bridge_payload.get("gnb_prefix", "tap-gnb"),
                 upf_prefix=bridge_payload.get("upf_prefix", "tap-upf"),
                 bridge_prefix=bridge_payload.get("bridge_prefix", "br-ran"),

@@ -362,6 +362,9 @@ class PolicyRuntime:
                 "execution_status": execution_status,
                 "compliance_status": compliance_status,
                 "monitoring_data": dict(record.get("monitoring_data") or {}),
+                "phase": "ns3_compliance"
+                if execution_status == "APPLIED" and compliance_status == "VIOLATED"
+                else "ns3_execution",
             }
             time.sleep(self.poll_interval_ms / 1000.0)
 
@@ -371,7 +374,7 @@ class PolicyRuntime:
             record["monitoring_data"] = dict(last_observation.get("monitoring_data") or {})
             return self._mark_failed(
                 record,
-                phase="ns3_apply",
+                phase=str(last_observation.get("phase") or "ns3_apply"),
                 error="ns-3 observed state did not converge to the requested policy before timeout",
                 status_code=409,
             )
@@ -429,7 +432,7 @@ class PolicyRuntime:
         record["updated_at"] = time.time()
         if record.get("execution_status") == "PENDING" and phase != "upstream_pcf":
             record["execution_status"] = "FAILED"
-        if record.get("compliance_status") == "PENDING" and phase.startswith("ns3_apply"):
+        if record.get("compliance_status") == "PENDING" and phase.startswith("ns3"):
             record["compliance_status"] = "VIOLATED"
         return record
 
@@ -879,6 +882,63 @@ def _monitoring_payload(
     return monitoring
 
 
+def _coerce_float(value: Any) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_bandwidth_target(
+    allocation: dict[str, Any],
+    requested_value: float,
+    *,
+    direction: str,
+) -> float:
+    requested = float(requested_value)
+    capacity_limited = bool(allocation.get(f"capacity_limited_{direction}"))
+    if not capacity_limited:
+        return requested
+    radio_capacity = _coerce_float(allocation.get(f"radio_capacity_{direction}_mbps"))
+    if radio_capacity is None:
+        return requested
+    return min(requested, radio_capacity)
+
+
+def _infer_violation_reason(
+    allocation: dict[str, Any],
+    telemetry: dict[str, Any],
+    requested_state: dict[str, Any],
+) -> str:
+    throughput_ul = _coerce_float(telemetry.get("throughput_ul"))
+    throughput_dl = _coerce_float(telemetry.get("throughput_dl"))
+    allocated_ul = _coerce_float(allocation.get("allocated_bandwidth_ul"))
+    allocated_dl = _coerce_float(allocation.get("allocated_bandwidth_dl"))
+    loss_rate = _coerce_float(telemetry.get("loss_rate"))
+    latency = _coerce_float(telemetry.get("latency"))
+    ran = telemetry.get("ran") if isinstance(telemetry.get("ran"), dict) else {}
+    ran_ul = ran.get("ul") if isinstance(ran.get("ul"), dict) else {}
+    ul_tx = _coerce_float(ran_ul.get("tx_pkts")) or 0.0
+    ul_rx = _coerce_float(ran_ul.get("rx_pkts")) or 0.0
+    ul_delivery_ratio = _coerce_float(ran_ul.get("delivery_ratio"))
+
+    if "loss_rate" in requested_state and loss_rate is not None and loss_rate > float(requested_state["loss_rate"]):
+        return "loss_budget_unmet"
+    if "latency_ms" in requested_state and latency is not None and latency > float(requested_state["latency_ms"]):
+        return "latency_budget_unmet"
+    if allocated_ul is not None and throughput_ul is not None and allocated_ul > 0 and throughput_ul < 0.5 * allocated_ul:
+        if ul_tx > 0 and ul_rx <= 0:
+            return "ul_scheduler_starvation"
+        if ul_delivery_ratio is not None and ul_delivery_ratio < 0.8:
+            return "ul_phy_decode_failure"
+        return "ul_radio_capacity_insufficient"
+    if allocated_dl is not None and throughput_dl is not None and allocated_dl > 0 and throughput_dl < 0.5 * allocated_dl:
+        return "dl_radio_capacity_insufficient"
+    return "telemetry_unmet"
+
+
 def _evaluate_record(record: dict[str, Any], snapshot: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
     mutation = record.get("mutation") or {}
     requested_state = mutation.get("requested_state") or {}
@@ -922,23 +982,35 @@ def _evaluate_sm_record(
     telemetry = flow.get("telemetry") if isinstance(flow.get("telemetry"), dict) else {}
     applied = True
     if "allocated_bandwidth_dl_mbps" in requested_state:
+        target_dl = _resolve_bandwidth_target(
+            allocation,
+            requested_state["allocated_bandwidth_dl_mbps"],
+            direction="dl",
+        )
         applied = applied and _within_ratio_tolerance(
             allocation.get("allocated_bandwidth_dl"),
-            requested_state["allocated_bandwidth_dl_mbps"],
+            target_dl,
         )
     if "allocated_bandwidth_ul_mbps" in requested_state:
+        target_ul = _resolve_bandwidth_target(
+            allocation,
+            requested_state["allocated_bandwidth_ul_mbps"],
+            direction="ul",
+        )
         applied = applied and _within_ratio_tolerance(
             allocation.get("allocated_bandwidth_ul"),
-            requested_state["allocated_bandwidth_ul_mbps"],
+            target_ul,
         )
 
-    compliant = applied
+    compliant = True
     if "latency_ms" in requested_state:
         compliant = compliant and _within_upper_bound(telemetry.get("latency"), requested_state["latency_ms"])
     if "jitter_ms" in requested_state:
         compliant = compliant and _within_upper_bound(telemetry.get("jitter"), requested_state["jitter_ms"])
     if "loss_rate" in requested_state:
         compliant = compliant and _within_upper_bound(telemetry.get("loss_rate"), requested_state["loss_rate"])
+
+    violation_reason = "" if compliant else _infer_violation_reason(allocation, telemetry, requested_state)
 
     return (
         "APPLIED" if applied else "FAILED",
@@ -947,6 +1019,7 @@ def _evaluate_sm_record(
             "observed_flow_id": flow.get("flow_id"),
             "observed_allocation": allocation,
             "observed_telemetry": telemetry,
+            "violation_reason": violation_reason,
         },
     )
 
@@ -1004,7 +1077,7 @@ def _failure_response(
         "policy_id": str(payload.get("policy_id") or ""),
         "policy_type": str(payload.get("policy_type") or ""),
         "execution_status": "FAILED" if phase != "upstream_pcf" else "PENDING",
-        "compliance_status": "VIOLATED" if phase.startswith("ns3_apply") else "PENDING",
+        "compliance_status": "VIOLATED" if phase.startswith("ns3") else "PENDING",
     }
 
 

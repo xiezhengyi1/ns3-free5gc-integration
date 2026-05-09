@@ -1,5 +1,5 @@
 # ns3-free5gc-integration
-
+python scripts/start_split_mode.py scenarios/split_mode/s1_basic_single_slice.yaml --run-id t001
 **编排与快照工具链**，用于将 [free5GC](https://free5gc.org/) 核心网、[UERANSIM](https://github.com/aligungr/UERANSIM) 无线接入网仿真器和 [ns-3 NR](https://5g-lena.cttc.es/) 数字孪生（Digital Twin）有机地集成在一起，实现 5G 端到端场景的自动化配置渲染、运行编排、日志采集和性能指标持久化。
 
 ## 目录

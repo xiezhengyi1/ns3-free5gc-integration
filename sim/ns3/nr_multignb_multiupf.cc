@@ -23,6 +23,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <sstream>
 #include <string>
@@ -562,14 +563,10 @@ AppendUniqueString(std::vector<std::string>* values, const std::string& value)
 
 struct SnapshotContext
 {
-    struct ExternalTraceDebug
+    struct TraceParseCounters
     {
-        uint64_t macTxGnb = 0;
-        uint64_t macTxUpf = 0;
-        uint64_t macRxGnb = 0;
-        uint64_t macRxUpf = 0;
-        uint64_t macRxDropGnb = 0;
-        uint64_t macRxDropUpf = 0;
+        uint64_t extractCalls = 0;
+        uint64_t ethernetNonIpv4 = 0;
         uint64_t parseNoIpv4 = 0;
         uint64_t parseNonUdpOuter = 0;
         uint64_t parseNoOuterUdp = 0;
@@ -582,6 +579,23 @@ struct SnapshotContext
         uint64_t matchDestinationPort = 0;
         uint64_t matchSourcePort = 0;
         uint64_t unmatchedPorts = 0;
+        std::map<uint16_t, uint64_t> ethernetTypes;
+    };
+
+    struct ExternalTraceDebug
+    {
+        uint64_t macTxGnb = 0;
+        uint64_t macTxUpf = 0;
+        uint64_t macRxGnb = 0;
+        uint64_t macRxUpf = 0;
+        uint64_t macRxDropGnb = 0;
+        uint64_t macRxDropUpf = 0;
+        uint64_t promiscSnifferGnb = 0;
+        uint64_t promiscSnifferUpf = 0;
+        TraceParseCounters macTx;
+        TraceParseCounters macRx;
+        TraceParseCounters macRxDrop;
+        TraceParseCounters promiscSniffer;
     };
 
     struct ExternalFlowCounters
@@ -652,124 +666,257 @@ struct SnapshotContext
 };
 
 bool
-ExtractUdpTupleFromPacket(SnapshotContext* context,
+ExtractUdpTupleFromPacket(SnapshotContext::TraceParseCounters* debug,
                           Ptr<const Packet> packet,
                           uint16_t* sourcePort,
                           uint16_t* destinationPort)
 {
-    NS_ASSERT(context != nullptr);
+    NS_ASSERT(debug != nullptr);
     NS_ASSERT(sourcePort != nullptr);
     NS_ASSERT(destinationPort != nullptr);
 
-    Ptr<Packet> packetCopy = packet->Copy();
-
-    EthernetHeader ethernetHeader;
-    if (packetCopy->PeekHeader(ethernetHeader))
+    const uint32_t packetSize = packet->GetSize();
+    if (packetSize == 0)
     {
-        packetCopy->RemoveHeader(ethernetHeader);
-        if (ethernetHeader.GetLengthType() != 0x0800)
+        debug->parseNoIpv4++;
+        return false;
+    }
+
+    std::vector<uint8_t> bytes(packetSize);
+    packet->CopyData(bytes.data(), packetSize);
+
+    auto readU16 = [&bytes](size_t offset) -> uint16_t {
+        return static_cast<uint16_t>((static_cast<uint16_t>(bytes[offset]) << 8) |
+                                     static_cast<uint16_t>(bytes[offset + 1]));
+    };
+
+    size_t offset = 0;
+    if (packetSize >= 14)
+    {
+        const uint16_t etherType = readU16(12);
+        if ((bytes[0] & 0xF0) != 0x40)
         {
-            return false;
+            debug->ethernetTypes[etherType]++;
+            if (etherType != 0x0800)
+            {
+                debug->ethernetNonIpv4++;
+                return false;
+            }
+            offset = 14;
         }
     }
 
-    Ipv4Header ipv4Header;
-    if (!packetCopy->PeekHeader(ipv4Header))
+    if (packetSize < offset + 20)
     {
-        context->externalTraceDebug.parseNoIpv4++;
-        return false;
-    }
-    packetCopy->RemoveHeader(ipv4Header);
-    if (ipv4Header.GetProtocol() != 17)
-    {
-        context->externalTraceDebug.parseNonUdpOuter++;
+        debug->parseNoIpv4++;
         return false;
     }
 
-    UdpHeader udpHeader;
-    if (!packetCopy->PeekHeader(udpHeader))
+    const uint8_t ipv4Version = bytes[offset] >> 4;
+    if (ipv4Version != 4)
     {
-        context->externalTraceDebug.parseNoOuterUdp++;
+        debug->parseNoIpv4++;
         return false;
     }
 
-    *sourcePort = udpHeader.GetSourcePort();
-    *destinationPort = udpHeader.GetDestinationPort();
+    const uint8_t ipv4IhlWords = bytes[offset] & 0x0F;
+    const size_t ipv4HeaderLength = static_cast<size_t>(ipv4IhlWords) * 4;
+    if (ipv4IhlWords < 5 || packetSize < offset + ipv4HeaderLength)
+    {
+        debug->parseNoIpv4++;
+        return false;
+    }
+
+    const uint8_t outerProtocol = bytes[offset + 9];
+    offset += ipv4HeaderLength;
+    if (outerProtocol != 17)
+    {
+        debug->parseNonUdpOuter++;
+        return false;
+    }
+
+    if (packetSize < offset + 8)
+    {
+        debug->parseNoOuterUdp++;
+        return false;
+    }
+
+    *sourcePort = readU16(offset);
+    *destinationPort = readU16(offset + 2);
+    offset += 8;
+
     // The bridged gNB<->UPF N3 link carries GTP-U, so the first UDP header is often the
     // outer transport (typically port 2152) rather than the UE application's inner flow.
     if (*sourcePort == 2152 || *destinationPort == 2152)
     {
-        packetCopy->RemoveHeader(udpHeader);
-
-        GtpuHeader gtpuHeader;
-        if (!packetCopy->PeekHeader(gtpuHeader))
+        if (packetSize < offset + 8)
         {
-            context->externalTraceDebug.parseGtpuNoHeader++;
-            return false;
-        }
-        packetCopy->RemoveHeader(gtpuHeader);
-
-        Ipv4Header innerIpv4Header;
-        if (!packetCopy->PeekHeader(innerIpv4Header))
-        {
-            context->externalTraceDebug.parseGtpuNoInnerIpv4++;
-            return false;
-        }
-        packetCopy->RemoveHeader(innerIpv4Header);
-        if (innerIpv4Header.GetProtocol() != 17)
-        {
-            context->externalTraceDebug.parseGtpuInnerNonUdp++;
+            debug->parseGtpuNoHeader++;
             return false;
         }
 
-        UdpHeader innerUdpHeader;
-        if (!packetCopy->PeekHeader(innerUdpHeader))
+        const uint8_t gtpuFlags = bytes[offset];
+        const uint8_t gtpuMessageType = bytes[offset + 1];
+        if ((gtpuFlags & 0x30) != 0x30 || gtpuMessageType != 0xff)
         {
-            context->externalTraceDebug.parseGtpuNoInnerUdp++;
+            debug->parseGtpuNoHeader++;
             return false;
         }
-        *sourcePort = innerUdpHeader.GetSourcePort();
-        *destinationPort = innerUdpHeader.GetDestinationPort();
-        context->externalTraceDebug.parseOkGtpuInnerUdp++;
+
+        size_t gtpuHeaderLength = 8;
+        const bool hasExtension = (gtpuFlags & 0x04) != 0;
+        const bool hasSequence = (gtpuFlags & 0x02) != 0;
+        const bool hasNpdu = (gtpuFlags & 0x01) != 0;
+        if (hasExtension || hasSequence || hasNpdu)
+        {
+            gtpuHeaderLength += 4;
+            if (packetSize < offset + gtpuHeaderLength)
+            {
+                debug->parseGtpuNoHeader++;
+                return false;
+            }
+            if (hasExtension)
+            {
+                size_t extensionOffset = offset + gtpuHeaderLength;
+                while (true)
+                {
+                    if (packetSize < extensionOffset + 2)
+                    {
+                        debug->parseGtpuNoHeader++;
+                        return false;
+                    }
+                    const uint8_t extensionLengthUnits = bytes[extensionOffset];
+                    const size_t extensionLength = static_cast<size_t>(extensionLengthUnits) * 4;
+                    if (extensionLength == 0 || packetSize < extensionOffset + extensionLength)
+                    {
+                        debug->parseGtpuNoHeader++;
+                        return false;
+                    }
+                    const uint8_t nextExtensionType = bytes[extensionOffset + extensionLength - 1];
+                    extensionOffset += extensionLength;
+                    gtpuHeaderLength = extensionOffset - offset;
+                    if (nextExtensionType == 0)
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        offset += gtpuHeaderLength;
+        if (packetSize < offset + 20)
+        {
+            debug->parseGtpuNoInnerIpv4++;
+            return false;
+        }
+
+        const uint8_t innerIpv4Version = bytes[offset] >> 4;
+        const uint8_t innerIpv4IhlWords = bytes[offset] & 0x0F;
+        const size_t innerIpv4HeaderLength = static_cast<size_t>(innerIpv4IhlWords) * 4;
+        if (innerIpv4Version != 4 || innerIpv4IhlWords < 5 ||
+            packetSize < offset + innerIpv4HeaderLength)
+        {
+            debug->parseGtpuNoInnerIpv4++;
+            return false;
+        }
+
+        const uint8_t innerProtocol = bytes[offset + 9];
+        offset += innerIpv4HeaderLength;
+        if (innerProtocol != 17)
+        {
+            debug->parseGtpuInnerNonUdp++;
+            return false;
+        }
+
+        if (packetSize < offset + 8)
+        {
+            debug->parseGtpuNoInnerUdp++;
+            return false;
+        }
+
+        *sourcePort = readU16(offset);
+        *destinationPort = readU16(offset + 2);
+        debug->parseOkGtpuInnerUdp++;
         return true;
     }
 
-    context->externalTraceDebug.parseOkOuterUdp++;
+    debug->parseOkOuterUdp++;
     return true;
 }
 
 bool
 ExtractExternalFlowKey(const SnapshotContext* context,
+                       SnapshotContext::TraceParseCounters* debug,
                        Ptr<const Packet> packet,
                        uint16_t* port,
                        bool* uplink)
 {
     NS_ASSERT(context != nullptr);
+    NS_ASSERT(debug != nullptr);
     NS_ASSERT(port != nullptr);
     NS_ASSERT(uplink != nullptr);
+    debug->extractCalls++;
 
     uint16_t sourcePort = 0;
     uint16_t destinationPort = 0;
-    if (!ExtractUdpTupleFromPacket(const_cast<SnapshotContext*>(context), packet, &sourcePort, &destinationPort))
+    if (!ExtractUdpTupleFromPacket(debug, packet, &sourcePort, &destinationPort))
     {
         return false;
     }
 
+    const auto resolveMappedPort = [&](uint16_t candidatePort,
+                                       bool directionUplink,
+                                       bool matchedAsDestination) -> bool {
+        if (candidatePort < context->externalTrafficSourceBasePort)
+        {
+            return false;
+        }
+        const uint32_t flowIndex = candidatePort - context->externalTrafficSourceBasePort;
+        if (flowIndex > static_cast<uint32_t>(std::numeric_limits<uint16_t>::max() - 5000))
+        {
+            return false;
+        }
+        const uint16_t mappedPort = static_cast<uint16_t>(5000 + flowIndex);
+        if (context->flowRuntimeByPort.find(mappedPort) == context->flowRuntimeByPort.end())
+        {
+            return false;
+        }
+        if (matchedAsDestination)
+        {
+            debug->matchDestinationPort++;
+        }
+        else
+        {
+            debug->matchSourcePort++;
+        }
+        *port = mappedPort;
+        *uplink = directionUplink;
+        return true;
+    };
+
     if (context->flowRuntimeByPort.find(destinationPort) != context->flowRuntimeByPort.end())
     {
-        const_cast<SnapshotContext*>(context)->externalTraceDebug.matchDestinationPort++;
+        debug->matchDestinationPort++;
         *port = destinationPort;
         *uplink = true;
         return true;
     }
     if (context->flowRuntimeByPort.find(sourcePort) != context->flowRuntimeByPort.end())
     {
-        const_cast<SnapshotContext*>(context)->externalTraceDebug.matchSourcePort++;
+        debug->matchSourcePort++;
         *port = sourcePort;
         *uplink = false;
         return true;
     }
-    const_cast<SnapshotContext*>(context)->externalTraceDebug.unmatchedPorts++;
+    if (resolveMappedPort(destinationPort, false, true))
+    {
+        return true;
+    }
+    if (resolveMappedPort(sourcePort, true, false))
+    {
+        return true;
+    }
+    debug->unmatchedPorts++;
     return false;
 }
 
@@ -786,20 +933,9 @@ OnBridgeMacTx(SnapshotContext* context, bool gnbSide, Ptr<const Packet> packet)
     }
     uint16_t port = 0;
     bool uplink = false;
-    if (!ExtractExternalFlowKey(context, packet, &port, &uplink))
+    if (!ExtractExternalFlowKey(context, &context->externalTraceDebug.macTx, packet, &port, &uplink))
     {
         return;
-    }
-    auto& counters = context->externalFlowCountersByPort[port];
-    if (gnbSide && uplink)
-    {
-        counters.txPacketsUl++;
-        counters.txTimesUl.push_back(Simulator::Now());
-    }
-    else if (!gnbSide && !uplink)
-    {
-        counters.txPacketsDl++;
-        counters.txTimesDl.push_back(Simulator::Now());
     }
 }
 
@@ -816,12 +952,17 @@ OnBridgeMacRx(SnapshotContext* context, bool gnbSide, Ptr<const Packet> packet)
     }
     uint16_t port = 0;
     bool uplink = false;
-    if (!ExtractExternalFlowKey(context, packet, &port, &uplink))
+    if (!ExtractExternalFlowKey(context, &context->externalTraceDebug.macRx, packet, &port, &uplink))
     {
         return;
     }
     auto& counters = context->externalFlowCountersByPort[port];
-    if (!gnbSide && uplink)
+    if (gnbSide && uplink)
+    {
+        counters.txPacketsUl++;
+        counters.txTimesUl.push_back(Simulator::Now());
+    }
+    else if (!gnbSide && uplink)
     {
         counters.rxPacketsUl++;
         if (!counters.txTimesUl.empty())
@@ -837,6 +978,11 @@ OnBridgeMacRx(SnapshotContext* context, bool gnbSide, Ptr<const Packet> packet)
             counters.lastDelayMsUl = delayMs;
             counters.hasLastDelayUl = true;
         }
+    }
+    else if (!gnbSide && !uplink)
+    {
+        counters.txPacketsDl++;
+        counters.txTimesDl.push_back(Simulator::Now());
     }
     else if (gnbSide && !uplink)
     {
@@ -870,7 +1016,7 @@ OnBridgeMacRxDrop(SnapshotContext* context, bool gnbSide, Ptr<const Packet> pack
     }
     uint16_t port = 0;
     bool uplink = false;
-    if (!ExtractExternalFlowKey(context, packet, &port, &uplink))
+    if (!ExtractExternalFlowKey(context, &context->externalTraceDebug.macRxDrop, packet, &port, &uplink))
     {
         return;
     }
@@ -891,6 +1037,22 @@ OnBridgeMacRxDrop(SnapshotContext* context, bool gnbSide, Ptr<const Packet> pack
             counters.txTimesDl.pop_front();
         }
     }
+}
+
+void
+OnBridgePromiscSniffer(SnapshotContext* context, bool gnbSide, Ptr<const Packet> packet)
+{
+    if (gnbSide)
+    {
+        context->externalTraceDebug.promiscSnifferGnb++;
+    }
+    else
+    {
+        context->externalTraceDebug.promiscSnifferUpf++;
+    }
+    uint16_t port = 0;
+    bool uplink = false;
+    ExtractExternalFlowKey(context, &context->externalTraceDebug.promiscSniffer, packet, &port, &uplink);
 }
 
 std::string
@@ -1625,6 +1787,8 @@ EmitSnapshot(SnapshotContext* context)
             const uint64_t rxPacketsDl = counters.rxPacketsDl;
             const uint64_t txPackets = txPacketsUl + txPacketsDl;
             const uint64_t rxPackets = rxPacketsUl + rxPacketsDl;
+            const uint64_t deliveredPackets = std::min(txPackets, rxPackets);
+            const uint64_t lostPackets = txPackets > deliveredPackets ? (txPackets - deliveredPackets) : 0;
             const uint64_t delaySamples = counters.delaySamplesUl + counters.delaySamplesDl;
             const uint64_t jitterSamples =
                 (counters.hasLastDelayUl ? counters.delaySamplesUl - 1 : 0) +
@@ -1634,7 +1798,7 @@ EmitSnapshot(SnapshotContext* context)
             const double throughputDl =
                 rxPacketsDl * runtime.profile.packetSizeBytes * 8.0 / tickSeconds / 1e6;
             const double lossRate =
-                txPackets > 0 ? static_cast<double>(txPackets - rxPackets) / static_cast<double>(txPackets) : 0.0;
+                txPackets > 0 ? static_cast<double>(lostPackets) / static_cast<double>(txPackets) : 0.0;
             const double shortfallRatio =
                 offeredMbps > 0.0
                     ? std::max(0.0, 1.0 - std::min(throughputUl, throughputDl) / offeredMbps)
@@ -1669,22 +1833,51 @@ EmitSnapshot(SnapshotContext* context)
                        runtime.profile.flowId);
         }
         const auto& debug = context->externalTraceDebug;
+        auto formatEtherTypes = [](const SnapshotContext::TraceParseCounters& counters) {
+            std::ostringstream stream;
+            bool firstEtherType = true;
+            for (const auto& [etherType, count] : counters.ethernetTypes)
+            {
+                if (!firstEtherType)
+                {
+                    stream << ",";
+                }
+                firstEtherType = false;
+                stream << "0x" << std::hex << etherType << std::dec << ":" << count;
+            }
+            return stream.str();
+        };
+        auto formatParseSummary = [&](const char* label, const SnapshotContext::TraceParseCounters& counters) {
+            std::ostringstream stream;
+            stream << label
+                   << "(calls=" << counters.extractCalls
+                   << ",etherTypes=[" << formatEtherTypes(counters) << "]"
+                   << ",nonIpv4Ether=" << counters.ethernetNonIpv4
+                   << ",okOuter=" << counters.parseOkOuterUdp
+                   << ",okGtpu=" << counters.parseOkGtpuInnerUdp
+                   << ",noIpv4=" << counters.parseNoIpv4
+                   << ",nonUdpOuter=" << counters.parseNonUdpOuter
+                   << ",noOuterUdp=" << counters.parseNoOuterUdp
+                   << ",gtpuNoHeader=" << counters.parseGtpuNoHeader
+                   << ",gtpuNoInnerIpv4=" << counters.parseGtpuNoInnerIpv4
+                   << ",gtpuInnerNonUdp=" << counters.parseGtpuInnerNonUdp
+                   << ",gtpuNoInnerUdp=" << counters.parseGtpuNoInnerUdp
+                   << ",matchDst=" << counters.matchDestinationPort
+                   << ",matchSrc=" << counters.matchSourcePort
+                   << ",unmatched=" << counters.unmatchedPorts
+                   << ")";
+            return stream.str();
+        };
         std::cerr << "[external-trace] tick=" << context->tickIndex
                   << " macTx(gnb=" << debug.macTxGnb << ",upf=" << debug.macTxUpf << ")"
                   << " macRx(gnb=" << debug.macRxGnb << ",upf=" << debug.macRxUpf << ")"
                   << " macRxDrop(gnb=" << debug.macRxDropGnb << ",upf=" << debug.macRxDropUpf << ")"
-                  << " parse(okOuter=" << debug.parseOkOuterUdp
-                  << ",okGtpu=" << debug.parseOkGtpuInnerUdp
-                  << ",noIpv4=" << debug.parseNoIpv4
-                  << ",nonUdpOuter=" << debug.parseNonUdpOuter
-                  << ",noOuterUdp=" << debug.parseNoOuterUdp
-                  << ",gtpuNoHeader=" << debug.parseGtpuNoHeader
-                  << ",gtpuNoInnerIpv4=" << debug.parseGtpuNoInnerIpv4
-                  << ",gtpuInnerNonUdp=" << debug.parseGtpuInnerNonUdp
-                  << ",gtpuNoInnerUdp=" << debug.parseGtpuNoInnerUdp << ")"
-                  << " match(dst=" << debug.matchDestinationPort
-                  << ",src=" << debug.matchSourcePort
-                  << ",unmatched=" << debug.unmatchedPorts << ")"
+                  << " promiscSniffer(gnb=" << debug.promiscSnifferGnb
+                  << ",upf=" << debug.promiscSnifferUpf << ")"
+                  << " " << formatParseSummary("macTx", debug.macTx)
+                  << " " << formatParseSummary("macRx", debug.macRx)
+                  << " " << formatParseSummary("macRxDrop", debug.macRxDrop)
+                  << " " << formatParseSummary("sniffer", debug.promiscSniffer)
                   << std::endl;
         context->externalTraceDebug = SnapshotContext::ExternalTraceDebug{};
         context->externalFlowCountersByPort.clear();
@@ -1995,10 +2188,6 @@ main(int argc, char* argv[])
 
     if (!bridgeGnbTaps.empty() && !bridgeUpfTaps.empty())
     {
-        NodeContainer gnbBridgeNodes;
-        gnbBridgeNodes.Create(gNbNum);
-        NodeContainer upfBridgeNodes;
-        upfBridgeNodes.Create(gNbNum);
         CsmaHelper bridgeCsma;
         bridgeCsma.SetChannelAttribute(
             "DataRate",
@@ -2007,12 +2196,11 @@ main(int argc, char* argv[])
                                        TimeValue(Seconds(std::max(0.0, bridgeLinkDelayMs) / 1000.0)));
         TapBridgeHelper tapBridge;
         tapBridge.SetAttribute("Mode", StringValue("UseBridge"));
-        for (uint32_t index = 0; index < gNbNum; ++index)
+        for (uint32_t gnbIndex = 0; gnbIndex < gNbNum; ++gnbIndex)
         {
-            NodeContainer pair;
-            pair.Add(gnbBridgeNodes.Get(index));
-            pair.Add(upfBridgeNodes.Get(index));
-            NetDeviceContainer devices = bridgeCsma.Install(pair);
+            NodeContainer segment;
+            segment.Create(2);
+            NetDeviceContainer devices = bridgeCsma.Install(segment);
             if (bridgeLinkLossRate > 0.0)
             {
                 for (uint32_t deviceIndex = 0; deviceIndex < devices.GetN(); ++deviceIndex)
@@ -2023,21 +2211,36 @@ main(int argc, char* argv[])
                     devices.Get(deviceIndex)->SetAttribute("ReceiveErrorModel", PointerValue(errorModel));
                 }
             }
-            devices.Get(0)->TraceConnectWithoutContext("MacTx", MakeBoundCallback(&OnBridgeMacTx, &context, true));
-            // TapBridge UseBridge receives through the bridged device's promiscuous path.
-            devices.Get(0)->TraceConnectWithoutContext("MacPromiscRx",
-                                                       MakeBoundCallback(&OnBridgeMacRx, &context, true));
-            devices.Get(0)->TraceConnectWithoutContext("PhyRxDrop",
-                                                       MakeBoundCallback(&OnBridgeMacRxDrop, &context, true));
-            devices.Get(1)->TraceConnectWithoutContext("MacTx", MakeBoundCallback(&OnBridgeMacTx, &context, false));
-            devices.Get(1)->TraceConnectWithoutContext("MacPromiscRx",
-                                                       MakeBoundCallback(&OnBridgeMacRx, &context, false));
-            devices.Get(1)->TraceConnectWithoutContext("PhyRxDrop",
-                                                       MakeBoundCallback(&OnBridgeMacRxDrop, &context, false));
-            tapBridge.SetAttribute("DeviceName", StringValue(bridgeGnbTaps[index]));
-            tapBridge.Install(pair.Get(0), devices.Get(0));
-            tapBridge.SetAttribute("DeviceName", StringValue(bridgeUpfTaps[index]));
-            tapBridge.Install(pair.Get(1), devices.Get(1));
+            const uint32_t upfIndex = gnbToUpf[gnbIndex];
+            const uint32_t gnbDeviceIndex = 0;
+            const uint32_t upfDeviceIndex = 1;
+            devices.Get(gnbDeviceIndex)->TraceConnectWithoutContext("MacTx",
+                                                                    MakeBoundCallback(&OnBridgeMacTx, &context, true));
+            devices.Get(gnbDeviceIndex)->TraceConnectWithoutContext(
+                "MacPromiscRx",
+                MakeBoundCallback(&OnBridgeMacRx, &context, true));
+            devices.Get(gnbDeviceIndex)->TraceConnectWithoutContext(
+                "PhyRxDrop",
+                MakeBoundCallback(&OnBridgeMacRxDrop, &context, true));
+            devices.Get(gnbDeviceIndex)->TraceConnectWithoutContext(
+                "PromiscSniffer",
+                MakeBoundCallback(&OnBridgePromiscSniffer, &context, true));
+            tapBridge.SetAttribute("DeviceName", StringValue(bridgeGnbTaps[gnbIndex]));
+            tapBridge.Install(segment.Get(gnbDeviceIndex), devices.Get(gnbDeviceIndex));
+
+            devices.Get(upfDeviceIndex)->TraceConnectWithoutContext("MacTx",
+                                                                    MakeBoundCallback(&OnBridgeMacTx, &context, false));
+            devices.Get(upfDeviceIndex)->TraceConnectWithoutContext(
+                "MacPromiscRx",
+                MakeBoundCallback(&OnBridgeMacRx, &context, false));
+            devices.Get(upfDeviceIndex)->TraceConnectWithoutContext(
+                "PhyRxDrop",
+                MakeBoundCallback(&OnBridgeMacRxDrop, &context, false));
+            devices.Get(upfDeviceIndex)->TraceConnectWithoutContext(
+                "PromiscSniffer",
+                MakeBoundCallback(&OnBridgePromiscSniffer, &context, false));
+            tapBridge.SetAttribute("DeviceName", StringValue(bridgeUpfTaps[gnbIndex]));
+            tapBridge.Install(segment.Get(upfDeviceIndex), devices.Get(upfDeviceIndex));
         }
     }
 
