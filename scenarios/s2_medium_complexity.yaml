@@ -31,6 +31,8 @@ slices:
       latency_ms: 8.0
       jitter_ms: 1.5
       loss_rate: 0.0003
+      jitter_ms: 1.5
+      loss_rate: 0.0003
       processing_delay_ms: 0.5
   - sst: 3
     sd: "000001"
@@ -190,12 +192,6 @@ ues:
         - gNB-2
         - gNB-1
     sessions:
-      - slice_ref: slice-1-000001
-        session_ref: imsi-208930000000009:app-drone-control:slice-1-000001:internet
-        apn: internet
-        type: IPv4
-        five_qi: 9
-        app_id: app-drone-control
       - slice_ref: slice-1-000001
         session_ref: imsi-208930000000009:app-4k-video:slice-1-000001:internet
         apn: internet

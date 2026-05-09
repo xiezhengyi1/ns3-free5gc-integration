@@ -85,6 +85,27 @@ def _resolve_slice_current_bandwidth(
     return _load_from_utilization(telemetry.get(utilization_key), total_bandwidth)
 
 
+def _load_from_utilization(utilization: object, total_bandwidth: object) -> float | None:
+    normalized_utilization = _numeric_value(utilization)
+    normalized_total = _numeric_value(total_bandwidth)
+    if normalized_utilization is None or normalized_total is None:
+        return None
+    return normalized_utilization * normalized_total
+
+
+def _resolve_slice_current_bandwidth(
+    telemetry: dict[str, object],
+    *,
+    current_bandwidth_key: str,
+    utilization_key: str,
+    total_bandwidth: object,
+) -> float | None:
+    direct_load = _numeric_value(telemetry.get(current_bandwidth_key))
+    if direct_load is not None:
+        return direct_load
+    return _load_from_utilization(telemetry.get(utilization_key), total_bandwidth)
+
+
 def _summary_node_row(row: dict[str, object]) -> dict[str, object]:
     return {
         "node_key": row["node_key"],

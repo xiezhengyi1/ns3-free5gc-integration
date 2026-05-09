@@ -187,6 +187,8 @@ def _format_bandwidth_string(value_mbps: float | None) -> str | None:
         return None
     kbps = max(1, int(round(value_mbps * 1000.0)))
     return f"{kbps} Kbps"
+    kbps = max(1, int(round(value_mbps * 1000.0)))
+    return f"{kbps} Kbps"
 
 
 def _flow_qos_ref(flow: FlowConfig, fallback_index: int) -> int:

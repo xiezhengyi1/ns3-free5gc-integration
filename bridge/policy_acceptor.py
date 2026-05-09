@@ -365,6 +365,9 @@ class PolicyRuntime:
                 "phase": "ns3_compliance"
                 if execution_status == "APPLIED" and compliance_status == "VIOLATED"
                 else "ns3_execution",
+                "phase": "ns3_compliance"
+                if execution_status == "APPLIED" and compliance_status == "VIOLATED"
+                else "ns3_execution",
             }
             time.sleep(self.poll_interval_ms / 1000.0)
 
