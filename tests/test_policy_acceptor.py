@@ -474,10 +474,83 @@ class PolicyGatewayTest(unittest.TestCase):
         )
 
         self.assertEqual(response["status"], "failed")
-        self.assertEqual(response["phase"], "ns3_apply")
+        self.assertEqual(response["phase"], "ns3_execution")
         self.assertEqual(response["execution_status"], "FAILED")
         self.assertEqual(response["compliance_status"], "VIOLATED")
         self.assertIn("did not converge", response["error"])
+
+    def test_applied_but_qos_violated_is_reported_separately(self) -> None:
+        _write_profiles(
+            self.flow_profile_file,
+            [_base_row(flow_id="flow-1", supi="imsi-208930000000001", slice_ref="slice-1-000001", slice_snssai="01000001")],
+        )
+        self._write_snapshot({"run_id": "run-7", "tick_index": 11, "flows": [], "ues": [], "slices": []})
+        runtime = self._build_runtime(StubDispatcher())
+        self._write_snapshot_later(
+            {
+                "run_id": "run-7",
+                "tick_index": 12,
+                "flows": [
+                    {
+                        "flow_id": "flow-1",
+                        "allocation": {
+                            "allocated_bandwidth_dl": 20,
+                            "allocated_bandwidth_ul": 10,
+                            "radio_capacity_dl_mbps": 20,
+                            "radio_capacity_ul_mbps": 10,
+                            "capacity_limited_dl": False,
+                            "capacity_limited_ul": False,
+                            "current_slice_snssai": "01000001",
+                        },
+                        "telemetry": {
+                            "latency": 55,
+                            "jitter": 8,
+                            "loss_rate": 0.08,
+                            "throughput_dl": 19,
+                            "throughput_ul": 9,
+                            "ran": {"ul": {"tx_pkts": 120, "rx_pkts": 70, "delivery_ratio": 0.58}},
+                        },
+                    }
+                ],
+                "ues": [],
+                "slices": [],
+            }
+        )
+
+        response = runtime.execute_policy(
+            {
+                "request_id": "req-7",
+                "session_id": "session-7",
+                "snapshot_id": "snapshot-7",
+                "policy_id": "smp-applied-violated",
+                "policy_type": "SmPolicyDecision",
+                "timeout_ms": 150,
+                "policy_details": {
+                    "policy_id": "smp-applied-violated",
+                    "target_type": "flow",
+                    "flow_id": "flow-1",
+                    "qosDecs": {
+                        "qos-flow-1": {
+                            "qosId": "qos-flow-1",
+                            "maxbrDl": "20",
+                            "maxbrUl": "10",
+                            "packetDelayBudget": 20,
+                            "packetErrorRate": "0.01",
+                            "jitterReq": 5,
+                        }
+                    },
+                },
+            }
+        )
+
+        self.assertEqual(response["status"], "failed")
+        self.assertEqual(response["phase"], "ns3_compliance")
+        self.assertEqual(response["execution_status"], "APPLIED")
+        self.assertEqual(response["compliance_status"], "VIOLATED")
+        self.assertEqual(
+            response["monitoring_data"]["violation_reason"],
+            "loss_budget_unmet",
+        )
 
     def test_launch_healthcheck_reports_upstream_state(self) -> None:
         _write_profiles(

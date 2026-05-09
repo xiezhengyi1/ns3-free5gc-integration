@@ -185,7 +185,8 @@ def _resolve_flow_session(scenario: ScenarioConfig, ue: UeConfig, flow: FlowConf
 def _format_bandwidth_string(value_mbps: float | None) -> str | None:
     if value_mbps is None or value_mbps <= 0:
         return None
-    return f"{value_mbps:g} Mbps"
+    kbps = max(1, int(round(value_mbps * 1000.0)))
+    return f"{kbps} Kbps"
 
 
 def _flow_qos_ref(flow: FlowConfig, fallback_index: int) -> int:

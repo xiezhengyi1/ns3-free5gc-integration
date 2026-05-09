@@ -26,11 +26,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class SubscriberBootstrapTest(unittest.TestCase):
-    def test_builds_payload_from_baseline_scenario(self) -> None:
-        scenario = load_scenario(PROJECT_ROOT / "scenarios" / "baseline_single_upf.yaml")
+    def test_builds_payload_from_single_slice_scenario(self) -> None:
+        scenario = load_scenario(PROJECT_ROOT / "scenarios" / "s1_basic_single_slice.yaml")
         payload = build_subscriber_payload(scenario, scenario.ues[0], "20893")
 
-        self.assertEqual(payload["ueId"], "imsi-208930000000001")
+        self.assertEqual(payload["ueId"], "imsi-208930000000008")
         self.assertEqual(payload["plmnID"], "20893")
         self.assertEqual(
             payload["AuthenticationSubscription"]["opc"]["opcValue"],
@@ -42,7 +42,7 @@ class SubscriberBootstrapTest(unittest.TestCase):
         )
         self.assertEqual(
             payload["AccessAndMobilitySubscriptionData"]["nssai"]["defaultSingleNssais"],
-            [{"sst": 1, "sd": "010203"}],
+            [{"sst": 2, "sd": "000001"}],
         )
         self.assertEqual(
             payload["SessionManagementSubscriptionData"][0]["dnnConfigurations"]["internet"]["pduSessionTypes"]["defaultSessionType"],
@@ -50,15 +50,30 @@ class SubscriberBootstrapTest(unittest.TestCase):
         )
         self.assertEqual(
             payload["SessionManagementSubscriptionData"][0]["dnnConfigurations"]["internet"]["5gQosProfile"]["5qi"],
-            9,
+            7,
+        )
+        self.assertEqual(
+            payload["SessionManagementSubscriptionData"][0]["dnnConfigurations"]["internet"]["sessionAmbr"],
+            {
+                "downlink": "3000 Kbps",
+                "uplink": "3800 Kbps",
+            },
+        )
+        self.assertEqual(
+            payload["QosFlows"][0]["mbrUL"],
+            "3800 Kbps",
+        )
+        self.assertEqual(
+            payload["QosFlows"][0]["gbrDL"],
+            "2400 Kbps",
         )
         self.assertIn(
-            "01010203",
+            "02000001",
             payload["SmfSelectionSubscriptionData"]["subscribedSnssaiInfos"],
         )
 
     def test_renders_payload_file_and_webui_url(self) -> None:
-        scenario = load_scenario(PROJECT_ROOT / "scenarios" / "baseline_single_upf.yaml")
+        scenario = load_scenario(PROJECT_ROOT / "scenarios" / "s1_basic_single_slice.yaml")
         run_id = generate_run_id("testsubs")
         rendered = render_run_assets(PROJECT_ROOT, scenario, run_id)
         try:
@@ -72,7 +87,7 @@ class SubscriberBootstrapTest(unittest.TestCase):
             payload = json.loads(assets.payload_files[0].read_text(encoding="utf-8"))
             self.assertEqual(assets.serving_plmn_id, "20893")
             self.assertEqual(assets.webui_base_url, "http://127.0.0.1:5000")
-            self.assertEqual(payload["ueId"], "imsi-208930000000001")
+            self.assertEqual(payload["ueId"], "imsi-208930000000008")
         finally:
             shutil.rmtree(rendered.run_dir, ignore_errors=True)
 
@@ -272,53 +287,43 @@ class SubscriberBootstrapTest(unittest.TestCase):
         )
 
     def test_binds_multi_slice_flows_to_explicit_sessions(self) -> None:
-        scenario = load_scenario(PROJECT_ROOT / "scenarios" / "baseline_ulcl_multi_slice_multi_gnb.yaml")
+        scenario = load_scenario(PROJECT_ROOT / "scenarios" / "s3_high_complexity.yaml")
 
         ue1_payload = build_subscriber_payload(scenario, scenario.ues[0], "20893")
         ue2_payload = build_subscriber_payload(scenario, scenario.ues[1], "20893")
 
         self.assertEqual(
             [item["singleNssai"]["sd"] for item in ue1_payload["SessionManagementSubscriptionData"]],
-            ["010203", "112233"],
+            ["000001"],
         )
         self.assertEqual(
-            ue1_payload["SessionManagementSubscriptionData"][1]["dnnConfigurations"]["enterprise"]["5gQosProfile"]["5qi"],
-            7,
+            ue2_payload["SessionManagementSubscriptionData"][1]["singleNssai"]["sd"],
+            "000002",
         )
         self.assertEqual(
-            ue1_payload["FlowRules"],
-            [
-                {
-                    "flowId": "ue1-video-flow",
-                    "appId": "ue1-video-app",
-                    "snssai": "01010203",
-                    "dnn": "internet",
-                    "qosRef": 1,
-                    "precedence": 1,
-                },
-                {
-                    "flowId": "ue1-control-flow",
-                    "appId": "ue1-control-app",
-                    "snssai": "01112233",
-                    "dnn": "enterprise",
-                    "qosRef": 2,
-                    "precedence": 2,
-                },
-            ],
+            [item["flowId"] for item in ue1_payload["FlowRules"]],
+            ["flow-9649"],
         )
         self.assertEqual(
             [item["sessionRef"] for item in ue1_payload["LocalPolicyData"]["flows"]],
-            ["ue1-video-session", "ue1-control-session"],
+            ["imsi-208930000000001:app-3982:slice-1-000001:internet"],
         )
         self.assertEqual(ue1_payload["ChargingDatas"], [])
-        self.assertEqual(ue2_payload["FlowRules"][0]["snssai"], "01112233")
-        self.assertEqual(ue2_payload["FlowRules"][0]["dnn"], "enterprise")
-        self.assertEqual(ue2_payload["FlowRules"][0]["precedence"], 1)
-        self.assertEqual(ue2_payload["LocalPolicyData"]["flows"][0]["sessionRef"], "ue2-telemetry-session")
+        self.assertEqual(
+            [item["snssai"] for item in ue2_payload["FlowRules"]],
+            ["02000001", "01000002"],
+        )
+        self.assertEqual(
+            [item["sessionRef"] for item in ue2_payload["LocalPolicyData"]["flows"]],
+            [
+                "imsi-208930000000002:app-5788:slice-2-000001:internet",
+                "imsi-208930000000002:app-5788:slice-1-000002:internet",
+            ],
+        )
         self.assertEqual(ue2_payload["ChargingDatas"], [])
 
     def test_emits_charging_payload_only_when_explicitly_configured(self) -> None:
-        scenario = load_scenario(PROJECT_ROOT / "scenarios" / "baseline_ulcl_multi_slice_multi_gnb.yaml")
+        scenario = load_scenario(PROJECT_ROOT / "scenarios" / "s3_high_complexity.yaml")
         charged_flow = replace(
             scenario.flows[0],
             charging_method="ONLINE",
@@ -333,11 +338,11 @@ class SubscriberBootstrapTest(unittest.TestCase):
             payload["ChargingDatas"],
             [
                 {
-                    "flowId": "ue1-video-flow",
-                    "appId": "ue1-video-app",
-                    "snssai": "01010203",
+                    "flowId": "flow-9649",
+                    "appId": "app-3982",
+                    "snssai": "01000001",
                     "dnn": "internet",
-                    "qosRef": 1,
+                    "qosRef": 0,
                     "chargingMethod": "ONLINE",
                     "quota": "1GB",
                     "unitCost": "0.05",

@@ -99,6 +99,7 @@ class SliceRecord:
     sd: str
     label: str | None = None
     resource: dict[str, Any] = field(default_factory=dict)
+    qos: dict[str, Any] = field(default_factory=dict)
     telemetry: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -109,6 +110,7 @@ class SliceRecord:
             sd=str(_require(payload, "sd")),
             label=payload.get("label"),
             resource=dict(payload.get("resource", {})),
+            qos=dict(payload.get("qos", {})),
             telemetry=dict(payload.get("telemetry", {})),
         )
 

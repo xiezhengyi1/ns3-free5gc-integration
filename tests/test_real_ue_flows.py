@@ -14,23 +14,45 @@ SPEC.loader.exec_module(MODULE)
 
 
 class RealUeFlowsTest(unittest.TestCase):
+    def test_effective_tick_window_uses_nominal_window_when_starting(self) -> None:
+        elapsed_ms, skipped_ticks = MODULE._effective_tick_window_ms(
+            last_tick=None,
+            last_sim_time_ms=None,
+            tick_index=0,
+            sim_time_ms=100,
+            nominal_tick_ms=100,
+        )
+
+        self.assertEqual(elapsed_ms, 100)
+        self.assertEqual(skipped_ticks, 0)
+
+    def test_effective_tick_window_drops_backlog_when_ticks_were_skipped(self) -> None:
+        elapsed_ms, skipped_ticks = MODULE._effective_tick_window_ms(
+            last_tick=0,
+            last_sim_time_ms=100,
+            tick_index=16,
+            sim_time_ms=1700,
+            nominal_tick_ms=100,
+        )
+
+        self.assertEqual(elapsed_ms, 100)
+        self.assertEqual(skipped_ticks, 15)
+
     def test_select_interface_for_session_uses_requested_index_when_available(self) -> None:
-        selected, used_fallback = MODULE._select_interface_for_session(
+        selected = MODULE._select_interface_for_session(
             [["uesimtun0", "10.0.0.1"], ["uesimtun1", "10.0.0.2"]],
             1,
         )
 
         self.assertEqual(selected, ["uesimtun1", "10.0.0.2"])
-        self.assertFalse(used_fallback)
 
-    def test_select_interface_for_session_falls_back_when_only_one_tunnel_exists(self) -> None:
-        selected, used_fallback = MODULE._select_interface_for_session(
+    def test_select_interface_for_session_returns_none_when_requested_tunnel_is_missing(self) -> None:
+        selected = MODULE._select_interface_for_session(
             [["uesimtun0", "10.0.0.1"]],
             1,
         )
 
-        self.assertEqual(selected, ["uesimtun0", "10.0.0.1"])
-        self.assertTrue(used_fallback)
+        self.assertIsNone(selected)
 
     def test_resolve_ue_interface_returns_none_when_no_tunnel_is_available(self) -> None:
         with mock.patch.object(MODULE, "_list_ue_interfaces", return_value=[]):
@@ -48,5 +70,5 @@ class RealUeFlowsTest(unittest.TestCase):
 
         self.assertEqual(
             resolved,
-            ({"iface": "uesimtun1", "ip": "10.0.0.2"}, False),
+            {"iface": "uesimtun1", "ip": "10.0.0.2"},
         )

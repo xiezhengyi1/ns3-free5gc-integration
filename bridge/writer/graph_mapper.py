@@ -64,6 +64,27 @@ def _numeric_value(value: object) -> float | None:
     return float(value)
 
 
+def _load_from_utilization(utilization: object, total_bandwidth: object) -> float | None:
+    normalized_utilization = _numeric_value(utilization)
+    normalized_total = _numeric_value(total_bandwidth)
+    if normalized_utilization is None or normalized_total is None:
+        return None
+    return normalized_utilization * normalized_total
+
+
+def _resolve_slice_current_bandwidth(
+    telemetry: dict[str, object],
+    *,
+    current_bandwidth_key: str,
+    utilization_key: str,
+    total_bandwidth: object,
+) -> float | None:
+    direct_load = _numeric_value(telemetry.get(current_bandwidth_key))
+    if direct_load is not None:
+        return direct_load
+    return _load_from_utilization(telemetry.get(utilization_key), total_bandwidth)
+
+
 def _summary_node_row(row: dict[str, object]) -> dict[str, object]:
     return {
         "node_key": row["node_key"],
@@ -208,7 +229,20 @@ def _flow_allocation_properties(
 
 
 def _flow_telemetry_properties(flow: FlowRecord) -> dict[str, object]:
-    properties = _dict_properties(flow.telemetry)
+    allowed_keys = {
+        "latency",
+        "jitter",
+        "loss_rate",
+        "throughput_dl",
+        "throughput_ul",
+        "packet_sent",
+        "packet_received",
+    }
+    properties = {
+        key: value
+        for key, value in _dict_properties(flow.telemetry).items()
+        if key in allowed_keys
+    }
     properties.setdefault("latency", flow.delay_ms)
     properties.setdefault("jitter", flow.jitter_ms)
     properties.setdefault("loss_rate", flow.loss_rate)
@@ -262,7 +296,22 @@ def _node_capacity_properties(raw_properties: dict[str, object]) -> dict[str, ob
 
 
 def _node_telemetry_properties(raw_properties: dict[str, object]) -> dict[str, object]:
-    return _dict_properties(raw_properties.get("telemetry"))
+    allowed_keys = {
+        "latency",
+        "jitter",
+        "loss_rate",
+        "utilization_dl",
+        "utilization_ul",
+        "allocated_dl_mbps",
+        "allocated_ul_mbps",
+        "demand_dl_mbps",
+        "demand_ul_mbps",
+    }
+    return {
+        key: value
+        for key, value in _dict_properties(raw_properties.get("telemetry")).items()
+        if key in allowed_keys
+    }
 
 
 @dataclass(slots=True)
@@ -773,44 +822,19 @@ def build_graph_snapshot_bundle(
             "sd": slice_record.sd,
         }
         summary_properties = dict(properties)
-        total_bandwidth_dl = 0.0
-        total_bandwidth_ul = 0.0
-        reserved_bandwidth_dl = 0.0
-        reserved_bandwidth_ul = 0.0
         current_bandwidth_dl = 0.0
         current_bandwidth_ul = 0.0
-        latency_targets: list[float] = []
-        jitter_targets: list[float] = []
-        loss_targets: list[float] = []
-        processing_delays: list[float] = []
         telemetry_latency: list[float] = []
         telemetry_jitter: list[float] = []
         telemetry_loss: list[float] = []
         if slice_flows:
             for flow in slice_flows:
-                flow_sla = _flow_sla_properties(flow)
                 flow_telemetry = _flow_telemetry_properties(flow)
-                total_bandwidth_dl += _numeric_value(flow_sla.get("bandwidth_dl")) or 0.0
-                total_bandwidth_ul += _numeric_value(flow_sla.get("bandwidth_ul")) or 0.0
-                reserved_bandwidth_dl += _numeric_value(flow_sla.get("guaranteed_bandwidth_dl")) or 0.0
-                reserved_bandwidth_ul += _numeric_value(flow_sla.get("guaranteed_bandwidth_ul")) or 0.0
                 current_bandwidth_dl += _numeric_value(flow_telemetry.get("throughput_dl")) or 0.0
                 current_bandwidth_ul += _numeric_value(flow_telemetry.get("throughput_ul")) or 0.0
-                latency_value = _numeric_value(flow_sla.get("latency"))
-                jitter_value = _numeric_value(flow_sla.get("jitter"))
-                loss_value = _numeric_value(flow_sla.get("loss_rate"))
-                processing_delay_value = _numeric_value(flow_sla.get("processing_delay"))
                 telemetry_latency_value = _numeric_value(flow_telemetry.get("latency"))
                 telemetry_jitter_value = _numeric_value(flow_telemetry.get("jitter"))
                 telemetry_loss_value = _numeric_value(flow_telemetry.get("loss_rate"))
-                if latency_value is not None:
-                    latency_targets.append(latency_value)
-                if jitter_value is not None:
-                    jitter_targets.append(jitter_value)
-                if loss_value is not None:
-                    loss_targets.append(loss_value)
-                if processing_delay_value is not None:
-                    processing_delays.append(processing_delay_value)
                 if telemetry_latency_value is not None:
                     telemetry_latency.append(telemetry_latency_value)
                 if telemetry_jitter_value is not None:
@@ -818,33 +842,59 @@ def build_graph_snapshot_bundle(
                 if telemetry_loss_value is not None:
                     telemetry_loss.append(telemetry_loss_value)
         slice_resource = _dict_properties(slice_record.resource)
-        explicit_slice_qos = _dict_properties(getattr(slice_record, "qos", None))
+        explicit_slice_qos = _dict_properties(slice_record.qos)
         slice_capacity = {
-            "total_bandwidth_dl": slice_resource.get("capacity_dl_mbps", total_bandwidth_dl),
-            "total_bandwidth_ul": slice_resource.get("capacity_ul_mbps", total_bandwidth_ul),
-            "reserved_bandwidth_dl": slice_resource.get("guaranteed_dl_mbps", reserved_bandwidth_dl),
-            "reserved_bandwidth_ul": slice_resource.get("guaranteed_ul_mbps", reserved_bandwidth_ul),
+            "total_bandwidth_dl": slice_resource.get("capacity_dl_mbps"),
+            "total_bandwidth_ul": slice_resource.get("capacity_ul_mbps"),
+            "guaranteed_bandwidth_dl": slice_resource.get("guaranteed_dl_mbps"),
+            "guaranteed_bandwidth_ul": slice_resource.get("guaranteed_ul_mbps"),
         }
+        slice_telemetry_input = _dict_properties(slice_record.telemetry)
+        telemetry_current_bandwidth_dl = _resolve_slice_current_bandwidth(
+            slice_telemetry_input,
+            current_bandwidth_key="current_bandwidth_dl",
+            utilization_key="utilization_dl",
+            total_bandwidth=slice_capacity["total_bandwidth_dl"],
+        )
+        telemetry_current_bandwidth_ul = _resolve_slice_current_bandwidth(
+            slice_telemetry_input,
+            current_bandwidth_key="current_bandwidth_ul",
+            utilization_key="utilization_ul",
+            total_bandwidth=slice_capacity["total_bandwidth_ul"],
+        )
         slice_load = {
-            "current_bandwidth_dl": _dict_properties(slice_record.telemetry).get("allocated_dl_mbps", current_bandwidth_dl),
-            "current_bandwidth_ul": _dict_properties(slice_record.telemetry).get("allocated_ul_mbps", current_bandwidth_ul),
-            "demand_bandwidth_dl": _dict_properties(slice_record.telemetry).get("demand_dl_mbps"),
-            "demand_bandwidth_ul": _dict_properties(slice_record.telemetry).get("demand_ul_mbps"),
+            "current_bandwidth_dl": (
+                telemetry_current_bandwidth_dl
+                if telemetry_current_bandwidth_dl is not None
+                else current_bandwidth_dl
+            ),
+            "current_bandwidth_ul": (
+                telemetry_current_bandwidth_ul
+                if telemetry_current_bandwidth_ul is not None
+                else current_bandwidth_ul
+            ),
+            "demand_bandwidth_dl": slice_telemetry_input.get("demand_dl_mbps"),
+            "demand_bandwidth_ul": slice_telemetry_input.get("demand_ul_mbps"),
         }
         slice_qos = {
-            "latency": explicit_slice_qos.get("latency", _average(latency_targets)),
-            "jitter": explicit_slice_qos.get("jitter", _average(jitter_targets)),
-            "loss_rate": explicit_slice_qos.get("loss_rate", _average(loss_targets)),
-            "processing_delay": explicit_slice_qos.get("processing_delay", _average(processing_delays)),
+            "latency": explicit_slice_qos.get("latency_ms", explicit_slice_qos.get("latency")),
+            "jitter": explicit_slice_qos.get("jitter_ms", explicit_slice_qos.get("jitter")),
+            "loss_rate": explicit_slice_qos.get("loss_rate"),
+            "processing_delay": explicit_slice_qos.get(
+                "processing_delay_ms",
+                explicit_slice_qos.get("processing_delay"),
+            ),
         }
         utilization_dl = (
-            current_bandwidth_dl / total_bandwidth_dl
-            if total_bandwidth_dl > 0
+            current_bandwidth_dl / slice_capacity["total_bandwidth_dl"]
+            if isinstance(slice_capacity["total_bandwidth_dl"], (int, float))
+            and slice_capacity["total_bandwidth_dl"] > 0
             else None
         )
         utilization_ul = (
-            current_bandwidth_ul / total_bandwidth_ul
-            if total_bandwidth_ul > 0
+            current_bandwidth_ul / slice_capacity["total_bandwidth_ul"]
+            if isinstance(slice_capacity["total_bandwidth_ul"], (int, float))
+            and slice_capacity["total_bandwidth_ul"] > 0
             else None
         )
         slice_telemetry = {
@@ -854,7 +904,7 @@ def build_graph_snapshot_bundle(
             "utilization_dl": utilization_dl,
             "utilization_ul": utilization_ul,
         }
-        slice_telemetry.update(_dict_properties(slice_record.telemetry))
+        slice_telemetry.update(slice_telemetry_input)
         properties["capacity"] = slice_capacity
         properties["load"] = slice_load
         properties["telemetry"] = slice_telemetry

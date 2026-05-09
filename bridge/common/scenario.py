@@ -37,6 +37,10 @@ def _optional_int(value: object) -> int | None:
     return int(value)
 
 
+def _slice_snssai(sst: int, sd: str) -> str:
+    return f"{sst:02d}{sd.lower()}"
+
+
 def _default_session_ref(ue_name: str, app_id: str, slice_ref: str, apn: str) -> str:
     return f"{ue_name}:{app_id}:{slice_ref}:{apn}"
 
@@ -119,6 +123,10 @@ class FlowConfig:
     service_type_id: int | None = None
     packet_size_bytes: float | None = None
     arrival_rate_pps: float | None = None
+    dl_packet_size_bytes: float | None = None
+    ul_packet_size_bytes: float | None = None
+    dl_arrival_rate_pps: float | None = None
+    ul_arrival_rate_pps: float | None = None
     current_slice_snssai: str | None = None
     allocated_bandwidth_dl_mbps: float | None = None
     allocated_bandwidth_ul_mbps: float | None = None
@@ -415,6 +423,60 @@ class ScenarioConfig:
                 raise ValueError(f"flow {flow.flow_id} references unknown app {flow.app_id}")
             target_ue = ue_by_name[flow.ue_name] if flow.ue_name is not None else ue_by_supi[flow.supi]
             self.resolve_flow_session(target_ue, flow)
+            slice_config = slices[flow.slice_ref]
+            expected_snssai = _slice_snssai(slice_config.sst, slice_config.sd)
+            if flow.current_slice_snssai is not None and flow.current_slice_snssai.lower() != expected_snssai:
+                raise ValueError(
+                    f"flow {flow.flow_id} uses current_slice_snssai {flow.current_slice_snssai}, "
+                    f"but slice {flow.slice_ref} resolves to {expected_snssai}"
+                )
+            if (
+                flow.dl_packet_size_bytes is not None
+                and flow.dl_arrival_rate_pps is not None
+                and flow.sla_target.bandwidth_dl_mbps is not None
+            ):
+                offered_dl_mbps = flow.dl_packet_size_bytes * 8.0 * flow.dl_arrival_rate_pps / 1_000_000.0
+                if offered_dl_mbps > flow.sla_target.bandwidth_dl_mbps + 1e-9:
+                    raise ValueError(
+                        f"flow {flow.flow_id} offered DL load {offered_dl_mbps:.6f} Mbps exceeds "
+                        f"sla_target.bandwidth_dl_mbps {flow.sla_target.bandwidth_dl_mbps:.6f}"
+                    )
+            if (
+                flow.ul_packet_size_bytes is not None
+                and flow.ul_arrival_rate_pps is not None
+                and flow.sla_target.bandwidth_ul_mbps is not None
+            ):
+                offered_ul_mbps = flow.ul_packet_size_bytes * 8.0 * flow.ul_arrival_rate_pps / 1_000_000.0
+                if offered_ul_mbps > flow.sla_target.bandwidth_ul_mbps + 1e-9:
+                    raise ValueError(
+                        f"flow {flow.flow_id} offered UL load {offered_ul_mbps:.6f} Mbps exceeds "
+                        f"sla_target.bandwidth_ul_mbps {flow.sla_target.bandwidth_ul_mbps:.6f}"
+                    )
+            if slice_config.qos is not None:
+                if (
+                    flow.sla_target.latency_ms is not None
+                    and flow.sla_target.latency_ms < slice_config.qos.latency_ms
+                ):
+                    raise ValueError(
+                        f"flow {flow.flow_id} latency target {flow.sla_target.latency_ms} ms is stricter than "
+                        f"slice {flow.slice_ref} latency {slice_config.qos.latency_ms} ms"
+                    )
+                if (
+                    flow.sla_target.jitter_ms is not None
+                    and flow.sla_target.jitter_ms < slice_config.qos.jitter_ms
+                ):
+                    raise ValueError(
+                        f"flow {flow.flow_id} jitter target {flow.sla_target.jitter_ms} ms is stricter than "
+                        f"slice {flow.slice_ref} jitter {slice_config.qos.jitter_ms} ms"
+                    )
+                if (
+                    flow.sla_target.loss_rate is not None
+                    and flow.sla_target.loss_rate < slice_config.qos.loss_rate
+                ):
+                    raise ValueError(
+                        f"flow {flow.flow_id} loss target {flow.sla_target.loss_rate} is stricter than "
+                        f"slice {flow.slice_ref} loss {slice_config.qos.loss_rate}"
+                    )
         if self.ns3.slice_isolation:
             for slice_config in self.slices:
                 resource = slice_config.resource
@@ -593,6 +655,14 @@ class ScenarioConfig:
                 service_type_id=_optional_int(item.get("service_type_id")),
                 packet_size_bytes=_optional_float(item.get("packet_size_bytes")),
                 arrival_rate_pps=_optional_float(item.get("arrival_rate_pps")),
+                dl_packet_size_bytes=_optional_float(item.get("dl_packet_size_bytes"))
+                or _optional_float(item.get("packet_size_bytes")),
+                ul_packet_size_bytes=_optional_float(item.get("ul_packet_size_bytes"))
+                or _optional_float(item.get("packet_size_bytes")),
+                dl_arrival_rate_pps=_optional_float(item.get("dl_arrival_rate_pps"))
+                or _optional_float(item.get("arrival_rate_pps")),
+                ul_arrival_rate_pps=_optional_float(item.get("ul_arrival_rate_pps"))
+                or _optional_float(item.get("arrival_rate_pps")),
                 current_slice_snssai=item.get("current_slice_snssai"),
                 allocated_bandwidth_dl_mbps=_optional_float(item.get("allocated_bandwidth_dl_mbps")),
                 allocated_bandwidth_ul_mbps=_optional_float(item.get("allocated_bandwidth_ul_mbps")),
