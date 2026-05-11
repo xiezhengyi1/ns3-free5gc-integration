@@ -265,6 +265,8 @@ double ResolvePacketSizeBytes(const FlowProfile& profile, bool downlink);
 
 double ResolveArrivalRatePps(const FlowProfile& profile, bool downlink);
 
+double RequestedBandwidthUlMbps(const FlowProfile& profile);
+
 struct SliceResourceProfile
 {
     std::string sliceId;
@@ -794,6 +796,14 @@ struct SnapshotContext
         uint64_t ipObservedPgwLocalDeliverUl = 0;
         uint64_t ipObservedPgwForwardUl = 0;
         uint64_t ipObservedPgwDropUl = 0;
+        uint64_t bridgeObservedGnbMacTxUl = 0;
+        uint64_t bridgeObservedUpfPromiscRxUl = 0;
+        uint64_t bridgeObservedUpfMacRxDropUl = 0;
+        uint32_t detailedTraceLogs = 0;
+        uint64_t lastLoggedUeTxUl = 0;
+        uint64_t lastLoggedPgwForwardUl = 0;
+        uint32_t consecutiveUplinkStallTicks = 0;
+        uint32_t uplinkStallLogs = 0;
         uint64_t lastSnapshotPacketSent = 0;
         uint64_t lastSnapshotPacketReceived = 0;
         uint64_t lastSnapshotPacketSentDl = 0;
@@ -890,6 +900,8 @@ struct SnapshotContext
     std::map<uint16_t, FlowRuntimeState> flowRuntimeByPort;
     std::map<uint16_t, ExternalFlowCounters> externalFlowCountersByPort;
     ExternalTraceDebug externalTraceDebug;
+    uint64_t unmatchedIpv4TraceLogs = 0;
+    uint64_t unmatchedIpv4DecisionLogs = 0;
     std::map<std::string, SliceResourceProfile> sliceResources;
     std::map<std::string, SliceRuntimeTelemetry> sliceTelemetry;
     Ptr<FlowMonitor> monitor;
@@ -1054,6 +1066,13 @@ SplitFlowUdpApp::ResolveInterval() const
         return Seconds(1.0);
     }
     double ratePps = ResolveArrivalRatePps(m_runtime->profile, m_downlink);
+    const double packetSizeBytes = ResolvePacketSizeBytes(m_runtime->profile, m_downlink);
+    const double allocatedBandwidthMbps =
+        m_downlink ? m_runtime->profile.allocatedBandwidthDlMbps : m_runtime->profile.allocatedBandwidthUlMbps;
+    if (allocatedBandwidthMbps > 0.0 && packetSizeBytes > 0.0)
+    {
+        ratePps = allocatedBandwidthMbps * 1e6 / 8.0 / packetSizeBytes;
+    }
     ratePps = std::max(1.0, ratePps);
     return Seconds(1.0 / ratePps);
 }
@@ -1276,6 +1295,25 @@ ExtractExternalFlowKey(const SnapshotContext* context,
         return false;
     }
 
+    if (context->flowRuntimeByPort.find(destinationPort) != context->flowRuntimeByPort.end())
+    {
+        debug->matchDestinationPort++;
+        *port = destinationPort;
+        *uplink = false;
+        return true;
+    }
+
+    for (const auto& [flowPort, runtime] : context->flowRuntimeByPort)
+    {
+        if (runtime.uplinkPort == destinationPort && runtime.uplinkSourcePort == sourcePort)
+        {
+            debug->matchSourcePort++;
+            *port = flowPort;
+            *uplink = true;
+            return true;
+        }
+    }
+
     const auto resolveMappedPort = [&](uint16_t candidatePort,
                                        bool directionUplink,
                                        bool matchedAsDestination) -> bool {
@@ -1306,20 +1344,6 @@ ExtractExternalFlowKey(const SnapshotContext* context,
         return true;
     };
 
-    if (context->flowRuntimeByPort.find(destinationPort) != context->flowRuntimeByPort.end())
-    {
-        debug->matchDestinationPort++;
-        *port = destinationPort;
-        *uplink = true;
-        return true;
-    }
-    if (context->flowRuntimeByPort.find(sourcePort) != context->flowRuntimeByPort.end())
-    {
-        debug->matchSourcePort++;
-        *port = sourcePort;
-        *uplink = false;
-        return true;
-    }
     if (resolveMappedPort(destinationPort, false, true))
     {
         return true;
@@ -1444,6 +1468,241 @@ enum class Ipv4TraceRole
     RemoteRx,
 };
 
+const char*
+TraceRoleName(Ipv4TraceRole role)
+{
+    switch (role)
+    {
+    case Ipv4TraceRole::UeTx:
+        return "ue-tx";
+    case Ipv4TraceRole::UeRx:
+        return "ue-rx";
+    case Ipv4TraceRole::PgwRx:
+        return "pgw-rx";
+    case Ipv4TraceRole::PgwTx:
+        return "pgw-tx";
+    case Ipv4TraceRole::PgwLocalDeliver:
+        return "pgw-local-deliver";
+    case Ipv4TraceRole::PgwForward:
+        return "pgw-forward";
+    case Ipv4TraceRole::PgwDrop:
+        return "pgw-drop";
+    case Ipv4TraceRole::RemoteTx:
+        return "remote-tx";
+    case Ipv4TraceRole::RemoteRx:
+        return "remote-rx";
+    }
+    return "unknown";
+}
+
+bool
+IsDetailedTraceTarget(const SnapshotContext::FlowRuntimeState& runtime)
+{
+    return runtime.profile.flowId == "flow-7528" || runtime.profile.flowId == "flow-4493" ||
+           runtime.profile.flowId == "flow-8178" || runtime.profile.flowId == "flow-8036" ||
+           runtime.profile.flowId == "flow-7178";
+}
+
+void
+MaybeEmitUplinkStallTrace(SnapshotContext* context, SnapshotContext::FlowRuntimeState* runtime)
+{
+    if (context == nullptr || runtime == nullptr || !IsDetailedTraceTarget(*runtime))
+    {
+        return;
+    }
+    if (runtime->ipObservedUeTxUl > runtime->lastLoggedUeTxUl &&
+        runtime->ipObservedPgwForwardUl == runtime->lastLoggedPgwForwardUl)
+    {
+        ++runtime->consecutiveUplinkStallTicks;
+    }
+    else
+    {
+        runtime->consecutiveUplinkStallTicks = 0;
+    }
+
+    runtime->lastLoggedUeTxUl = runtime->ipObservedUeTxUl;
+    runtime->lastLoggedPgwForwardUl = runtime->ipObservedPgwForwardUl;
+
+    if (runtime->consecutiveUplinkStallTicks < 3 || runtime->uplinkStallLogs >= 8)
+    {
+        return;
+    }
+
+    ++runtime->uplinkStallLogs;
+    const auto& ueRadio =
+        runtime->ueIndex < context->ueRadioTelemetry.size() ? context->ueRadioTelemetry[runtime->ueIndex]
+                                                            : SnapshotContext::UeRadioTelemetry{};
+    const uint32_t gnbIndex =
+        runtime->ueIndex < context->ueToGnb.size() ? context->ueToGnb[runtime->ueIndex] : 0;
+    const auto& gnbRadio =
+        gnbIndex < context->gnbRadioTelemetry.size() ? context->gnbRadioTelemetry[gnbIndex]
+                                                     : SnapshotContext::GnbRuntimeTelemetry{};
+    std::cerr << "[split-ns3] uplink-stall"
+              << " tick=" << context->tickIndex
+              << " flow_id=" << runtime->profile.flowId
+              << " ue_index=" << runtime->ueIndex
+              << " gnb_index=" << gnbIndex
+              << " ue_ip="
+              << (runtime->ueIndex < context->ueIps.size() ? ToString(context->ueIps[runtime->ueIndex])
+                                                           : "0.0.0.0")
+              << " session_ref=" << runtime->profile.sessionRef
+              << " slice_ref=" << runtime->profile.sliceRef
+              << " app_id=" << runtime->profile.appId
+              << " stall_ticks=" << runtime->consecutiveUplinkStallTicks
+              << " ue_tx_ul=" << runtime->ipObservedUeTxUl
+              << " pgw_rx_ul=" << runtime->ipObservedPgwRxUl
+              << " pgw_fwd_ul=" << runtime->ipObservedPgwForwardUl
+              << " remote_rx_ul=" << runtime->ipObservedRemoteRxUl
+              << " alloc_ul_mbps=" << runtime->profile.allocatedBandwidthUlMbps
+              << " requested_ul_mbps=" << RequestedBandwidthUlMbps(runtime->profile)
+              << " ue_ul_buffer_bytes=" << ueRadio.ulBufferBytes
+              << " ue_dl_buffer_bytes=" << ueRadio.dlBufferBytes
+              << " gnb_radio_capacity_ul_mbps=" << gnbRadio.radioCapacityUlMbps
+              << " gnb_ul_scheduled_bytes=" << gnbRadio.ulScheduledBytes
+              << " gnb_ul_prb_utilization=" << gnbRadio.ulPrbUtilization
+              << std::endl;
+}
+
+bool
+ShouldEmitDetailedTrace(const SnapshotContext* context, const SnapshotContext::FlowRuntimeState& runtime)
+{
+    if (context == nullptr)
+    {
+        return false;
+    }
+    if (!IsDetailedTraceTarget(runtime))
+    {
+        return false;
+    }
+    if (context->tickIndex < 24)
+    {
+        return false;
+    }
+    return runtime.detailedTraceLogs < 24;
+}
+
+void
+EmitDetailedTrace(SnapshotContext* context,
+                  SnapshotContext::FlowRuntimeState* runtime,
+                  Ipv4TraceRole role,
+                  const Ipv4Header* ipv4Header,
+                  uint16_t sourcePort,
+                  uint16_t destinationPort,
+                  const char* note)
+{
+    if (context == nullptr || runtime == nullptr || !ShouldEmitDetailedTrace(context, *runtime))
+    {
+        return;
+    }
+    ++runtime->detailedTraceLogs;
+    std::cerr << "[split-ns3] detailed-ul-trace"
+              << " tick=" << context->tickIndex
+              << " flow_id=" << runtime->profile.flowId
+              << " role=" << TraceRoleName(role)
+              << " note=" << note
+              << " src_ip=" << (ipv4Header != nullptr ? ToString(ipv4Header->GetSource()) : "0.0.0.0")
+              << " dst_ip=" << (ipv4Header != nullptr ? ToString(ipv4Header->GetDestination()) : "0.0.0.0")
+              << " src_port=" << sourcePort
+              << " dst_port=" << destinationPort
+              << " ul_port=" << runtime->uplinkPort
+              << " ul_source_port=" << runtime->uplinkSourcePort
+              << " ue_ip="
+              << (runtime->ueIndex < context->ueIps.size() ? ToString(context->ueIps[runtime->ueIndex]) : "0.0.0.0")
+              << " pgw_rx_ul=" << runtime->ipObservedPgwRxUl
+              << " pgw_fwd_ul=" << runtime->ipObservedPgwForwardUl
+              << " pgw_local_ul=" << runtime->ipObservedPgwLocalDeliverUl
+              << " pgw_drop_ul=" << runtime->ipObservedPgwDropUl
+              << " remote_rx_ul=" << runtime->ipObservedRemoteRxUl
+              << std::endl;
+}
+
+void
+LogUnmatchedIpv4Trace(SnapshotContext* context, Ipv4TraceRole role, Ptr<const Packet> packet)
+{
+    if (context == nullptr || packet == nullptr || context->unmatchedIpv4TraceLogs >= 40)
+    {
+        return;
+    }
+
+    SnapshotContext::TraceParseCounters debug;
+    uint16_t sourcePort = 0;
+    uint16_t destinationPort = 0;
+    const bool parsed = ExtractUdpTupleFromPacket(&debug, packet, &sourcePort, &destinationPort);
+    const bool isRelevantTargetUplinkPort =
+        sourcePort == 25003 || sourcePort == 25004 || sourcePort == 25007 || sourcePort == 25008 ||
+        sourcePort == 25009 || destinationPort == 6003 || destinationPort == 6004 ||
+        destinationPort == 6007 || destinationPort == 6008 || destinationPort == 6009;
+    if (role != Ipv4TraceRole::PgwRx || !parsed || !isRelevantTargetUplinkPort)
+    {
+        return;
+    }
+    ++context->unmatchedIpv4TraceLogs;
+    std::cerr << "[split-ns3] unmatched-ipv4-trace"
+              << " count=" << context->unmatchedIpv4TraceLogs
+              << " tick=" << context->tickIndex
+              << " role=" << TraceRoleName(role)
+              << " parsed=" << (parsed ? "true" : "false")
+              << " src_port=" << sourcePort
+              << " dst_port=" << destinationPort
+              << " parse_ok_outer_udp=" << debug.parseOkOuterUdp
+              << " parse_ok_gtpu_inner_udp=" << debug.parseOkGtpuInnerUdp
+              << " parse_non_udp_outer=" << debug.parseNonUdpOuter
+              << " parse_gtpu_no_inner_ipv4=" << debug.parseGtpuNoInnerIpv4
+              << " parse_gtpu_inner_non_udp=" << debug.parseGtpuInnerNonUdp
+              << " unmatched_ports=" << debug.unmatchedPorts
+              << std::endl;
+}
+
+void
+LogUnmatchedIpv4Decision(SnapshotContext* context,
+                         Ipv4TraceRole role,
+                         const Ipv4Header& ipv4Header,
+                         Ptr<const Packet> payload)
+{
+    if (context == nullptr || payload == nullptr || context->unmatchedIpv4DecisionLogs >= 40)
+    {
+        return;
+    }
+
+    const bool relevantSource = ipv4Header.GetSource() == Ipv4Address("7.0.0.4") ||
+                                ipv4Header.GetSource() == Ipv4Address("7.0.0.6");
+    if (!relevantSource)
+    {
+        return;
+    }
+
+    const uint32_t payloadSize = payload->GetSize();
+    if (payloadSize < 4)
+    {
+        return;
+    }
+    std::vector<uint8_t> bytes(payloadSize);
+    payload->CopyData(bytes.data(), payloadSize);
+    const uint16_t sourcePort = static_cast<uint16_t>((static_cast<uint16_t>(bytes[0]) << 8) |
+                                                      static_cast<uint16_t>(bytes[1]));
+    const uint16_t destinationPort = static_cast<uint16_t>((static_cast<uint16_t>(bytes[2]) << 8) |
+                                                           static_cast<uint16_t>(bytes[3]));
+    const bool relevantPort = sourcePort == 25003 || sourcePort == 25004 || sourcePort == 25007 ||
+                              sourcePort == 25008 || sourcePort == 25009 || destinationPort == 6003 ||
+                              destinationPort == 6004 || destinationPort == 6007 || destinationPort == 6008 ||
+                              destinationPort == 6009;
+    if (!relevantPort)
+    {
+        return;
+    }
+
+    ++context->unmatchedIpv4DecisionLogs;
+    std::cerr << "[split-ns3] unmatched-ipv4-decision"
+              << " count=" << context->unmatchedIpv4DecisionLogs
+              << " tick=" << context->tickIndex
+              << " role=" << TraceRoleName(role)
+              << " src_ip=" << ToString(ipv4Header.GetSource())
+              << " dst_ip=" << ToString(ipv4Header.GetDestination())
+              << " src_port=" << sourcePort
+              << " dst_port=" << destinationPort
+              << std::endl;
+}
+
 void
 OnIpv4Trace(SnapshotContext* context, Ipv4TraceRole role, Ptr<const Packet> packet, Ptr<Ipv4> ipv4, uint32_t interface)
 {
@@ -1453,6 +1712,10 @@ OnIpv4Trace(SnapshotContext* context, Ipv4TraceRole role, Ptr<const Packet> pack
     bool uplink = false;
     if (!ResolveIpv4UdpFlow(context, packet, &runtime, &uplink) || runtime == nullptr)
     {
+        if (role == Ipv4TraceRole::PgwRx)
+        {
+            LogUnmatchedIpv4Trace(context, role, packet);
+        }
         return;
     }
 
@@ -1486,6 +1749,14 @@ OnIpv4Trace(SnapshotContext* context, Ipv4TraceRole role, Ptr<const Packet> pack
         if (uplink)
         {
             ++runtime->ipObservedPgwRxUl;
+            SnapshotContext::TraceParseCounters debug;
+            uint16_t sourcePort = 0;
+            uint16_t destinationPort = 0;
+            if (ExtractUdpTupleFromPacket(&debug, packet, &sourcePort, &destinationPort))
+            {
+                Ipv4Header header;
+                EmitDetailedTrace(context, runtime, role, nullptr, sourcePort, destinationPort, "matched-pgw-rx");
+            }
         }
         break;
     case Ipv4TraceRole::PgwTx:
@@ -1510,6 +1781,10 @@ OnIpv4DecisionTrace(SnapshotContext* context,
     if (!ResolveIpv4UdpFlowFromHeader(context, header, packet, &runtime, &uplink) || runtime == nullptr ||
         !uplink)
     {
+        if (role == Ipv4TraceRole::PgwLocalDeliver || role == Ipv4TraceRole::PgwForward || role == Ipv4TraceRole::PgwDrop)
+        {
+            LogUnmatchedIpv4Decision(context, role, header, packet);
+        }
         return;
     }
 
@@ -1532,6 +1807,18 @@ OnIpv4DecisionTrace(SnapshotContext* context,
         ++runtime->ipObservedPgwDropUl;
         break;
     }
+
+    const uint32_t payloadSize = packet != nullptr ? packet->GetSize() : 0;
+    if (payloadSize >= 4)
+    {
+        std::vector<uint8_t> bytes(payloadSize);
+        packet->CopyData(bytes.data(), payloadSize);
+        const uint16_t sourcePort = static_cast<uint16_t>((static_cast<uint16_t>(bytes[0]) << 8) |
+                                                          static_cast<uint16_t>(bytes[1]));
+        const uint16_t destinationPort = static_cast<uint16_t>((static_cast<uint16_t>(bytes[2]) << 8) |
+                                                               static_cast<uint16_t>(bytes[3]));
+        EmitDetailedTrace(context, runtime, role, &header, sourcePort, destinationPort, "matched-decision");
+    }
 }
 
 void
@@ -1550,9 +1837,21 @@ OnIpv4DropTrace(SnapshotContext* context,
     if (!ResolveIpv4UdpFlowFromHeader(context, header, packet, &runtime, &uplink) || runtime == nullptr ||
         !uplink)
     {
+        LogUnmatchedIpv4Decision(context, Ipv4TraceRole::PgwDrop, header, packet);
         return;
     }
     ++runtime->ipObservedPgwDropUl;
+    const uint32_t payloadSize = packet != nullptr ? packet->GetSize() : 0;
+    if (payloadSize >= 4)
+    {
+        std::vector<uint8_t> bytes(payloadSize);
+        packet->CopyData(bytes.data(), payloadSize);
+        const uint16_t sourcePort = static_cast<uint16_t>((static_cast<uint16_t>(bytes[0]) << 8) |
+                                                          static_cast<uint16_t>(bytes[1]));
+        const uint16_t destinationPort = static_cast<uint16_t>((static_cast<uint16_t>(bytes[2]) << 8) |
+                                                               static_cast<uint16_t>(bytes[3]));
+        EmitDetailedTrace(context, runtime, Ipv4TraceRole::PgwDrop, &header, sourcePort, destinationPort, "matched-drop-trace");
+    }
 }
 
 void
@@ -1571,6 +1870,11 @@ OnBridgeMacTx(SnapshotContext* context, bool gnbSide, Ptr<const Packet> packet)
     if (!ExtractExternalFlowKey(context, &context->externalTraceDebug.macTx, packet, &port, &uplink))
     {
         return;
+    }
+    auto runtimeIt = context->flowRuntimeByPort.find(port);
+    if (runtimeIt != context->flowRuntimeByPort.end() && gnbSide && uplink)
+    {
+        runtimeIt->second.bridgeObservedGnbMacTxUl++;
     }
 }
 
@@ -1591,6 +1895,7 @@ OnBridgeMacRx(SnapshotContext* context, bool gnbSide, Ptr<const Packet> packet)
     {
         return;
     }
+    auto runtimeIt = context->flowRuntimeByPort.find(port);
     auto& counters = context->externalFlowCountersByPort[port];
     if (gnbSide && uplink)
     {
@@ -1600,6 +1905,10 @@ OnBridgeMacRx(SnapshotContext* context, bool gnbSide, Ptr<const Packet> packet)
     else if (!gnbSide && uplink)
     {
         counters.rxPacketsUl++;
+        if (runtimeIt != context->flowRuntimeByPort.end())
+        {
+            runtimeIt->second.bridgeObservedUpfPromiscRxUl++;
+        }
         if (!counters.txTimesUl.empty())
         {
             const double delayMs = (Simulator::Now() - counters.txTimesUl.front()).GetSeconds() * 1000.0;
@@ -1655,10 +1964,15 @@ OnBridgeMacRxDrop(SnapshotContext* context, bool gnbSide, Ptr<const Packet> pack
     {
         return;
     }
+    auto runtimeIt = context->flowRuntimeByPort.find(port);
     auto& counters = context->externalFlowCountersByPort[port];
     if (!gnbSide && uplink)
     {
         counters.dropPacketsUl++;
+        if (runtimeIt != context->flowRuntimeByPort.end())
+        {
+            runtimeIt->second.bridgeObservedUpfMacRxDropUl++;
+        }
         if (!counters.txTimesUl.empty())
         {
             counters.txTimesUl.pop_front();
@@ -2458,7 +2772,7 @@ EmitSnapshot(SnapshotContext* context)
         ApplySlaDrivenAllocations(context);
     }
     UpdateUeAndGnbRadioTelemetry(context);
-    for (const auto& [port, runtime] : context->flowRuntimeByPort)
+    for (auto& [port, runtime] : context->flowRuntimeByPort)
     {
         const uint64_t rxBytesDl = runtime.downlinkSink != nullptr ? runtime.downlinkSink->GetTotalRx() : 0;
         const uint64_t rxBytesUl = runtime.uplinkSink != nullptr ? runtime.uplinkSink->GetTotalRx() : 0;
@@ -2495,7 +2809,11 @@ EmitSnapshot(SnapshotContext* context)
                   << " ip_remote_rx_ul=" << runtime.ipObservedRemoteRxUl
                   << " ip_remote_tx_dl=" << runtime.ipObservedRemoteTxDl
                   << " ip_ue_rx_dl=" << runtime.ipObservedUeRxDl
+                  << " bridge_gnb_mac_tx_ul=" << runtime.bridgeObservedGnbMacTxUl
+                  << " bridge_upf_promisc_rx_ul=" << runtime.bridgeObservedUpfPromiscRxUl
+                  << " bridge_upf_mac_rx_drop_ul=" << runtime.bridgeObservedUpfMacRxDropUl
                   << std::endl;
+        MaybeEmitUplinkStallTrace(context, &runtime);
     }
 
     context->monitor->CheckForLostPackets();
@@ -2854,6 +3172,29 @@ EmitSnapshot(SnapshotContext* context)
              << Quote("throughput_ul") << ":" << throughputUl << ","
              << Quote("tick_delta_packet_sent") << ":" << tickDeltaPacketSent << ","
              << Quote("tick_delta_packet_received") << ":" << tickDeltaPacketReceived << ","
+             << Quote("ip_path") << ":{" << Quote("ue_tx_ul") << ":"
+             << (runtimeState != nullptr ? runtimeState->ipObservedUeTxUl : 0) << ","
+             << Quote("pgw_rx_ul") << ":" << (runtimeState != nullptr ? runtimeState->ipObservedPgwRxUl : 0)
+             << "," << Quote("pgw_tx_ul") << ":"
+             << (runtimeState != nullptr ? runtimeState->ipObservedPgwTxUl : 0) << ","
+             << Quote("pgw_local_deliver_ul") << ":"
+             << (runtimeState != nullptr ? runtimeState->ipObservedPgwLocalDeliverUl : 0) << ","
+             << Quote("pgw_forward_ul") << ":"
+             << (runtimeState != nullptr ? runtimeState->ipObservedPgwForwardUl : 0) << ","
+             << Quote("pgw_drop_ul") << ":"
+             << (runtimeState != nullptr ? runtimeState->ipObservedPgwDropUl : 0) << ","
+             << Quote("remote_rx_ul") << ":"
+             << (runtimeState != nullptr ? runtimeState->ipObservedRemoteRxUl : 0) << ","
+             << Quote("remote_tx_dl") << ":"
+             << (runtimeState != nullptr ? runtimeState->ipObservedRemoteTxDl : 0) << ","
+             << Quote("ue_rx_dl") << ":" << (runtimeState != nullptr ? runtimeState->ipObservedUeRxDl : 0)
+             << "," << Quote("bridge_gnb_mac_tx_ul") << ":"
+             << (runtimeState != nullptr ? runtimeState->bridgeObservedGnbMacTxUl : 0) << ","
+             << Quote("bridge_upf_promisc_rx_ul") << ":"
+             << (runtimeState != nullptr ? runtimeState->bridgeObservedUpfPromiscRxUl : 0) << ","
+             << Quote("bridge_upf_mac_rx_drop_ul") << ":"
+             << (runtimeState != nullptr ? runtimeState->bridgeObservedUpfMacRxDropUl : 0)
+             << "},"
              << Quote("ran") << ":{" << Quote("ul") << ":{" << Quote("tx_pkts") << ":" << ranUlTxPkts << ","
              << Quote("rx_pkts") << ":" << ranUlRxPkts << "," << Quote("drop_before_pgw_pkts") << ":"
              << ranUlDropBeforePgwPkts << "," << Quote("delivery_ratio") << ":" << ranUlDeliveryRatio
@@ -3166,6 +3507,38 @@ EmitSnapshot(SnapshotContext* context)
                    << ")";
             return stream.str();
         };
+        auto appendParseSummaryJson = [&](std::ostream& stream,
+                                          const char* label,
+                                          const SnapshotContext::TraceParseCounters& counters) {
+            stream << Quote(label) << ":{" << Quote("extract_calls") << ":" << counters.extractCalls << ","
+                   << Quote("non_ipv4_ether") << ":" << counters.ethernetNonIpv4 << ","
+                   << Quote("ok_outer_udp") << ":" << counters.parseOkOuterUdp << ","
+                   << Quote("ok_gtpu_inner_udp") << ":" << counters.parseOkGtpuInnerUdp << ","
+                   << Quote("no_ipv4") << ":" << counters.parseNoIpv4 << ","
+                   << Quote("non_udp_outer") << ":" << counters.parseNonUdpOuter << ","
+                   << Quote("no_outer_udp") << ":" << counters.parseNoOuterUdp << ","
+                   << Quote("gtpu_no_header") << ":" << counters.parseGtpuNoHeader << ","
+                   << Quote("gtpu_no_inner_ipv4") << ":" << counters.parseGtpuNoInnerIpv4 << ","
+                   << Quote("gtpu_inner_non_udp") << ":" << counters.parseGtpuInnerNonUdp << ","
+                   << Quote("gtpu_no_inner_udp") << ":" << counters.parseGtpuNoInnerUdp << ","
+                   << Quote("match_destination_port") << ":" << counters.matchDestinationPort << ","
+                   << Quote("match_source_port") << ":" << counters.matchSourcePort << ","
+                   << Quote("unmatched_ports") << ":" << counters.unmatchedPorts << ","
+                   << Quote("ethernet_types") << ":{";
+            bool firstEtherType = true;
+            for (const auto& [etherType, count] : counters.ethernetTypes)
+            {
+                if (!firstEtherType)
+                {
+                    stream << ",";
+                }
+                firstEtherType = false;
+                std::ostringstream key;
+                key << "0x" << std::hex << etherType;
+                stream << Quote(key.str()) << ":" << count;
+            }
+            stream << "}}";
+        };
         std::cerr << "[external-trace] tick=" << context->tickIndex
                   << " macTx(gnb=" << debug.macTxGnb << ",upf=" << debug.macTxUpf << ")"
                   << " macRx(gnb=" << debug.macRxGnb << ",upf=" << debug.macRxUpf << ")"
@@ -3177,6 +3550,21 @@ EmitSnapshot(SnapshotContext* context)
                   << " " << formatParseSummary("macRxDrop", debug.macRxDrop)
                   << " " << formatParseSummary("sniffer", debug.promiscSniffer)
                   << std::endl;
+        json << "," << Quote("external_trace") << ":{" << Quote("mac_tx") << ":{" << Quote("gnb") << ":"
+             << debug.macTxGnb << "," << Quote("upf") << ":" << debug.macTxUpf << "},"
+             << Quote("mac_rx") << ":{" << Quote("gnb") << ":" << debug.macRxGnb << "," << Quote("upf") << ":"
+             << debug.macRxUpf << "}," << Quote("mac_rx_drop") << ":{" << Quote("gnb") << ":"
+             << debug.macRxDropGnb << "," << Quote("upf") << ":" << debug.macRxDropUpf << "},"
+             << Quote("promisc_sniffer") << ":{" << Quote("gnb") << ":" << debug.promiscSnifferGnb << ","
+             << Quote("upf") << ":" << debug.promiscSnifferUpf << "},";
+        appendParseSummaryJson(json, "mac_tx_parse", debug.macTx);
+        json << ",";
+        appendParseSummaryJson(json, "mac_rx_parse", debug.macRx);
+        json << ",";
+        appendParseSummaryJson(json, "mac_rx_drop_parse", debug.macRxDrop);
+        json << ",";
+        appendParseSummaryJson(json, "promisc_sniffer_parse", debug.promiscSniffer);
+        json << "}";
         context->externalTraceDebug = SnapshotContext::ExternalTraceDebug{};
         context->externalFlowCountersByPort.clear();
     }
@@ -3746,17 +4134,10 @@ main(int argc, char* argv[])
                     installedUdpClient = DynamicCast<UdpClient>(installedClient.Get(0));
                 }
 
-                NrEpsBearer bearer(NrEpsBearer::NGBR_LOW_LAT_EMBB);
-                Ptr<NrEpcTft> tft = Create<NrEpcTft>();
-                NrEpcTft::PacketFilter downlinkFilter;
-                downlinkFilter.localPortStart = dlPort;
-                downlinkFilter.localPortEnd = dlPort;
-                tft->Add(downlinkFilter);
-                NrEpcTft::PacketFilter uplinkFilter;
-                uplinkFilter.remotePortStart = ulPort;
-                uplinkFilter.remotePortEnd = ulPort;
-                tft->Add(uplinkFilter);
-                nrHelper->ActivateDedicatedEpsBearer(ueNetDev.Get(ueIndex), bearer, tft);
+                // Split mode already enforces per-flow bandwidth at the traffic generator.
+                // Installing an additional dedicated EPS bearer per flow makes the ns-3
+                // user-plane state diverge from the split-mode control/runtime model and
+                // has been causing persistent UE-specific uplink stalls after startup.
             }
             flowRuntimeByPort[dlPort] = SnapshotContext::FlowRuntimeState{
                 profile,

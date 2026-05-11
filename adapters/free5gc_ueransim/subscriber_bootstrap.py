@@ -12,7 +12,7 @@ from urllib import error, parse, request
 
 import yaml
 
-from bridge.common.scenario import AppConfig, FlowConfig, ScenarioConfig, SessionConfig, UeConfig
+from bridge.common.scenario import FlowConfig, ScenarioConfig, SessionConfig, UeConfig
 from bridge.common.topology import ResolvedScenarioTopology, resolve_scenario_topology
 
 
@@ -154,6 +154,15 @@ def _apps_for_ue(scenario: ScenarioConfig, ue: UeConfig, flows: tuple[FlowConfig
     )
 
 
+def _policy_app_id_by_flow_for_ue(
+    scenario: ScenarioConfig,
+    ue: UeConfig,
+    flows: tuple[FlowConfig, ...],
+) -> dict[str, str]:
+    policy_app_id_by_flow = scenario.policy_app_id_map()
+    return {flow.flow_id: policy_app_id_by_flow.get(flow.flow_id, flow.app_id) for flow in flows}
+
+
 def _sla_target_payload(flow: FlowConfig) -> dict[str, object]:
     payload = {
         "latencyMs": flow.sla_target.latency_ms,
@@ -207,13 +216,14 @@ def _build_flow_rule_payload(
     scenario: ScenarioConfig,
     ue: UeConfig,
     flow: FlowConfig,
+    policy_app_id: str,
     qos_ref: int,
     precedence: int,
 ) -> dict[str, object]:
     session = _resolve_flow_session(scenario, ue, flow)
     payload = {
         "flowId": flow.flow_id,
-        "appId": flow.app_id,
+        "appId": policy_app_id,
         "snssai": _slice_snssai_string(scenario, flow.slice_ref),
         "dnn": flow.dnn or session.apn,
         "qosRef": qos_ref,
@@ -228,12 +238,13 @@ def _build_qos_flow_payload(
     scenario: ScenarioConfig,
     ue: UeConfig,
     flow: FlowConfig,
+    policy_app_id: str,
     qos_ref: int,
 ) -> dict[str, object]:
     session = _resolve_flow_session(scenario, ue, flow)
     payload = {
         "flowId": flow.flow_id,
-        "appId": flow.app_id,
+        "appId": policy_app_id,
         "snssai": _slice_snssai_string(scenario, flow.slice_ref),
         "dnn": flow.dnn or session.apn,
         "qosRef": qos_ref,
@@ -250,6 +261,7 @@ def _build_charging_payload(
     scenario: ScenarioConfig,
     ue: UeConfig,
     flow: FlowConfig,
+    policy_app_id: str,
     qos_ref: int,
 ) -> dict[str, object]:
     if all(
@@ -261,7 +273,7 @@ def _build_charging_payload(
     session = _resolve_flow_session(scenario, ue, flow)
     payload = {
         "flowId": flow.flow_id,
-        "appId": flow.app_id,
+        "appId": policy_app_id,
         "snssai": _slice_snssai_string(scenario, flow.slice_ref),
         "dnn": flow.dnn or session.apn,
         "qosRef": qos_ref,
@@ -282,7 +294,7 @@ def build_subscriber_payload(
 ) -> dict[str, object]:
     slice_map = scenario.slice_map()
     ue_flows = _flows_for_ue(scenario, ue)
-    ue_apps = _apps_for_ue(scenario, ue, ue_flows)
+    policy_app_id_by_flow = _policy_app_id_by_flow_for_ue(scenario, ue, ue_flows)
     ordered_slice_refs: list[str] = []
     sessions_by_slice: dict[str, dict[str, SessionConfig]] = {}
 
@@ -356,9 +368,10 @@ def build_subscriber_payload(
     for index, flow in enumerate(ue_flows, start=1):
         qos_ref = _flow_qos_ref(flow, index)
         precedence = _flow_precedence(flow, index)
-        flow_rules.append(_build_flow_rule_payload(scenario, ue, flow, qos_ref, precedence))
-        qos_flows.append(_build_qos_flow_payload(scenario, ue, flow, qos_ref))
-        charging_datas.append(_build_charging_payload(scenario, ue, flow, qos_ref))
+        policy_app_id = policy_app_id_by_flow[flow.flow_id]
+        flow_rules.append(_build_flow_rule_payload(scenario, ue, flow, policy_app_id, qos_ref, precedence))
+        qos_flows.append(_build_qos_flow_payload(scenario, ue, flow, policy_app_id, qos_ref))
+        charging_datas.append(_build_charging_payload(scenario, ue, flow, policy_app_id, qos_ref))
 
     payload = {
         "plmnID": serving_plmn_id,
@@ -396,20 +409,27 @@ def build_subscriber_payload(
             "preferredGnbs": list(ue.free5gc_policy.preferred_gnbs),
             "resolvedTargetGnb": resolved_target_gnb,
         }
-    if ue_apps or ue_flows:
-        local_policy_data["applications"] = [
-            {
-                "appId": app.app_id,
-                "name": app.name,
-                "flowIds": list(app.flow_ids),
-            }
-            for app in ue_apps
-        ]
+    if ue_flows:
+        applications_by_policy_app_id: dict[str, dict[str, object]] = {}
+        for flow in ue_flows:
+            policy_app_id = policy_app_id_by_flow[flow.flow_id]
+            app_payload = applications_by_policy_app_id.setdefault(
+                policy_app_id,
+                {
+                    "appId": policy_app_id,
+                    "logicalAppId": flow.app_id,
+                    "name": flow.app_name or flow.app_id,
+                    "flowIds": [],
+                },
+            )
+            app_payload["flowIds"].append(flow.flow_id)
+        local_policy_data["applications"] = list(applications_by_policy_app_id.values())
         local_policy_data["flows"] = [
             {
                 "flowId": flow.flow_id,
                 "name": flow.name,
-                "appId": flow.app_id,
+                "appId": policy_app_id_by_flow[flow.flow_id],
+                "logicalAppId": flow.app_id,
                 "appName": flow.app_name,
                 "sliceRef": flow.slice_ref,
                 "sessionRef": _resolve_flow_session(scenario, ue, flow).session_ref,

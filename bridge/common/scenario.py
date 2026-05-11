@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import ipaddress
 import ipaddress
 from pathlib import Path
+import re
 from typing import Any
 
 import yaml
@@ -44,6 +45,11 @@ def _slice_snssai(sst: int, sd: str) -> str:
 
 def _default_session_ref(ue_name: str, app_id: str, slice_ref: str, apn: str) -> str:
     return f"{ue_name}:{app_id}:{slice_ref}:{apn}"
+
+
+def _sanitize_policy_app_suffix(value: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9]+", "-", value).strip("-")
+    return sanitized or "session"
 
 
 @dataclass(slots=True, frozen=True)
@@ -267,6 +273,30 @@ class ScenarioConfig:
     def flow_map(self) -> dict[str, FlowConfig]:
         return {flow.flow_id: flow for flow in self.flows}
 
+    def policy_app_id_map(self) -> dict[str, str]:
+        session_refs_by_app: dict[tuple[str, str], set[str]] = {}
+        resolved_sessions: dict[str, SessionConfig] = {}
+        ue_by_name = {ue.name: ue for ue in self.ues}
+        ue_by_supi = {ue.supi: ue for ue in self.ues}
+
+        for flow in self.flows:
+            target_ue = ue_by_name[flow.ue_name] if flow.ue_name is not None else ue_by_supi[flow.supi]
+            session = self.resolve_flow_session(target_ue, flow)
+            resolved_sessions[flow.flow_id] = session
+            session_refs_by_app.setdefault((target_ue.supi, flow.app_id), set()).add(session.session_ref)
+
+        policy_app_ids: dict[str, str] = {}
+        for flow in self.flows:
+            target_ue = ue_by_name[flow.ue_name] if flow.ue_name is not None else ue_by_supi[flow.supi]
+            session = resolved_sessions[flow.flow_id]
+            session_refs = session_refs_by_app[(target_ue.supi, flow.app_id)]
+            if len(session_refs) == 1:
+                policy_app_ids[flow.flow_id] = flow.app_id
+                continue
+            suffix = _sanitize_policy_app_suffix(session.session_ref)
+            policy_app_ids[flow.flow_id] = f"{flow.app_id}--{suffix}"
+        return policy_app_ids
+
     def flows_for_ue(self, ue_name: str) -> tuple[FlowConfig, ...]:
         return tuple(flow for flow in self.flows if flow.ue_name == ue_name)
 
@@ -404,6 +434,18 @@ class ScenarioConfig:
                 if session.session_ref in seen_session_refs:
                     raise ValueError(f"UE {ue.name} defines duplicate session_ref {session.session_ref}")
                 seen_session_refs.add(session.session_ref)
+            attached_gnb_name = ue.gnb or ue.free5gc_policy.target_gnb
+            if attached_gnb_name is not None:
+                attached_gnb = gnbs[attached_gnb_name]
+                supported_slices = set(attached_gnb.slices)
+                missing_slices = sorted(
+                    {session.slice_ref for session in ue.sessions if session.slice_ref not in supported_slices}
+                )
+                if missing_slices:
+                    raise ValueError(
+                        f"UE {ue.name} is attached to gNB {attached_gnb_name}, "
+                        f"but that gNB does not advertise slices {missing_slices}"
+                    )
         for app in self.apps:
             if app.supi not in ue_by_supi:
                 raise ValueError(f"app {app.app_id} references unknown SUPI {app.supi}")

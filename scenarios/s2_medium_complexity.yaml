@@ -72,6 +72,7 @@ gnbs:
     nci: "0x000000002"
     slices:
       - slice-1-000001
+      - slice-2-000001
       - slice-3-000001
     backhaul_upf: i-upf-1
   - name: gNB-3
@@ -268,12 +269,6 @@ apps:
     ue_name: ue4
     flow_ids:
       - flow-1634
-  - app_id: app-drone-control
-    name: Drone_Control
-    supi: imsi-208930000000009
-    ue_name: ue5
-    flow_ids:
-      - flow-8178
   - app_id: app-4k-video
     name: 4K_Video
     supi: imsi-208930000000009
@@ -432,9 +427,9 @@ flows:
     allocated_bandwidth_ul_mbps: 0.5
     optimize_requested: true
     sla_target:
-      latency_ms: 15.0
-      jitter_ms: 4.0
-      loss_rate: 0.0015
+      latency_ms: 60.0
+      jitter_ms: 20.0
+      loss_rate: 0.02
       bandwidth_dl_mbps: 15.0
       bandwidth_ul_mbps: 0.5
       guaranteed_bandwidth_dl_mbps: 12.0
@@ -500,36 +495,6 @@ flows:
       guaranteed_bandwidth_dl_mbps: 0.6
       guaranteed_bandwidth_ul_mbps: 0.05
       priority: 10
-  - flow_id: flow-8178
-    name: Drone_Control_video_1
-    supi: imsi-208930000000009
-    app_id: app-drone-control
-    slice_ref: slice-1-000001
-    session_ref: imsi-208930000000009:app-drone-control:slice-1-000001:internet
-    ue_name: ue5
-    app_name: Drone_Control
-    five_qi: 9
-    service_type: eMBB
-    service_type_id: 1
-    packet_size_bytes: 250.0
-    arrival_rate_pps: 250.0
-    dl_packet_size_bytes: 250.0
-    ul_packet_size_bytes: 1250.0
-    dl_arrival_rate_pps: 250.0
-    ul_arrival_rate_pps: 800.0
-    current_slice_snssai: "01000001"
-    allocated_bandwidth_dl_mbps: 0.5
-    allocated_bandwidth_ul_mbps: 8.0
-    optimize_requested: false
-    sla_target:
-      latency_ms: 20.0
-      jitter_ms: 5.0
-      loss_rate: 0.001
-      bandwidth_dl_mbps: 0.5
-      bandwidth_ul_mbps: 8.0
-      guaranteed_bandwidth_dl_mbps: 0.3
-      guaranteed_bandwidth_ul_mbps: 6.0
-      priority: 2
   - flow_id: flow-8036
     name: 4K_Video_stream_1
     supi: imsi-208930000000009

@@ -89,8 +89,11 @@ def main(argv: list[str] | None = None) -> int:
             },
             "user_plane_kpi": {
                 "kpis": snapshot.get("kpis", {}),
+                "ues": snapshot.get("ues", []),
+                "gnbs": snapshot.get("gnbs", []),
                 "flows": snapshot.get("flows", []),
                 "slices": snapshot.get("slices", []),
+                "external_trace": snapshot.get("external_trace", {}),
             },
         }
         with output_file.open("a", encoding="utf-8") as handle:

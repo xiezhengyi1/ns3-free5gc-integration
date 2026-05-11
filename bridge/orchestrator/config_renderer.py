@@ -693,6 +693,7 @@ def _render_ulcl_uerouting_config(
 
     ue_routing_info: dict[str, dict[str, Any]] = {}
     pfd_data_by_app: dict[str, dict[str, Any]] = {}
+    policy_app_id_by_flow = scenario.policy_app_id_map()
     flow_index_by_id = {flow.flow_id: index for index, flow in enumerate(scenario.flows)}
 
     for ue in scenario.ues:
@@ -716,10 +717,11 @@ def _render_ulcl_uerouting_config(
                     f"permit out udp from 8.8.8.8/32 {destination_port} to any {source_port}",
                 ]
             )
+            policy_app_id = policy_app_id_by_flow.get(flow.flow_id, flow.app_id)
             app_payload = pfd_data_by_app.setdefault(
-                flow.app_id,
+                policy_app_id,
                 {
-                    "applicationId": flow.app_id,
+                    "applicationId": policy_app_id,
                     "pfds": [],
                 },
             )

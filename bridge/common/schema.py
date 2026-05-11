@@ -80,6 +80,8 @@ class UeRecord:
     gnb_id: str
     slice_id: str
     ip_address: str | None = None
+    sessions: list[dict[str, Any]] = field(default_factory=list)
+    telemetry: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "UeRecord":
@@ -89,6 +91,8 @@ class UeRecord:
             gnb_id=str(_require(payload, "gnb_id")),
             slice_id=str(_require(payload, "slice_id")),
             ip_address=payload.get("ip_address"),
+            sessions=[dict(item) for item in payload.get("sessions", []) if isinstance(item, dict)],
+            telemetry=dict(payload.get("telemetry", {})),
         )
 
 
@@ -193,6 +197,7 @@ class TickSnapshot:
     slices: list[SliceRecord]
     kpis: dict[str, float]
     reward_inputs: dict[str, float]
+    external_trace: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "TickSnapshot":
@@ -212,6 +217,7 @@ class TickSnapshot:
                 key: float(value)
                 for key, value in _require(payload, "reward_inputs").items()
             },
+            external_trace=dict(payload.get("external_trace", {})),
         )
         snapshot.validate()
         return snapshot
@@ -259,6 +265,7 @@ class TickSnapshot:
             "slices": [asdict(item) for item in self.slices],
             "kpis": dict(self.kpis),
             "reward_inputs": dict(self.reward_inputs),
+            "external_trace": dict(self.external_trace),
         }
 
 

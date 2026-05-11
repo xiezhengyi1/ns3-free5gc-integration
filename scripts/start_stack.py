@@ -13,9 +13,13 @@ from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 
+import yaml
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from bridge.orchestrator.cli import main as orchestrator_main
+from bridge.split_mode.config import load_split_mode_config
+from bridge.split_mode.renderer import render_split_run
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,11 +44,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     return parser
 
+def _yaml_root(path: Path) -> dict:
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise SystemExit(f"scenario YAML root must be a mapping: {path}")
+    return payload
+
+
+def _is_split_mode_yaml(path: Path) -> bool:
+    payload = _yaml_root(path)
+    has_base = "base_scenario" in payload
+    has_regular_scenario_fields = "free5gc" in payload or "ues" in payload or "slices" in payload
+    if has_base and has_regular_scenario_fields:
+        raise SystemExit(
+            f"ambiguous scenario YAML: {path} mixes split-mode field 'base_scenario' with regular scenario fields"
+        )
+    return has_base
+
+
 def _capture_prepare_manifest(
     input_path: Path,
     run_id: str | None,
     live_graph_snapshot_id: str | None,
 ) -> Path:
+    if _is_split_mode_yaml(input_path):
+        config = load_split_mode_config(input_path)
+        rendered = render_split_run(
+            Path(__file__).resolve().parents[1],
+            config,
+            run_id=run_id,
+            live_graph_snapshot_id=live_graph_snapshot_id,
+        )
+        return rendered.manifest_path
+
     buffer = StringIO()
     with redirect_stdout(buffer):
         orchestrator_main(
