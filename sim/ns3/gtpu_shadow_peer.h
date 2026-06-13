@@ -288,17 +288,6 @@ class GtpuShadowPeer : public Object
         Simulator::Schedule(MicroSeconds(m_virtualEpochUs),
                             &GtpuShadowPeer::StartEpoch,
                             this);
-        if (!m_pumpStarted)
-        {
-            m_pumpStarted = true;
-            Simulator::ScheduleNow(&GtpuShadowPeer::PumpNonBlocking, this);
-        }
-    }
-
-    void PumpNonBlocking()
-    {
-        ReceiveAvailable();
-        Simulator::Schedule(MicroSeconds(10), &GtpuShadowPeer::PumpNonBlocking, this);
     }
 
     void ReceiveAvailable()
@@ -416,7 +405,6 @@ class GtpuShadowPeer : public Object
     uint64_t m_authorizationId = 0;
     size_t m_expectedThisEpoch = 0;
     size_t m_receivedThisEpoch = 0;
-    bool m_pumpStarted = false;
     std::vector<uint8_t> m_receiveBuffer;
     std::map<uint64_t, PendingPacket> m_pending;
 };

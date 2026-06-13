@@ -87,6 +87,14 @@ class UserPlaneGateTest(unittest.TestCase):
         self.assertEqual(self.upf.written_frames, [b"control-arp"])
         self.assertEqual(self.messages, [])
 
+    def test_pre_epoch_mode_bypasses_only_control_frames(self) -> None:
+        self.gate.capture_pre_epoch(frame=b"control-arp", ingress_port="gnb")
+        self.gate.capture_pre_epoch(frame=b"managed-packet", ingress_port="gnb")
+
+        self.assertEqual(self.upf.written_frames, [b"control-arp"])
+        self.assertEqual(self.gate.stats.bypassed, 1)
+        self.assertEqual(self.gate.stats.dropped, 1)
+
     def test_managed_frame_waits_for_delivery_result(self) -> None:
         packet_id = self._capture_managed()
 

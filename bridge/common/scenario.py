@@ -424,6 +424,12 @@ class ScenarioConfig:
                 raise ValueError("user-plane gate requires bridge.enable_inline_harness")
             if len(self.gnbs) != 1:
                 raise ValueError("user-plane gate currently requires exactly one gNB N3 link")
+            if not self.bridge.user_plane_gate.fail_closed:
+                raise ValueError("user-plane gate requires fail_closed=true")
+            if "Realtime" in self.ns3.simulator:
+                raise ValueError(
+                    "user-plane gate requires an ns-3 virtual-time simulator, not RealtimeSimulatorImpl"
+                )
         if self.bridge.n3_network_cidr:
             try:
                 n3_network = ipaddress.ip_network(self.bridge.n3_network_cidr, strict=True)

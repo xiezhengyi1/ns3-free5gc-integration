@@ -47,6 +47,19 @@ class FrameGate:
         self._next_sequence = 1
         self._egress_by_packet: dict[int, str] = {}
 
+    def capture_pre_epoch(self, *, frame: bytes, ingress_port: str) -> None:
+        decision = self.classifier.classify(frame)
+        if decision.kind is DecisionKind.CONTROL_BYPASS:
+            self._write_frame(self._egress(ingress_port), frame)
+            self.stats.bypassed += 1
+            return
+        if decision.kind is DecisionKind.UNMAPPED:
+            self.stats.unmapped += 1
+        elif decision.kind is DecisionKind.MALFORMED:
+            self.stats.malformed += 1
+        else:
+            self.stats.dropped += 1
+
     def capture(
         self,
         *,
@@ -86,7 +99,11 @@ class FrameGate:
             self.stats.capacity_drops += 1
             return None
         self._egress_by_packet[record.packet_id] = egress_port
-        shadow_size = decision.packet.inner_size_bytes or len(frame)
+        shadow_size = (
+            decision.packet.inner_payload_size_bytes
+            or decision.packet.inner_size_bytes
+            or len(frame)
+        )
         self.coordinator.mark_submitted(record.packet_id)
         self.kpi.submitted(
             packet_id=record.packet_id,

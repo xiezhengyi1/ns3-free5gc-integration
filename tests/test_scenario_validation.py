@@ -143,6 +143,7 @@ class ScenarioValidationTest(unittest.TestCase):
             }
         )
         payload["flows"][0].update({"ue_ip": "10.60.0.1", "qfi": 9})
+        payload["ns3"]["simulator"] = "DefaultSimulatorImpl"
 
         scenario = ScenarioConfig.from_dict(payload)
 
@@ -192,6 +193,7 @@ class ScenarioValidationTest(unittest.TestCase):
         payload.setdefault("bridge", {})["enable_inline_harness"] = True
         payload["bridge"]["n3_network_cidr"] = "10.201.1.0/29"
         payload["bridge"]["user_plane_gate"] = {"enabled": True}
+        payload["ns3"]["simulator"] = "DefaultSimulatorImpl"
 
         with self.assertRaisesRegex(ValueError, "ue_ip"):
             ScenarioConfig.from_dict(payload)
@@ -208,6 +210,36 @@ class ScenarioValidationTest(unittest.TestCase):
         scenario = ScenarioConfig.from_dict(payload)
         self.assertEqual(scenario.flows[0].ue_ip, "10.60.0.1")
         self.assertEqual(scenario.flows[0].qfi, 9)
+
+    def test_gate_cannot_disable_fail_closed_policy(self) -> None:
+        payload = _base_payload()
+        payload.setdefault("bridge", {}).update(
+            {
+                "enable_inline_harness": True,
+                "n3_network_cidr": "10.201.1.0/29",
+                "user_plane_gate": {"enabled": True, "fail_closed": False},
+            }
+        )
+        payload["flows"][0].update({"ue_ip": "10.60.0.1", "qfi": 9})
+        payload["ns3"]["simulator"] = "DefaultSimulatorImpl"
+
+        with self.assertRaisesRegex(ValueError, "fail_closed"):
+            ScenarioConfig.from_dict(payload)
+
+    def test_gate_rejects_realtime_scheduler(self) -> None:
+        payload = _base_payload()
+        payload.setdefault("bridge", {}).update(
+            {
+                "enable_inline_harness": True,
+                "n3_network_cidr": "10.201.1.0/29",
+                "user_plane_gate": {"enabled": True},
+            }
+        )
+        payload["flows"][0].update({"ue_ip": "10.60.0.1", "qfi": 9})
+        payload["ns3"]["simulator"] = "RealtimeSimulatorImpl"
+
+        with self.assertRaisesRegex(ValueError, "virtual-time"):
+            ScenarioConfig.from_dict(payload)
 
 
 if __name__ == "__main__":

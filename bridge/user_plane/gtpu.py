@@ -48,6 +48,7 @@ class GtpuPacket:
     inner_src_port: int | None
     inner_dst_port: int | None
     inner_size_bytes: int = 0
+    inner_payload_size_bytes: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +183,9 @@ def parse_gtpu_frame(frame: bytes) -> GtpuPacket:
         inner_src_port, inner_dst_port = struct.unpack_from(
             "!HH", frame, inner.payload_offset
         )
+    inner_payload_size = inner.end - inner.payload_offset
+    if inner.protocol == 17:
+        inner_payload_size = max(0, inner_payload_size - 8)
     return GtpuPacket(
         teid=teid,
         qfi=qfi,
@@ -193,6 +197,7 @@ def parse_gtpu_frame(frame: bytes) -> GtpuPacket:
         inner_src_port=inner_src_port,
         inner_dst_port=inner_dst_port,
         inner_size_bytes=inner.end - cursor,
+        inner_payload_size_bytes=inner_payload_size,
     )
 
 

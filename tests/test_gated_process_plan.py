@@ -68,6 +68,7 @@ class GatedProcessPlanTest(unittest.TestCase):
         commands = {command.name: command for command in manifest.commands}
         names = [command.name for command in manifest.commands]
         self.assertLess(names.index("bridge-setup"), names.index("user-plane-gate"))
+        self.assertEqual(names.index("user-plane-gate"), names.index("bridge-setup") + 1)
         self.assertLess(names.index("user-plane-gate"), names.index("ns3-run"))
         self.assertIn("--controlled", commands["real-ue-flows"].argv)
         self.assertIn("--user-plane-gate-socket", commands["ns3-run"].argv)

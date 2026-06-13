@@ -184,6 +184,10 @@ class GateRuntime:
                             or self.current_epoch_id is None
                             or self.current_ns3_time_us is None
                         ):
+                            self.gate.capture_pre_epoch(
+                                frame=frame,
+                                ingress_port=ingress,
+                            )
                             continue
                         self.gate.capture(
                             frame=frame,

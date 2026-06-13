@@ -37,6 +37,21 @@ python scripts/start_stack.py artifacts/runs/<run-id>/run-manifest.json
 python3 scripts/start_graph_stack.py scenarios/graph_snapshot_real_smoke.yaml
 ```
 
+### 真实 GTP-U 经 NR 裁决
+
+`scenarios/free5gc_ueransim_gtpu_nr.yaml` 启用新的用户面门控模式。free5GC/UERANSIM 仍建立真实 PDU Session，但每个 GTP-U G-PDU 原帧会先停留在 Linux TAP gate 中；ns-3 为其创建同一 flow/方向/大小的影子 UDP 包，经 EPC、NR bearer、RLC/MAC/PHY 后返回送达或虚拟过期结果，gate 再释放或丢弃原帧。
+
+```bash
+# 无需 root 的确定性生命周期/KPI检查
+python scripts/run_gate_loopback.py
+
+# Linux 实验机：渲染并按 manifest 启动
+python scripts/render_run.py scenarios/free5gc_ueransim_gtpu_nr.yaml
+python scripts/start_stack.py artifacts/runs/<run-id>/run-manifest.json
+```
+
+该模式以 `Simulator::Now()` 为唯一实验时钟。控制面继续使用墙钟保持会话，UDP agent 只在 ns-3 `AUTHORIZE_SEND` 后发送一包。逐包事件和 tick KPI 分别写入 `generated/ns3/packet-events.jsonl` 与 `packet-kpis.jsonl`。当前首个在线实现限定单 gNB-UPF N3 链路；未映射、容量溢出、peer 断连均 fail-closed。
+
 ## 前置依赖
 
 | 组件 | 版本要求 |

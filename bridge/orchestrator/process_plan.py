@@ -526,9 +526,11 @@ def build_run_manifest(
                     "--external-traffic-only",
                 ]
             )
-            ns3_run_index = commands.index(ns3_run)
+            bridge_setup_index = next(
+                index for index, command in enumerate(commands) if command.name == "bridge-setup"
+            )
             commands.insert(
-                ns3_run_index,
+                bridge_setup_index + 1,
                 CommandSpec(
                     name="user-plane-gate",
                     cwd=str(project_root),
