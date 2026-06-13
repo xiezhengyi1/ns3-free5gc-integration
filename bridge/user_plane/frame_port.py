@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections import deque
+import os
 import socket
+import struct
 from typing import Protocol
 
 
@@ -49,3 +51,35 @@ class AfPacketFramePort:
 
     def close(self) -> None:
         self.socket.close()
+
+
+class TunTapFramePort:
+    TUNSETIFF = 0x400454CA
+    IFF_TAP = 0x0002
+    IFF_NO_PI = 0x1000
+
+    def __init__(self, interface_name: str) -> None:
+        if os.name != "posix":
+            raise OSError("TAP frame ports are available only on POSIX systems")
+        import fcntl
+
+        self._fd = os.open("/dev/net/tun", os.O_RDWR | os.O_NONBLOCK)
+        request = struct.pack(
+            "16sH",
+            interface_name.encode("ascii"),
+            self.IFF_TAP | self.IFF_NO_PI,
+        )
+        response = fcntl.ioctl(self._fd, self.TUNSETIFF, request)
+        self.interface_name = response[:16].split(b"\x00", 1)[0].decode("ascii")
+
+    def fileno(self) -> int:
+        return self._fd
+
+    def read(self, max_frame_bytes: int = 65535) -> bytes:
+        return os.read(self._fd, max_frame_bytes)
+
+    def write(self, frame: bytes) -> int:
+        return os.write(self._fd, frame)
+
+    def close(self) -> None:
+        os.close(self._fd)

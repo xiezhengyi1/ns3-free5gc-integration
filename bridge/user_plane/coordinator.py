@@ -148,6 +148,12 @@ class PacketCoordinator:
         except KeyError as exc:
             raise CoordinatorError(f"unknown packet {packet_id}") from exc
 
+    def epoch(self, epoch_id: int) -> EpochRecord:
+        try:
+            return self._epochs[epoch_id]
+        except KeyError as exc:
+            raise CoordinatorError(f"unknown epoch {epoch_id}") from exc
+
     def mark_submitted(self, packet_id: int) -> PacketRecord:
         record = self.packet(packet_id)
         self._transition(record, PacketState.SUBMITTED)
@@ -190,9 +196,7 @@ class PacketCoordinator:
         return record
 
     def is_epoch_complete(self, epoch_id: int) -> bool:
-        epoch = self._epochs.get(epoch_id)
-        if epoch is None:
-            raise CoordinatorError(f"unknown epoch {epoch_id}")
+        epoch = self.epoch(epoch_id)
         return all(self._packets[packet_id].state in _NS3_TERMINAL for packet_id in epoch.packet_ids)
 
     def expire(self, *, ns3_now_us: int) -> list[GateAction]:

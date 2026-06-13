@@ -24,6 +24,7 @@ class MessageType(IntEnum):
     PACKET_DROP = 4
     TICK_COMPLETE = 5
     AUTHORIZE_SEND = 6
+    EPOCH_START = 7
 
 
 @dataclass(frozen=True, slots=True)

@@ -40,6 +40,7 @@ class PacketCoordinatorTest(unittest.TestCase):
 
         self.assertEqual((self.epoch, second_epoch), (1, 2))
         self.assertEqual((first.packet_id, second.packet_id), (1, 2))
+        self.assertEqual(self.coordinator.epoch(self.epoch).start_ns3_us, 1000)
 
     def test_delivery_requires_submission_and_explicit_release_completion(self) -> None:
         packet = self._capture()
