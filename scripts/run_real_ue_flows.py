@@ -10,8 +10,12 @@ import os
 from pathlib import Path
 import shlex
 import signal
+import socket
 import subprocess
 import time
+from typing import Callable
+
+from bridge.user_plane.protocol import MessageType, StreamDecoder
 
 
 def _rate_pps_from_bandwidth(target_mbps: float, packet_size: float) -> float:
@@ -91,6 +95,149 @@ def _effective_tick_window_ms(
     if sim_gap > nominal:
         return nominal, tick_gap
     return sim_gap, tick_gap
+
+
+def _controlled_sender_argv(
+    *,
+    sender: str,
+    target_ip: str,
+    destination_port: int,
+    source_port: int,
+    interface: str,
+    packet_size: int,
+    flow_id: str,
+    epoch_id: int,
+    application_sequence: int,
+) -> list[str]:
+    return [
+        sender,
+        target_ip,
+        str(destination_port),
+        str(source_port),
+        interface,
+        str(packet_size),
+        "1",
+        flow_id,
+        str(epoch_id),
+        str(application_sequence),
+    ]
+
+
+def _resolve_downlink_route(
+    upf_containers: list[str], ue_ip: str
+) -> dict[str, str] | None:
+    for container in upf_containers:
+        route = subprocess.check_output(
+            [
+                "docker",
+                "exec",
+                container,
+                "sh",
+                "-lc",
+                f"ip route get {shlex.quote(ue_ip)} | head -n 1",
+            ],
+            text=True,
+        ).split()
+        if "dev" in route and route[route.index("dev") + 1] == "upfgtp":
+            return {"container": container, "iface": "upfgtp"}
+    return None
+
+
+def _run_controlled(
+    *,
+    args: argparse.Namespace,
+    flows: list[dict[str, object]],
+    container_sender: str,
+    upf_containers: list[str],
+    should_stop: Callable[[], bool],
+) -> int:
+    flows_by_id = {str(flow["flow_id"]): flow for flow in flows}
+    decoder = StreamDecoder()
+    connection: socket.socket | None = None
+    while not should_stop():
+        if connection is None:
+            try:
+                connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                connection.connect(args.authorization_socket)
+            except OSError:
+                if connection is not None:
+                    connection.close()
+                connection = None
+                time.sleep(0.2)
+                continue
+        try:
+            data = connection.recv(65536)
+        except OSError:
+            connection.close()
+            connection = None
+            decoder = StreamDecoder()
+            continue
+        if not data:
+            connection.close()
+            connection = None
+            decoder = StreamDecoder()
+            continue
+        for message in decoder.feed(data):
+            if message.message_type is not MessageType.AUTHORIZE_SEND:
+                continue
+            flow_id = str(message.payload["flow_id"])
+            flow = flows_by_id.get(flow_id)
+            if flow is None:
+                raise ValueError(f"authorization references unknown flow {flow_id}")
+            direction = str(message.payload["direction"])
+            packet_size = int(
+                message.payload.get("payload_size", flow["packet_size"])
+            )
+            epoch_id = int(message.payload["epoch_id"])
+            sequence = int(
+                message.payload.get("application_sequence", message.sequence)
+            )
+            selected_interface = _resolve_ue_interface(
+                str(flow["container"]), int(flow["session_index"])
+            )
+            if selected_interface is None:
+                continue
+            if direction == "uplink":
+                container = str(flow["container"])
+                interface = selected_interface["iface"]
+                target_ip = args.target_ip
+                destination_port = int(flow["port"])
+                source_port = int(flow["source_port"])
+            elif direction == "downlink":
+                route = _resolve_downlink_route(
+                    upf_containers, selected_interface["ip"]
+                )
+                if route is None:
+                    continue
+                container = route["container"]
+                interface = route["iface"]
+                target_ip = selected_interface["ip"]
+                destination_port = int(flow["source_port"])
+                source_port = int(flow["port"])
+            else:
+                raise ValueError(f"unsupported authorization direction {direction}")
+            subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    container,
+                    *_controlled_sender_argv(
+                        sender=container_sender,
+                        target_ip=target_ip,
+                        destination_port=destination_port,
+                        source_port=source_port,
+                        interface=interface,
+                        packet_size=packet_size,
+                        flow_id=flow_id,
+                        epoch_id=epoch_id,
+                        application_sequence=sequence,
+                    ),
+                ],
+                check=True,
+            )
+    if connection is not None:
+        connection.close()
+    return 0
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -208,6 +355,15 @@ def main(argv: list[str] | None = None) -> int:
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
+
+    if args.controlled:
+        return _run_controlled(
+            args=args,
+            flows=flows,
+            container_sender=container_sender,
+            upf_containers=upf_containers,
+            should_stop=lambda: stopping,
+        )
 
     last_tick: int | None = None
     last_sim_time_ms: int | None = None

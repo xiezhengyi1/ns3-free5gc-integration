@@ -13,6 +13,7 @@ class UserPlaneCliTest(unittest.TestCase):
                 "gnb_tap": "tgnb1",
                 "upf_tap": "tupf1",
                 "socket_path": "/tmp/gate.sock",
+                "authorization_socket": "/tmp/gate.sock.agents",
                 "max_pending_packets": 16,
                 "max_pending_bytes": 4096,
                 "fail_closed": True,
@@ -33,6 +34,7 @@ class UserPlaneCliTest(unittest.TestCase):
         )
 
         self.assertEqual(config.gnb_tap, "tgnb1")
+        self.assertEqual(config.authorization_socket, "/tmp/gate.sock.agents")
         self.assertEqual(config.bindings[0].flow_id, "flow-1")
         self.assertEqual(config.bindings[0].qfi, 9)
         self.assertEqual(config.virtual_expiry_us_by_flow, {"flow-1": 5000})

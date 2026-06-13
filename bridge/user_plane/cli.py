@@ -27,6 +27,7 @@ class GateRuntimeConfig:
     gnb_tap: str
     upf_tap: str
     socket_path: str
+    authorization_socket: str
     max_pending_packets: int
     max_pending_bytes: int
     fail_closed: bool
@@ -86,6 +87,9 @@ class GateRuntimeConfig:
             gnb_tap=str(payload["gnb_tap"]),
             upf_tap=str(payload["upf_tap"]),
             socket_path=str(payload["socket_path"]),
+            authorization_socket=str(
+                payload.get("authorization_socket", f"{payload['socket_path']}.agents")
+            ),
             max_pending_packets=max_packets,
             max_pending_bytes=max_bytes,
             fail_closed=bool(payload.get("fail_closed", True)),
@@ -114,6 +118,7 @@ class GateRuntime:
             "upf": TunTapFramePort(config.upf_tap),
         }
         self.peer: socket.socket | None = None
+        self.agent_peers: list[socket.socket] = []
         self.current_epoch_id: int | None = None
         self.current_ns3_time_us: int | None = None
         self.gate = FrameGate(
@@ -136,10 +141,20 @@ class GateRuntime:
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(str(socket_path))
         listener.listen(1)
+        authorization_path = Path(self.config.authorization_socket)
+        authorization_path.parent.mkdir(parents=True, exist_ok=True)
+        authorization_path.unlink(missing_ok=True)
+        authorization_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        authorization_listener.bind(str(authorization_path))
+        authorization_listener.listen(16)
         decoder = StreamDecoder()
         try:
             while True:
-                readers: list[Any] = [listener, *self.ports.values()]
+                readers: list[Any] = [
+                    listener,
+                    authorization_listener,
+                    *self.ports.values(),
+                ]
                 if self.peer is not None:
                     readers.append(self.peer)
                 ready, _, _ = select.select(readers, [], [])
@@ -151,6 +166,9 @@ class GateRuntime:
                             continue
                         self.peer = peer
                         decoder = StreamDecoder()
+                    elif source is authorization_listener:
+                        agent, _ = authorization_listener.accept()
+                        self.agent_peers.append(agent)
                     elif source is self.peer:
                         data = self.peer.recv(65536)
                         if not data:
@@ -176,10 +194,14 @@ class GateRuntime:
         finally:
             if self.peer is not None:
                 self.peer.close()
+            for agent in self.agent_peers:
+                agent.close()
             listener.close()
+            authorization_listener.close()
             for port in self.ports.values():
                 port.close()
             socket_path.unlink(missing_ok=True)
+            authorization_path.unlink(missing_ok=True)
 
     def _handle_peer_message(self, message: Message) -> None:
         if message.message_type is MessageType.EPOCH_START:
@@ -210,9 +232,24 @@ class GateRuntime:
                 end_ns3_us=end_ns3_us,
             )
             self._append_json(self.config.kpi_log, asdict(summary))
+            for event in self.kpi.events:
+                if event.epoch_id == epoch_id:
+                    self._append_json(self.config.event_log, asdict(event))
             self.current_ns3_time_us = end_ns3_us
             return
         if message.message_type is MessageType.HELLO:
+            return
+        if message.message_type is MessageType.AUTHORIZE_SEND:
+            encoded = encode_message(message)
+            live_agents: list[socket.socket] = []
+            for agent in self.agent_peers:
+                try:
+                    agent.sendall(encoded)
+                except (BrokenPipeError, ConnectionResetError):
+                    agent.close()
+                else:
+                    live_agents.append(agent)
+            self.agent_peers = live_agents
             return
         raise ValueError(f"unsupported peer message {message.message_type.name}")
 

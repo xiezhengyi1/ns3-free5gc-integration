@@ -135,7 +135,14 @@ class ScenarioValidationTest(unittest.TestCase):
 
     def test_loads_gated_user_plane_defaults(self) -> None:
         payload = _base_payload()
-        payload.setdefault("bridge", {})["user_plane_gate"] = {"enabled": True}
+        payload.setdefault("bridge", {}).update(
+            {
+                "enable_inline_harness": True,
+                "n3_network_cidr": "10.201.1.0/29",
+                "user_plane_gate": {"enabled": True},
+            }
+        )
+        payload["flows"][0].update({"ue_ip": "10.60.0.1", "qfi": 9})
 
         scenario = ScenarioConfig.from_dict(payload)
 
@@ -179,6 +186,28 @@ class ScenarioValidationTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "virtual_epoch_us"):
             ScenarioConfig.from_dict(payload)
+
+    def test_gate_requires_reproducible_flow_binding(self) -> None:
+        payload = _base_payload()
+        payload.setdefault("bridge", {})["enable_inline_harness"] = True
+        payload["bridge"]["n3_network_cidr"] = "10.201.1.0/29"
+        payload["bridge"]["user_plane_gate"] = {"enabled": True}
+
+        with self.assertRaisesRegex(ValueError, "ue_ip"):
+            ScenarioConfig.from_dict(payload)
+
+        payload["flows"][0].update(
+            {
+                "ue_ip": "10.60.0.1",
+                "qfi": 9,
+                "inner_protocol": 17,
+                "ue_port": 15000,
+                "remote_port": 5000,
+            }
+        )
+        scenario = ScenarioConfig.from_dict(payload)
+        self.assertEqual(scenario.flows[0].ue_ip, "10.60.0.1")
+        self.assertEqual(scenario.flows[0].qfi, 9)
 
 
 if __name__ == "__main__":

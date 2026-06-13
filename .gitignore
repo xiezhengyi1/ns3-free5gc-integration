@@ -10,3 +10,4 @@ tmp/
 .venv
 .superpowers/
 .worktrees/
+.learnings/

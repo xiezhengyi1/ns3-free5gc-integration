@@ -101,3 +101,32 @@ class RealUeFlowsTest(unittest.TestCase):
             resolved,
             {"iface": "uesimtun1", "ip": "10.0.0.2"},
         )
+
+    def test_controlled_sender_argv_carries_experiment_identity(self) -> None:
+        argv = MODULE._controlled_sender_argv(
+            sender="/tmp/sender",
+            target_ip="192.0.2.1",
+            destination_port=5000,
+            source_port=15000,
+            interface="uesimtun0",
+            packet_size=256,
+            flow_id="flow-1",
+            epoch_id=7,
+            application_sequence=9,
+        )
+
+        self.assertEqual(
+            argv,
+            [
+                "/tmp/sender",
+                "192.0.2.1",
+                "5000",
+                "15000",
+                "uesimtun0",
+                "256",
+                "1",
+                "flow-1",
+                "7",
+                "9",
+            ],
+        )

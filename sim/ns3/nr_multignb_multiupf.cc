@@ -15,6 +15,7 @@
 #include "ns3/point-to-point-module.h"
 #include "ns3/tap-bridge-module.h"
 #include "ns3/udp-header.h"
+#include "gtpu_shadow_peer.h"
 
 #include <algorithm>
 #include <cmath>
@@ -181,6 +182,13 @@ struct FlowProfile
     std::string policyFilter;
     uint32_t precedence = 128;
     uint32_t qosRef = 0;
+    uint32_t qfi = 0;
+    std::string ueIp;
+    uint32_t innerProtocol = 17;
+    uint32_t uePort = 0;
+    uint32_t remotePort = 0;
+    std::string rlcMode = "UM";
+    double virtualExpiryMs = 1000.0;
     std::string chargingMethod;
     std::string quota;
     std::string unitCost;
@@ -404,9 +412,24 @@ LoadFlowProfiles(const std::string& path)
         profile.policyFilter = GetColumnValue(headerIndex, columns, "policy_filter");
         profile.precedence = ParseOptionalUint(GetColumnValue(headerIndex, columns, "precedence"), 128);
         profile.qosRef = ParseOptionalUint(GetColumnValue(headerIndex, columns, "qos_ref"), 0);
+        profile.qfi = ParseOptionalUint(GetColumnValue(headerIndex, columns, "qfi"), 0);
+        profile.ueIp = GetColumnValue(headerIndex, columns, "ue_ip");
+        profile.innerProtocol =
+            ParseOptionalUint(GetColumnValue(headerIndex, columns, "inner_protocol"), 17);
+        profile.uePort = ParseOptionalUint(GetColumnValue(headerIndex, columns, "ue_port"), 0);
+        profile.remotePort =
+            ParseOptionalUint(GetColumnValue(headerIndex, columns, "remote_port"), 0);
         profile.chargingMethod = GetColumnValue(headerIndex, columns, "charging_method");
         profile.quota = GetColumnValue(headerIndex, columns, "quota");
         profile.unitCost = GetColumnValue(headerIndex, columns, "unit_cost");
+        profile.rlcMode = GetColumnValue(headerIndex, columns, "rlc_mode");
+        if (profile.rlcMode.empty())
+        {
+            profile.rlcMode = "UM";
+        }
+        profile.virtualExpiryMs = ParseOptionalDouble(
+            GetColumnValue(headerIndex, columns, "virtual_expiry_ms"),
+            1000.0);
 
         if (profile.flowId.empty())
         {
@@ -643,8 +666,16 @@ struct SnapshotContext
     double bridgeLinkDelayMs = 1.0;
     double bridgeLinkLossRate = 0.0;
     bool externalTrafficOnly = false;
+    bool gatedUserPlane = false;
     std::string externalTrafficTargetIp = "8.8.8.8";
     uint32_t externalTrafficSourceBasePort = 15000;
+    std::string userPlaneGateSocket;
+    std::string bearerMapFile;
+    uint32_t rngSeed = 1;
+    uint64_t rngRun = 1;
+    uint64_t virtualEpochUs = 100000;
+    double channelUpdateMs = 10.0;
+    bool shadowingEnabled = true;
     std::vector<std::string> upfNames;
     std::vector<std::string> sliceSds;
     std::vector<std::string> sliceIds;
@@ -664,6 +695,111 @@ struct SnapshotContext
     Time appStartTime;
     Time simTime;
 };
+
+class ShadowPacketTag : public Tag
+{
+  public:
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::ShadowPacketTag")
+                                .SetParent<Tag>()
+                                .AddConstructor<ShadowPacketTag>();
+        return tid;
+    }
+
+    TypeId GetInstanceTypeId() const override
+    {
+        return GetTypeId();
+    }
+
+    uint32_t GetSerializedSize() const override
+    {
+        return 16;
+    }
+
+    void Serialize(TagBuffer buffer) const override
+    {
+        buffer.WriteU64(m_packetId);
+        buffer.WriteU64(m_epochId);
+    }
+
+    void Deserialize(TagBuffer buffer) override
+    {
+        m_packetId = buffer.ReadU64();
+        m_epochId = buffer.ReadU64();
+    }
+
+    void Print(std::ostream& stream) const override
+    {
+        stream << "packetId=" << m_packetId << " epochId=" << m_epochId;
+    }
+
+    void Set(uint64_t packetId, uint64_t epochId)
+    {
+        m_packetId = packetId;
+        m_epochId = epochId;
+    }
+
+    uint64_t GetPacketId() const
+    {
+        return m_packetId;
+    }
+
+  private:
+    uint64_t m_packetId = 0;
+    uint64_t m_epochId = 0;
+};
+
+struct ShadowFlowEndpoint
+{
+    Ptr<Socket> uplink;
+    Ptr<Socket> downlink;
+};
+
+struct ShadowInjectionContext
+{
+    Ptr<GtpuShadowPeer> peer;
+    std::map<std::string, ShadowFlowEndpoint> endpoints;
+};
+
+void
+OnShadowSocketReceive(Ptr<GtpuShadowPeer> peer, Ptr<Socket> socket)
+{
+    while (Ptr<Packet> packet = socket->Recv())
+    {
+        ShadowPacketTag tag;
+        if (packet->RemovePacketTag(tag))
+        {
+            peer->Deliver(tag.GetPacketId());
+        }
+    }
+}
+
+void
+InjectShadowPacket(ShadowInjectionContext* context, ShadowPacketRequest request)
+{
+    auto endpointIt = context->endpoints.find(request.flowId);
+    if (endpointIt == context->endpoints.end())
+    {
+        context->peer->Drop(request.packetId, "unknown-flow");
+        return;
+    }
+    Ptr<Socket> socket =
+        request.direction == "uplink" ? endpointIt->second.uplink : endpointIt->second.downlink;
+    if (socket == nullptr)
+    {
+        context->peer->Drop(request.packetId, "missing-direction-socket");
+        return;
+    }
+    Ptr<Packet> packet = Create<Packet>(std::max<uint32_t>(1, request.sizeBytes));
+    ShadowPacketTag tag;
+    tag.Set(request.packetId, request.epochId);
+    packet->AddPacketTag(tag);
+    if (socket->Send(packet) < 0)
+    {
+        context->peer->Drop(request.packetId, "socket-send-failed");
+    }
+}
 
 bool
 ExtractUdpTupleFromPacket(SnapshotContext::TraceParseCounters* debug,
@@ -1379,9 +1515,12 @@ ApplySlaDrivenAllocations(SnapshotContext* context)
             const double flowQueueBytes =
                 deficitMbps * 1e6 / 8.0 * static_cast<double>(context->tickMs) / 1000.0;
             telemetry.queueBytes += flowQueueBytes;
-            telemetry.droppedPackets += runtime->profile.packetSizeBytes > 0.0
-                                            ? flowQueueBytes / runtime->profile.packetSizeBytes
-                                            : 0.0;
+            if (!context->gatedUserPlane)
+            {
+                telemetry.droppedPackets += runtime->profile.packetSizeBytes > 0.0
+                                                ? flowQueueBytes / runtime->profile.packetSizeBytes
+                                                : 0.0;
+            }
             ApplyClientRate(*runtime);
         }
     }
@@ -1799,10 +1938,6 @@ EmitSnapshot(SnapshotContext* context)
                 rxPacketsDl * runtime.profile.packetSizeBytes * 8.0 / tickSeconds / 1e6;
             const double lossRate =
                 txPackets > 0 ? static_cast<double>(lostPackets) / static_cast<double>(txPackets) : 0.0;
-            const double shortfallRatio =
-                offeredMbps > 0.0
-                    ? std::max(0.0, 1.0 - std::min(throughputUl, throughputDl) / offeredMbps)
-                    : 0.0;
             const double measuredDelayMs =
                 delaySamples > 0
                     ? (counters.delaySumMsUl + counters.delaySumMsDl) / static_cast<double>(delaySamples)
@@ -1811,7 +1946,7 @@ EmitSnapshot(SnapshotContext* context)
                 jitterSamples > 0
                     ? (counters.jitterSumMsUl + counters.jitterSumMsDl) / static_cast<double>(jitterSamples)
                     : 0.0;
-            const double delayMs = measuredDelayMs > 0.0 ? measuredDelayMs : std::max(0.1, context->bridgeLinkDelayMs);
+            const double delayMs = measuredDelayMs;
             const double jitterMs = measuredJitterMs > 0.0 ? measuredJitterMs : 0.0;
             appendFlow(&runtime.profile,
                        runtime.ueIndex,
@@ -2029,8 +2164,17 @@ main(int argc, char* argv[])
     cmd.AddValue("externalTrafficOnly", "Use real UE UDP flows and disable built-in ns-3 UDP apps", externalTrafficOnly);
     cmd.AddValue("externalTrafficTargetIp", "Destination IP used by the real UE UDP generator", externalTrafficTargetIp);
     cmd.AddValue("externalTrafficSourceBasePort", "First source port used by the real UE UDP generator", externalTrafficSourceBasePort);
+    cmd.AddValue("userPlaneGateSocket", "Unix socket for the real GTP-U frame gate", userPlaneGateSocket);
+    cmd.AddValue("bearerMapFile", "Rendered bearer map used by the frame gate", bearerMapFile);
+    cmd.AddValue("rngSeed", "ns-3 random seed", rngSeed);
+    cmd.AddValue("rngRun", "ns-3 independent random run", rngRun);
+    cmd.AddValue("virtualEpochUs", "Virtual user-plane epoch in microseconds", virtualEpochUs);
+    cmd.AddValue("channelUpdateMs", "3GPP channel condition update period in milliseconds", channelUpdateMs);
+    cmd.AddValue("shadowingEnabled", "Enable 3GPP shadow fading", shadowingEnabled);
     cmd.Parse(argc, argv);
 
+    RngSeedManager::SetSeed(rngSeed);
+    RngSeedManager::SetRun(rngRun);
     GlobalValue::Bind("SimulatorImplementationType", StringValue(NormalizeSimulatorType(simulator)));
     GlobalValue::Bind("ChecksumEnabled", BooleanValue(true));
 
@@ -2173,8 +2317,10 @@ main(int argc, char* argv[])
     auto band = ccBwpCreator.CreateOperationBandContiguousCc(bandConf);
     Ptr<NrChannelHelper> channelHelper = CreateObject<NrChannelHelper>();
     channelHelper->ConfigureFactories("UMi", "Default", "ThreeGpp");
-    channelHelper->SetPathlossAttribute("ShadowingEnabled", BooleanValue(false));
-    channelHelper->SetChannelConditionModelAttribute("UpdatePeriod", TimeValue(MilliSeconds(0)));
+    channelHelper->SetPathlossAttribute("ShadowingEnabled", BooleanValue(shadowingEnabled));
+    channelHelper->SetChannelConditionModelAttribute(
+        "UpdatePeriod",
+        TimeValue(MilliSeconds(std::max(0.001, channelUpdateMs))));
     channelHelper->AssignChannelsToBands({band});
     allBwps = CcBwpCreator::GetAllBwps({band});
 
@@ -2342,6 +2488,74 @@ main(int argc, char* argv[])
         }
     }
 
+    ShadowInjectionContext shadowContext;
+    if (!userPlaneGateSocket.empty())
+    {
+        shadowContext.peer = CreateObject<GtpuShadowPeer>();
+        std::vector<ShadowFlowAuthorization> authorizations;
+        for (uint32_t index = 0; index < flowProfiles.size(); ++index)
+        {
+            const auto& profile = flowProfiles[index];
+            auto ueIt = ueIndexBySupi.find(profile.supi);
+            if (ueIt == ueIndexBySupi.end())
+            {
+                NS_FATAL_ERROR("shadow flow references unknown SUPI " << profile.supi);
+            }
+            const uint32_t ueIndex = ueIt->second;
+            const uint16_t downlinkPort = static_cast<uint16_t>(30000 + index);
+            const uint16_t uplinkPort = static_cast<uint16_t>(40000 + index);
+
+            Ptr<Socket> downlinkReceiver =
+                Socket::CreateSocket(gridScenario.GetUserTerminals().Get(ueIndex),
+                                     UdpSocketFactory::GetTypeId());
+            downlinkReceiver->Bind(InetSocketAddress(Ipv4Address::GetAny(), downlinkPort));
+            downlinkReceiver->SetRecvCallback(
+                MakeBoundCallback(&OnShadowSocketReceive, shadowContext.peer));
+            Ptr<Socket> downlinkSender =
+                Socket::CreateSocket(remoteHost, UdpSocketFactory::GetTypeId());
+            downlinkSender->Connect(
+                InetSocketAddress(ueIpIfaces.GetAddress(ueIndex), downlinkPort));
+
+            Ptr<Socket> uplinkReceiver =
+                Socket::CreateSocket(remoteHost, UdpSocketFactory::GetTypeId());
+            uplinkReceiver->Bind(InetSocketAddress(Ipv4Address::GetAny(), uplinkPort));
+            uplinkReceiver->SetRecvCallback(
+                MakeBoundCallback(&OnShadowSocketReceive, shadowContext.peer));
+            Ptr<Socket> uplinkSender =
+                Socket::CreateSocket(gridScenario.GetUserTerminals().Get(ueIndex),
+                                     UdpSocketFactory::GetTypeId());
+            uplinkSender->Connect(InetSocketAddress(remoteHostAddress, uplinkPort));
+
+            shadowContext.endpoints[profile.flowId] =
+                ShadowFlowEndpoint{uplinkSender, downlinkSender};
+            authorizations.push_back(ShadowFlowAuthorization{
+                profile.flowId,
+                static_cast<uint32_t>(std::max(64.0, profile.packetSizeBytes)),
+            });
+
+            const auto qci = profile.rlcMode == "AM"
+                                 ? NrEpsBearer::NGBR_VIDEO_TCP_DEFAULT
+                                 : NrEpsBearer::NGBR_VOICE_VIDEO_GAMING;
+            NrEpsBearer bearer(qci);
+            Ptr<NrEpcTft> tft = Create<NrEpcTft>();
+            NrEpcTft::PacketFilter downlinkFilter;
+            downlinkFilter.localPortStart = downlinkPort;
+            downlinkFilter.localPortEnd = downlinkPort;
+            tft->Add(downlinkFilter);
+            NrEpcTft::PacketFilter uplinkFilter;
+            uplinkFilter.remotePortStart = uplinkPort;
+            uplinkFilter.remotePortEnd = uplinkPort;
+            tft->Add(uplinkFilter);
+            nrHelper->ActivateDedicatedEpsBearer(ueNetDev.Get(ueIndex), bearer, tft);
+        }
+        shadowContext.peer->Configure(
+            userPlaneGateSocket,
+            virtualEpochUs,
+            authorizations,
+            MakeBoundCallback(&InjectShadowPacket, &shadowContext));
+        Simulator::Schedule(appStartTime, &GtpuShadowPeer::Start, shadowContext.peer);
+    }
+
     if (!externalTrafficOnly)
     {
         serverApps.Start(appStartTime);
@@ -2375,6 +2589,7 @@ main(int argc, char* argv[])
     context.bridgeLinkDelayMs = bridgeLinkDelayMs;
     context.bridgeLinkLossRate = bridgeLinkLossRate;
     context.externalTrafficOnly = externalTrafficOnly;
+    context.gatedUserPlane = !userPlaneGateSocket.empty();
     context.externalTrafficTargetIp = externalTrafficTargetIp;
     context.externalTrafficSourceBasePort = externalTrafficSourceBasePort;
     context.upfNames = upfNames;

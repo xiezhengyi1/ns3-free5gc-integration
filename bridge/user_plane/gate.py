@@ -86,6 +86,7 @@ class FrameGate:
             self.stats.capacity_drops += 1
             return None
         self._egress_by_packet[record.packet_id] = egress_port
+        shadow_size = decision.packet.inner_size_bytes or len(frame)
         self.coordinator.mark_submitted(record.packet_id)
         self.kpi.submitted(
             packet_id=record.packet_id,
@@ -93,7 +94,7 @@ class FrameGate:
             flow_id=decision.flow_id,
             direction=decision.direction.value,
             enqueue_ns3_us=ns3_time_us,
-            size_bytes=len(frame),
+            size_bytes=shadow_size,
         )
         self.peer_send(
             Message(
@@ -104,7 +105,7 @@ class FrameGate:
                     "epoch_id": epoch_id,
                     "flow_id": decision.flow_id,
                     "direction": decision.direction.value,
-                    "size_bytes": len(frame),
+                    "size_bytes": shadow_size,
                     "enqueue_ns3_us": ns3_time_us,
                     "virtual_expiry_us": expiry_us,
                     "teid": decision.packet.teid,

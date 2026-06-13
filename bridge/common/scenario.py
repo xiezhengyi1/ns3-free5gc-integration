@@ -141,6 +141,11 @@ class FlowConfig:
     policy_filter: str | None = None
     precedence: int | None = None
     qos_ref: int | None = None
+    qfi: int | None = None
+    ue_ip: str | None = None
+    inner_protocol: int | None = None
+    ue_port: int | None = None
+    remote_port: int | None = None
     charging_method: str | None = None
     quota: str | None = None
     unit_cost: str | None = None
@@ -414,6 +419,11 @@ class ScenarioConfig:
         if self.bridge.enable_inline_harness:
             if not self.bridge.n3_network_cidr:
                 raise ValueError("bridge.n3_network_cidr is required when inline harness is enabled")
+        if self.bridge.user_plane_gate.enabled:
+            if not self.bridge.enable_inline_harness:
+                raise ValueError("user-plane gate requires bridge.enable_inline_harness")
+            if len(self.gnbs) != 1:
+                raise ValueError("user-plane gate currently requires exactly one gNB N3 link")
         if self.bridge.n3_network_cidr:
             try:
                 n3_network = ipaddress.ip_network(self.bridge.n3_network_cidr, strict=True)
@@ -484,6 +494,30 @@ class ScenarioConfig:
                 raise ValueError(f"flow {flow.flow_id} rlc_mode must be 'UM' or 'AM'")
             if flow.virtual_expiry_ms <= 0:
                 raise ValueError(f"flow {flow.flow_id} virtual_expiry_ms must be positive")
+            if self.bridge.user_plane_gate.enabled:
+                if flow.ue_ip is None:
+                    raise ValueError(f"flow {flow.flow_id} ue_ip is required for user-plane gate")
+                try:
+                    ue_ip = ipaddress.ip_address(flow.ue_ip)
+                except ValueError as exc:
+                    raise ValueError(f"flow {flow.flow_id} has invalid ue_ip {flow.ue_ip}") from exc
+                if ue_ip.version != 4:
+                    raise ValueError(f"flow {flow.flow_id} ue_ip must be IPv4")
+                if flow.qfi is None and not any(
+                    value is not None
+                    for value in (flow.inner_protocol, flow.ue_port, flow.remote_port)
+                ):
+                    raise ValueError(
+                        f"flow {flow.flow_id} requires qfi or inner tuple binding"
+                    )
+            if flow.qfi is not None and not 0 <= flow.qfi <= 63:
+                raise ValueError(f"flow {flow.flow_id} qfi must be within [0, 63]")
+            for port_name, port_value in (
+                ("ue_port", flow.ue_port),
+                ("remote_port", flow.remote_port),
+            ):
+                if port_value is not None and not 1 <= port_value <= 65535:
+                    raise ValueError(f"flow {flow.flow_id} {port_name} must be within [1, 65535]")
             if flow.supi not in ue_by_supi:
                 raise ValueError(f"flow {flow.flow_id} references unknown SUPI {flow.supi}")
             if flow.ue_name is not None and flow.ue_name not in ue_by_name:
@@ -748,7 +782,16 @@ class ScenarioConfig:
                 ),
                 policy_filter=item.get("policy_filter") or item.get("filter"),
                 precedence=_optional_int(item.get("precedence")),
-                qos_ref=_optional_int(item.get("qos_ref") or item.get("qosRef") or item.get("qfi")),
+                qos_ref=_optional_int(
+                    item.get("qos_ref")
+                    if item.get("qos_ref") is not None
+                    else item.get("qosRef")
+                ),
+                qfi=_optional_int(item.get("qfi")),
+                ue_ip=(str(item["ue_ip"]) if item.get("ue_ip") is not None else None),
+                inner_protocol=_optional_int(item.get("inner_protocol")),
+                ue_port=_optional_int(item.get("ue_port")),
+                remote_port=_optional_int(item.get("remote_port")),
                 charging_method=item.get("charging_method") or item.get("chargingMethod"),
                 quota=item.get("quota"),
                 unit_cost=item.get("unit_cost") or item.get("unitCost"),

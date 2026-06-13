@@ -35,6 +35,8 @@ class RunManifest:
     clock_file: str
     ns3_flow_profile_file: str
     ns3_slice_resource_file: str
+    user_plane_gate_file: str | None
+    bearer_map_file: str | None
     state_db: str
     archive_dir: str
     ns3_source_file: str
@@ -63,6 +65,8 @@ def build_run_manifest(
     clock_file: Path,
     flow_profile_file: Path,
     slice_resource_file: Path,
+    user_plane_gate_file: Path | None,
+    bearer_map_file: Path | None,
     state_db: Path,
     archive_dir: Path,
     service_map: dict[str, dict[str, str]],
@@ -428,7 +432,11 @@ def build_run_manifest(
             argv=[*compose_base_argv, "down"],
         ),
     ]
-    if scenario.bridge.enable_inline_harness and bridge_plans:
+    if (
+        scenario.bridge.enable_inline_harness
+        and bridge_plans
+        and not scenario.bridge.user_plane_gate.enabled
+    ):
         ns3_run = next(command for command in commands if command.name == "ns3-run")
         ns3_run.argv.extend(
             [
@@ -485,6 +493,55 @@ def build_run_manifest(
                 ],
             ),
         )
+        if scenario.bridge.user_plane_gate.enabled:
+            if user_plane_gate_file is None or bearer_map_file is None:
+                raise ValueError("gated user plane requires rendered gate and bearer map files")
+            real_ue_flows = next(
+                command for command in commands if command.name == "real-ue-flows"
+            )
+            real_ue_flows.argv.extend(
+                [
+                    "--controlled",
+                    "--authorization-socket",
+                    f"{scenario.bridge.user_plane_gate.socket_path}.agents",
+                ]
+            )
+            ns3_run = next(command for command in commands if command.name == "ns3-run")
+            ns3_run.argv.extend(
+                [
+                    "--user-plane-gate-socket",
+                    scenario.bridge.user_plane_gate.socket_path,
+                    "--bearer-map-file",
+                    str(bearer_map_file),
+                    "--rng-seed",
+                    str(scenario.seed),
+                    "--rng-run",
+                    str(scenario.ns3.rng_run),
+                    "--virtual-epoch-us",
+                    str(scenario.ns3.virtual_epoch_us),
+                    "--channel-update-ms",
+                    str(scenario.ns3.channel_update_ms),
+                    "--shadowing-enabled",
+                    "true" if scenario.ns3.shadowing_enabled else "false",
+                    "--external-traffic-only",
+                ]
+            )
+            ns3_run_index = commands.index(ns3_run)
+            commands.insert(
+                ns3_run_index,
+                CommandSpec(
+                    name="user-plane-gate",
+                    cwd=str(project_root),
+                    argv=[
+                        python_command,
+                        "-m",
+                        "bridge.user_plane.cli",
+                        "--config",
+                        str(user_plane_gate_file),
+                    ],
+                    background=True,
+                ),
+            )
         ns3_run_index = next(
             index for index, command in enumerate(commands) if command.name == "ns3-run"
         )
@@ -545,6 +602,10 @@ def build_run_manifest(
         clock_file=str(clock_file),
         ns3_flow_profile_file=str(flow_profile_file),
         ns3_slice_resource_file=str(slice_resource_file),
+        user_plane_gate_file=(
+            str(user_plane_gate_file) if user_plane_gate_file is not None else None
+        ),
+        bearer_map_file=str(bearer_map_file) if bearer_map_file is not None else None,
         state_db=str(state_db),
         archive_dir=str(archive_dir),
         ns3_source_file=str(project_root / "sim" / "ns3" / "nr_multignb_multiupf.cc"),

@@ -1084,6 +1084,11 @@ def _render_ns3_flow_profiles(scenario: ScenarioConfig, output_path: Path) -> No
         "policy_filter",
         "precedence",
         "qos_ref",
+        "qfi",
+        "ue_ip",
+        "inner_protocol",
+        "ue_port",
+        "remote_port",
         "charging_method",
         "quota",
         "unit_cost",
@@ -1129,6 +1134,11 @@ def _render_ns3_flow_profiles(scenario: ScenarioConfig, output_path: Path) -> No
             flow.policy_filter,
             flow.precedence,
             flow.qos_ref,
+            flow.qfi,
+            flow.ue_ip,
+            flow.inner_protocol,
+            flow.ue_port,
+            flow.remote_port,
             flow.charging_method,
             flow.quota,
             flow.unit_cost,
@@ -1173,6 +1183,69 @@ def _render_ns3_slice_resources(scenario: ScenarioConfig, output_path: Path) -> 
         ]
         lines.append("\t".join(_format_tsv_value(value) for value in values))
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _render_user_plane_assets(
+    scenario: ScenarioConfig,
+    bridge_plans: list[Any],
+    generated_dir: Path,
+) -> tuple[Path, Path]:
+    if len(bridge_plans) != 1:
+        raise ValueError("user-plane gate currently requires exactly one bridge plan")
+    plan = bridge_plans[0]
+    gate = scenario.bridge.user_plane_gate
+    flow_rows = [
+        {
+            "flow_id": flow.flow_id,
+            "ue_ip": flow.ue_ip,
+            "qfi": flow.qfi,
+            "inner_protocol": flow.inner_protocol,
+            "ue_port": flow.ue_port,
+            "remote_port": flow.remote_port,
+            "virtual_expiry_us": round(flow.virtual_expiry_ms * 1000.0),
+        }
+        for flow in scenario.flows
+    ]
+    gate_payload = {
+        "gnb_tap": plan.gnb_tap,
+        "upf_tap": plan.upf_tap,
+        "socket_path": gate.socket_path,
+        "authorization_socket": f"{gate.socket_path}.agents",
+        "max_pending_packets": gate.max_pending_packets,
+        "max_pending_bytes": gate.max_pending_bytes,
+        "fail_closed": gate.fail_closed,
+        "gnb_ips": [plan.gnb_n3_ip],
+        "upf_ips": [plan.upf_n3_ip],
+        "event_log": str(generated_dir / scenario.ns3.output_subdir / "packet-events.jsonl"),
+        "kpi_log": str(generated_dir / scenario.ns3.output_subdir / "packet-kpis.jsonl"),
+        "flows": flow_rows,
+    }
+    bearer_payload = {
+        "rng_seed": scenario.seed,
+        "rng_run": scenario.ns3.rng_run,
+        "virtual_epoch_us": scenario.ns3.virtual_epoch_us,
+        "channel_update_ms": scenario.ns3.channel_update_ms,
+        "shadowing_enabled": scenario.ns3.shadowing_enabled,
+        "flows": [
+            {
+                **row,
+                "rlc_mode": flow.rlc_mode,
+                "five_qi": flow.five_qi,
+            }
+            for row, flow in zip(flow_rows, scenario.flows, strict=True)
+        ],
+    }
+    gate_file = generated_dir / "user-plane-gate.json"
+    bearer_file = generated_dir / "bearer-map.json"
+    gate_file.write_text(
+        json.dumps(gate_payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    bearer_file.write_text(
+        json.dumps(bearer_payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return gate_file, bearer_file
 
 
 def render_run_assets(
@@ -1222,6 +1295,12 @@ def render_run_assets(
     _render_ue_configs(scenario, config_dir, resolved_topology)
     _render_ns3_flow_profiles(scenario, flow_profile_file)
     _render_ns3_slice_resources(scenario, slice_resource_file)
+    user_plane_gate_file: Path | None = None
+    bearer_map_file: Path | None = None
+    if scenario.bridge.user_plane_gate.enabled:
+        user_plane_gate_file, bearer_map_file = _render_user_plane_assets(
+            scenario, bridge_plans, generated_dir
+        )
 
     compose_file = generated_dir / "free5gc-compose.generated.yaml"
     _yaml_dump(compose_file, compose_render.compose_payload)
@@ -1253,6 +1332,8 @@ def render_run_assets(
         clock_file=clock_file,
         flow_profile_file=flow_profile_file,
         slice_resource_file=slice_resource_file,
+        user_plane_gate_file=user_plane_gate_file,
+        bearer_map_file=bearer_map_file,
         state_db=state_db,
         archive_dir=archive_dir,
         service_map=compose_render.service_map,

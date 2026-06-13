@@ -47,6 +47,7 @@ class GtpuPacket:
     inner_protocol: int
     inner_src_port: int | None
     inner_dst_port: int | None
+    inner_size_bytes: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,6 +192,7 @@ def parse_gtpu_frame(frame: bytes) -> GtpuPacket:
         inner_protocol=inner.protocol,
         inner_src_port=inner_src_port,
         inner_dst_port=inner_dst_port,
+        inner_size_bytes=inner.end - cursor,
     )
 
 

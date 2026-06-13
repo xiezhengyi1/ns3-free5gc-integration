@@ -88,6 +88,7 @@ class GtpuParserTest(unittest.TestCase):
         self.assertEqual(parsed.inner_protocol, 17)
         self.assertEqual(parsed.inner_src_port, 4000)
         self.assertEqual(parsed.inner_dst_port, 5000)
+        self.assertGreater(parsed.inner_size_bytes, 20)
 
     def test_classifier_maps_qfi_before_tuple_fallback(self) -> None:
         classifier = FlowClassifier(

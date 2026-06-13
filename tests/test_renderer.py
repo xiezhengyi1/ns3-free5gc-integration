@@ -19,7 +19,11 @@ from adapters.free5gc_ueransim.compose_override import (
 )
 from bridge.common.ids import generate_run_id
 from bridge.common.scenario import load_scenario
-from bridge.orchestrator.config_renderer import _render_ns3_flow_profiles, render_run_assets
+from bridge.orchestrator.config_renderer import (
+    _render_ns3_flow_profiles,
+    _render_user_plane_assets,
+    render_run_assets,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +43,57 @@ class RendererTest(unittest.TestCase):
             rendered = dict(zip(header, values, strict=True))
             self.assertEqual(rendered["rlc_mode"], "UM")
             self.assertEqual(rendered["virtual_expiry_ms"], "1000.0")
+
+    def test_renders_gate_and_bearer_map_assets(self) -> None:
+        scenario = load_scenario(PROJECT_ROOT / "scenarios" / "s1_basic_single_slice.yaml")
+        flow = replace(
+            scenario.flows[0],
+            ue_ip="10.60.0.1",
+            qfi=9,
+            inner_protocol=17,
+            ue_port=15000,
+            remote_port=5000,
+            rlc_mode="UM",
+            virtual_expiry_ms=250.0,
+        )
+        scenario = replace(
+            scenario,
+            flows=(flow,),
+            bridge=replace(
+                scenario.bridge,
+                user_plane_gate=replace(
+                    scenario.bridge.user_plane_gate,
+                    enabled=True,
+                ),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            generated_dir = Path(directory)
+            plans = [
+                type(
+                    "Plan",
+                    (),
+                    {
+                        "gnb_tap": "tgnb1",
+                        "upf_tap": "tupf1",
+                        "gnb_n3_ip": "10.201.1.2",
+                        "upf_n3_ip": "10.201.1.3",
+                    },
+                )()
+            ]
+
+            gate_file, bearer_file = _render_user_plane_assets(
+                scenario, plans, generated_dir
+            )
+
+            gate = json.loads(gate_file.read_text(encoding="utf-8"))
+            bearer = json.loads(bearer_file.read_text(encoding="utf-8"))
+            self.assertEqual(gate["gnb_tap"], "tgnb1")
+            self.assertEqual(gate["flows"][0]["ue_ip"], "10.60.0.1")
+            self.assertEqual(gate["flows"][0]["virtual_expiry_us"], 250000)
+            self.assertEqual(bearer["flows"][0]["rlc_mode"], "UM")
+            self.assertEqual(bearer["rng_seed"], scenario.seed)
+            self.assertEqual(bearer["rng_run"], scenario.ns3.rng_run)
 
     def test_inline_harness_requires_explicit_n3_network(self) -> None:
         scenario = load_scenario(PROJECT_ROOT / "scenarios" / "s1_basic_single_slice.yaml")
