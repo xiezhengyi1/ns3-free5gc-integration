@@ -93,7 +93,7 @@ def _effective_tick_window_ms(
     return sim_gap, tick_gap
 
 
-def main(argv: list[str] | None = None) -> int:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generate real UE UDP traffic from ns-3 flow profiles")
     parser.add_argument("--flow-profile-file", required=True)
     parser.add_argument("--clock-file", required=True)
@@ -105,8 +105,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source-base-port", type=int, default=15000)
     parser.add_argument("--tick-ms", type=int, default=1000)
     parser.add_argument("--upf-container", action="append", required=True)
+    parser.add_argument(
+        "--controlled",
+        action="store_true",
+        help="send only after AUTHORIZE_SEND messages from the gate coordinator",
+    )
+    parser.add_argument(
+        "--authorization-socket",
+        help="Unix socket carrying versioned user-plane authorization messages",
+    )
     parser.add_argument("ue_mappings", nargs="+", help="UE-to-container mapping, for example ue1=nrint-ue1")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.controlled and not args.authorization_socket:
+        parser.error("--authorization-socket is required with --controlled")
 
     ue_containers = dict(item.split("=", 1) for item in args.ue_mappings)
     upf_containers = list(dict.fromkeys(args.upf_container))

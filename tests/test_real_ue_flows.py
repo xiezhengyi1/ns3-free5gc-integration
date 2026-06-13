@@ -14,6 +14,35 @@ SPEC.loader.exec_module(MODULE)
 
 
 class RealUeFlowsTest(unittest.TestCase):
+    def test_parser_accepts_controlled_mode(self) -> None:
+        parser = MODULE._build_parser()
+
+        args = parser.parse_args(
+            [
+                "--flow-profile-file",
+                "flows.tsv",
+                "--clock-file",
+                "clock.json",
+                "--state-file",
+                "state.jsonl",
+                "--run-id",
+                "run-1",
+                "--scenario-id",
+                "scenario-1",
+                "--target-ip",
+                "192.0.2.1",
+                "--upf-container",
+                "upf",
+                "--controlled",
+                "--authorization-socket",
+                "/tmp/authorize.sock",
+                "ue1=ue-container",
+            ]
+        )
+
+        self.assertTrue(args.controlled)
+        self.assertEqual(args.authorization_socket, "/tmp/authorize.sock")
+
     def test_effective_tick_window_uses_nominal_window_when_starting(self) -> None:
         elapsed_ms, skipped_ticks = MODULE._effective_tick_window_ms(
             last_tick=None,
