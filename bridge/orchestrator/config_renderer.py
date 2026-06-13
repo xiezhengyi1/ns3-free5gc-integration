@@ -1087,6 +1087,8 @@ def _render_ns3_flow_profiles(scenario: ScenarioConfig, output_path: Path) -> No
         "charging_method",
         "quota",
         "unit_cost",
+        "rlc_mode",
+        "virtual_expiry_ms",
     ]
     lines = ["\t".join(header)]
     for flow in scenario.flows:
@@ -1130,6 +1132,8 @@ def _render_ns3_flow_profiles(scenario: ScenarioConfig, output_path: Path) -> No
             flow.charging_method,
             flow.quota,
             flow.unit_cost,
+            flow.rlc_mode,
+            flow.virtual_expiry_ms,
         ]
         lines.append("\t".join(_format_tsv_value(value) for value in values))
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

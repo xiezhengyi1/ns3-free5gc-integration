@@ -19,6 +19,7 @@ packages = [
   "bridge",
   "bridge.common",
   "bridge.orchestrator",
+  "bridge.user_plane",
   "bridge.writer",
   "adapters",
   "adapters.free5gc_ueransim",

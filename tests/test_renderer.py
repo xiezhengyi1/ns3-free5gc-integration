@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 import shutil
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -18,13 +19,27 @@ from adapters.free5gc_ueransim.compose_override import (
 )
 from bridge.common.ids import generate_run_id
 from bridge.common.scenario import load_scenario
-from bridge.orchestrator.config_renderer import render_run_assets
+from bridge.orchestrator.config_renderer import _render_ns3_flow_profiles, render_run_assets
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class RendererTest(unittest.TestCase):
+    def test_flow_profile_renders_rlc_and_virtual_expiry(self) -> None:
+        scenario = load_scenario(PROJECT_ROOT / "scenarios" / "s1_basic_single_slice.yaml")
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "flow-profiles.tsv"
+
+            _render_ns3_flow_profiles(scenario, output)
+
+            rows = output.read_text(encoding="utf-8").splitlines()
+            header = rows[0].split("\t")
+            values = rows[1].split("\t")
+            rendered = dict(zip(header, values, strict=True))
+            self.assertEqual(rendered["rlc_mode"], "UM")
+            self.assertEqual(rendered["virtual_expiry_ms"], "1000.0")
+
     def test_inline_harness_requires_explicit_n3_network(self) -> None:
         scenario = load_scenario(PROJECT_ROOT / "scenarios" / "s1_basic_single_slice.yaml")
         invalid = replace(

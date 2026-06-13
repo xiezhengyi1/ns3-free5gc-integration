@@ -144,6 +144,8 @@ class FlowConfig:
     charging_method: str | None = None
     quota: str | None = None
     unit_cost: str | None = None
+    rlc_mode: str = "UM"
+    virtual_expiry_ms: float = 1000.0
     sla_target: SlaTargetConfig = field(default_factory=SlaTargetConfig)
 
 
@@ -205,6 +207,10 @@ class Ns3Config:
     bridge_link_loss_rate: float = 0.0
     policy_reload_ms: int = 1000
     slice_isolation: bool = False
+    rng_run: int = 1
+    virtual_epoch_us: int = 100_000
+    channel_update_ms: float = 10.0
+    shadowing_enabled: bool = True
 
 
 @dataclass(slots=True, frozen=True)
@@ -223,6 +229,15 @@ class TopologyConfig:
 
 
 @dataclass(slots=True, frozen=True)
+class UserPlaneGateConfig:
+    enabled: bool = False
+    fail_closed: bool = True
+    max_pending_packets: int = 8192
+    max_pending_bytes: int = 64 * 1024 * 1024
+    socket_path: str = "/tmp/ns3-free5gc-gate.sock"
+
+
+@dataclass(slots=True, frozen=True)
 class BridgeHarnessConfig:
     enable_inline_harness: bool = False
     gnb_n3_ifname: str | None = None
@@ -233,6 +248,7 @@ class BridgeHarnessConfig:
     upf_prefix: str = "tap-upf"
     bridge_prefix: str = "br-ran"
     host_veth_prefix: str = "veth-ran"
+    user_plane_gate: UserPlaneGateConfig = field(default_factory=UserPlaneGateConfig)
 
 
 @dataclass(slots=True, frozen=True)
@@ -383,6 +399,18 @@ class ScenarioConfig:
             raise ValueError("ns3.bridge_mode must currently be 'l2_inline'")
         if not 0.0 <= self.ns3.bridge_link_loss_rate <= 1.0:
             raise ValueError("ns3.bridge_link_loss_rate must be within [0.0, 1.0]")
+        if self.ns3.rng_run <= 0:
+            raise ValueError("ns3.rng_run must be positive")
+        if self.ns3.virtual_epoch_us <= 0:
+            raise ValueError("ns3.virtual_epoch_us must be positive")
+        if self.ns3.channel_update_ms <= 0:
+            raise ValueError("ns3.channel_update_ms must be positive")
+        if self.bridge.user_plane_gate.max_pending_packets <= 0:
+            raise ValueError("bridge.user_plane_gate.max_pending_packets must be positive")
+        if self.bridge.user_plane_gate.max_pending_bytes <= 0:
+            raise ValueError("bridge.user_plane_gate.max_pending_bytes must be positive")
+        if not self.bridge.user_plane_gate.socket_path:
+            raise ValueError("bridge.user_plane_gate.socket_path must not be empty")
         if self.bridge.enable_inline_harness:
             if not self.bridge.n3_network_cidr:
                 raise ValueError("bridge.n3_network_cidr is required when inline harness is enabled")
@@ -452,6 +480,10 @@ class ScenarioConfig:
             if app.ue_name is not None and app.ue_name not in ue_by_name:
                 raise ValueError(f"app {app.app_id} references unknown UE {app.ue_name}")
         for flow in self.flows:
+            if flow.rlc_mode not in {"UM", "AM"}:
+                raise ValueError(f"flow {flow.flow_id} rlc_mode must be 'UM' or 'AM'")
+            if flow.virtual_expiry_ms <= 0:
+                raise ValueError(f"flow {flow.flow_id} virtual_expiry_ms must be positive")
             if flow.supi not in ue_by_supi:
                 raise ValueError(f"flow {flow.flow_id} references unknown SUPI {flow.supi}")
             if flow.ue_name is not None and flow.ue_name not in ue_by_name:
@@ -720,6 +752,8 @@ class ScenarioConfig:
                 charging_method=item.get("charging_method") or item.get("chargingMethod"),
                 quota=item.get("quota"),
                 unit_cost=item.get("unit_cost") or item.get("unitCost"),
+                rlc_mode=str(item.get("rlc_mode", "UM")).upper(),
+                virtual_expiry_ms=float(item.get("virtual_expiry_ms", 1000.0)),
                 sla_target=SlaTargetConfig(
                     latency_ms=_optional_float(item.get("sla_target", {}).get("latency_ms"))
                     if isinstance(item.get("sla_target"), dict)
@@ -787,6 +821,12 @@ class ScenarioConfig:
                 bridge_link_loss_rate=float(ns3_payload.get("bridge_link_loss_rate", 0.0)),
                 policy_reload_ms=int(ns3_payload.get("policy_reload_ms", 1000)),
                 slice_isolation=bool(ns3_payload.get("slice_isolation", False)),
+                rng_run=int(ns3_payload.get("rng_run", 1)),
+                virtual_epoch_us=int(
+                    ns3_payload.get("virtual_epoch_us", int(payload.get("tick_ms", 1000)) * 1000)
+                ),
+                channel_update_ms=float(ns3_payload.get("channel_update_ms", 10.0)),
+                shadowing_enabled=bool(ns3_payload.get("shadowing_enabled", True)),
             ),
             writer=WriterConfig(
                 archive_dir=writer_payload.get("archive_dir", "artifacts/archive"),
@@ -811,6 +851,25 @@ class ScenarioConfig:
                 upf_prefix=bridge_payload.get("upf_prefix", "tap-upf"),
                 bridge_prefix=bridge_payload.get("bridge_prefix", "br-ran"),
                 host_veth_prefix=bridge_payload.get("host_veth_prefix", "veth-ran"),
+                user_plane_gate=UserPlaneGateConfig(
+                    enabled=bool(bridge_payload.get("user_plane_gate", {}).get("enabled", False)),
+                    fail_closed=bool(
+                        bridge_payload.get("user_plane_gate", {}).get("fail_closed", True)
+                    ),
+                    max_pending_packets=int(
+                        bridge_payload.get("user_plane_gate", {}).get("max_pending_packets", 8192)
+                    ),
+                    max_pending_bytes=int(
+                        bridge_payload.get("user_plane_gate", {}).get(
+                            "max_pending_bytes", 64 * 1024 * 1024
+                        )
+                    ),
+                    socket_path=str(
+                        bridge_payload.get("user_plane_gate", {}).get(
+                            "socket_path", "/tmp/ns3-free5gc-gate.sock"
+                        )
+                    ),
+                ),
             ),
             policy=PolicyConfig(
                 db_url=resolved_policy_db_url,

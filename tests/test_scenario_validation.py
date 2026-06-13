@@ -133,6 +133,53 @@ class ScenarioValidationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "offered DL load"):
             ScenarioConfig.from_dict(payload)
 
+    def test_loads_gated_user_plane_defaults(self) -> None:
+        payload = _base_payload()
+        payload.setdefault("bridge", {})["user_plane_gate"] = {"enabled": True}
+
+        scenario = ScenarioConfig.from_dict(payload)
+
+        self.assertEqual(scenario.flows[0].rlc_mode, "UM")
+        self.assertEqual(scenario.flows[0].virtual_expiry_ms, 1000.0)
+        self.assertEqual(scenario.ns3.rng_run, 1)
+        self.assertEqual(scenario.ns3.virtual_epoch_us, 100_000)
+        self.assertEqual(scenario.ns3.channel_update_ms, 10.0)
+        self.assertTrue(scenario.ns3.shadowing_enabled)
+        self.assertTrue(scenario.bridge.user_plane_gate.enabled)
+        self.assertTrue(scenario.bridge.user_plane_gate.fail_closed)
+        self.assertEqual(scenario.bridge.user_plane_gate.max_pending_packets, 8192)
+
+    def test_rejects_invalid_rlc_mode(self) -> None:
+        payload = _base_payload()
+        payload["flows"][0]["rlc_mode"] = "TM"
+
+        with self.assertRaisesRegex(ValueError, "rlc_mode"):
+            ScenarioConfig.from_dict(payload)
+
+    def test_rejects_non_positive_virtual_expiry(self) -> None:
+        payload = _base_payload()
+        payload["flows"][0]["virtual_expiry_ms"] = 0
+
+        with self.assertRaisesRegex(ValueError, "virtual_expiry_ms"):
+            ScenarioConfig.from_dict(payload)
+
+    def test_rejects_invalid_gate_capacity(self) -> None:
+        payload = _base_payload()
+        payload.setdefault("bridge", {})["user_plane_gate"] = {
+            "enabled": True,
+            "max_pending_packets": 0,
+        }
+
+        with self.assertRaisesRegex(ValueError, "max_pending_packets"):
+            ScenarioConfig.from_dict(payload)
+
+    def test_rejects_non_positive_ns3_virtual_time_parameters(self) -> None:
+        payload = _base_payload()
+        payload["ns3"]["virtual_epoch_us"] = 0
+
+        with self.assertRaisesRegex(ValueError, "virtual_epoch_us"):
+            ScenarioConfig.from_dict(payload)
+
 
 if __name__ == "__main__":
     unittest.main()
