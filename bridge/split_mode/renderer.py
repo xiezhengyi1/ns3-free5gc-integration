@@ -246,7 +246,8 @@ def render_split_run(
         shutil.rmtree(run_dir)
     rendered = render_run_assets(project_root, config.control_plane_scenario, resolved_run_id)
     _rewrite_split_control_plane_configs(config, rendered.config_dir)
-    _rewrite_split_uerouting_pfds(config, rendered.config_dir)
+    if config.control_plane_scenario.free5gc.mode == "ulcl":
+        _rewrite_split_uerouting_pfds(config, rendered.config_dir)
     run_dir = rendered.run_dir
     generated_dir = rendered.generated_dir
     split_dir = generated_dir / "split-mode"
@@ -263,7 +264,7 @@ def render_split_run(
 
     base_manifest = rendered.manifest
     scenario = config.control_plane_scenario
-    inline_harness_enabled = config.base_scenario.bridge.enable_inline_harness
+    inline_harness_enabled = scenario.bridge.enable_inline_harness
     bridge_plans = (
         build_bridge_plan(
             config.base_scenario,
@@ -301,7 +302,10 @@ def render_split_run(
     gnb_index_by_name = {gnb.name: index for index, gnb in enumerate(scenario.gnbs, start=1)}
     upf_index_by_name = {upf.name: index for index, upf in enumerate(scenario.upfs, start=1)}
     ue_gnb_map = ",".join(str(gnb_index_by_name[resolved_topology.ue_to_gnb[ue.name]]) for ue in scenario.ues)
-    gnb_upf_map = ",".join(str(upf_index_by_name[resolved_topology.gnb_to_upf[gnb.name]]) for gnb in scenario.gnbs)
+    gnb_upf_map = ",".join(
+        str(upf_index_by_name[resolved_topology.gnb_to_upfs[gnb.name][0]])
+        for gnb in scenario.gnbs
+    )
     gnb_positions = ";".join(
         (
             f"{position.x}:{position.y}:{position.z}"
@@ -794,6 +798,18 @@ def render_split_run(
         core_services=list(base_manifest.core_services),
         ran_services=list(base_manifest.ran_services),
         service_map=service_map,
+        fast_reset={
+            "api_url": "http://127.0.0.1:18081",
+            "state_file": str(run_dir / "state" / "fast-reset-state.json"),
+            "process_registry": str(run_dir / "state" / "fast-reset-processes.json"),
+            "serve_argv": [
+                python_command,
+                "-m",
+                "bridge.orchestrator.fast_reset",
+                "serve",
+                str(run_dir / "run-manifest.split.json"),
+            ],
+        },
         commands=commands,
     )
     manifest_path = run_dir / "run-manifest.split.json"

@@ -50,7 +50,7 @@ python scripts/render_run.py scenarios/free5gc_ueransim_gtpu_nr.yaml
 python scripts/start_stack.py artifacts/runs/<run-id>/run-manifest.json
 ```
 
-该模式以 `Simulator::Now()` 为唯一实验时钟。控制面继续使用墙钟保持会话，UDP agent 只在 ns-3 `AUTHORIZE_SEND` 后发送一包。逐包事件和 tick KPI 分别写入 `generated/ns3/packet-events.jsonl` 与 `packet-kpis.jsonl`。当前首个在线实现限定单 gNB-UPF N3 链路；未映射、容量溢出、peer 断连均 fail-closed。
+该模式以 `Simulator::Now()` 为唯一实验时钟。控制面继续使用墙钟保持会话，UDP agent 只在 ns-3 `AUTHORIZE_SEND` 后发送一包；启动较晚的 agent 会收到当前 epoch 的缓冲授权，重复授权不会重复发包。逐包事件和 tick KPI 分别写入 `generated/ns3/packet-events.jsonl` 与 `packet-kpis.jsonl`，空日志、非有限值、类型错误和守恒失败都会使运行验证失败。N3 支持多个 gNB、多个 UPF 和任意声明的端点边；共享端点只创建一个 TAP，未映射、容量溢出、peer 断连均 fail-closed。
 
 ## 前置依赖
 
@@ -310,7 +310,7 @@ upfs:
 gnbs:
   - name: gnb1
     alias: gnb.free5gc.org
-    backhaul_upf: upf
+    backhaul_upfs: [upf]
 ues:
   - name: ue1
     supi: imsi-208930000000001
@@ -318,6 +318,18 @@ ues:
     sessions:
       - apn: internet
         slice_ref: slice-1-010203
+```
+
+多对多 N3 使用必填的 `backhaul_upfs` 声明一个 gNB 的全部可达 UPF，并可在 flow 上用 `upf_ref` 选择业务 UPF。未设置 `upf_ref` 时使用该 gNB 的第一条 N3 边。
+
+```yaml
+gnbs:
+  - name: gnb1
+    backhaul_upfs: [i-upf, psa-upf]
+flows:
+  - flow_id: flow-video
+    ue_name: ue1
+    upf_ref: psa-upf
 ```
 
       ### baseline_multi_ue.yaml
@@ -374,6 +386,22 @@ python -m bridge.orchestrator.cli prepare-run scenarios/baseline_ulcl_multi_gnb.
 ```bash
 python scripts/start_stack.py artifacts/runs/<run-id>/run-manifest.json
 ```
+
+需要反复执行实验时，改用 manifest 内置的快速重置监督器。首次启动执行冷启动，之后的 `POST /v1/reset` 会终止上一代 gate/writer/ns-3 进程，并行重启既有 Compose 服务、恢复订阅者和应用策略、重建 TAP，再从 generation 0 重新启动 ns-3，不重新构建 ns-3 或 Compose 网络：
+
+```bash
+python -m bridge.orchestrator.fast_reset serve \
+  artifacts/runs/<run-id>/run-manifest.json --initialize cold
+
+python -m bridge.orchestrator.fast_reset reset
+python -m bridge.orchestrator.fast_reset status
+
+# 或直接调用接口
+curl -X POST http://127.0.0.1:18081/v1/reset \
+  -H 'Content-Type: application/json' -d '{}'
+```
+
+`run-manifest.split.json` 使用同一接口。不要同时用 `start_stack.py` 和快速重置监督器管理同一个 run。重置响应表示新一代进程已经启动；PDU Session 就绪仍由 gate/流量生成器的 fail-closed 等待机制保证。非 loopback 监听必须配置 `--token`。
 
 图驱动的一键启动、日志查看和图增量写回说明见 [docs/start_graph_stack.md](docs/start_graph_stack.md)。
 

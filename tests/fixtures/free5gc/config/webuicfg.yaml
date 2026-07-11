@@ -1,0 +1,4 @@
+configuration:
+  webServer:
+    scheme: http
+    port: 5000

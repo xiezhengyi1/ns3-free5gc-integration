@@ -167,7 +167,7 @@ def _summarize_ns3_snapshot(
         for ue in scenario.ues
     }
     expected_gnb_upf_map = {
-        f"gnb-{index}": resolved_topology.gnb_to_upf[gnb.name]
+        f"gnb-{index}": resolved_topology.gnb_to_upfs[gnb.name][0]
         for index, gnb in enumerate(scenario.gnbs, start=1)
     }
     actual_ue_bindings = {

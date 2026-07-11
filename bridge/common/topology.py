@@ -31,7 +31,7 @@ class NodePosition:
 @dataclass(slots=True, frozen=True)
 class ResolvedScenarioTopology:
     ue_to_gnb: dict[str, str]
-    gnb_to_upf: dict[str, str]
+    gnb_to_upfs: dict[str, tuple[str, ...]]
     gnb_positions: dict[str, NodePosition]
     ue_positions: dict[str, NodePosition]
     source_graph_file: str | None = None
@@ -40,7 +40,9 @@ class ResolvedScenarioTopology:
         return {
             "source_graph_file": self.source_graph_file,
             "ue_to_gnb": dict(self.ue_to_gnb),
-            "gnb_to_upf": dict(self.gnb_to_upf),
+            "gnb_to_upfs": {
+                gnb_name: list(upf_names) for gnb_name, upf_names in self.gnb_to_upfs.items()
+            },
             "gnb_positions": {
                 name: asdict(position) for name, position in self.gnb_positions.items()
             },
@@ -58,7 +60,7 @@ class TopologyGraphData:
     gnbs: dict[str, dict[str, object]]
     ues: dict[str, dict[str, object]]
     ue_to_gnb: dict[str, str]
-    gnb_to_upf: dict[str, str]
+    gnb_to_upfs: dict[str, tuple[str, ...]]
     gnb_positions: dict[str, NodePosition]
     ue_positions: dict[str, NodePosition]
 
@@ -359,7 +361,7 @@ def load_topology_graph(path: str | Path) -> TopologyGraphData:
     gnb_payloads: dict[str, dict[str, object]] = {}
     ue_payloads: dict[str, dict[str, object]] = {}
     ue_to_gnb: dict[str, str] = {}
-    gnb_to_upf: dict[str, str] = {}
+    gnb_to_upfs: dict[str, list[str]] = {}
     gnb_positions: dict[str, NodePosition] = {}
     ue_positions: dict[str, NodePosition] = {}
 
@@ -421,8 +423,11 @@ def load_topology_graph(path: str | Path) -> TopologyGraphData:
                 entry.setdefault("tac", int(attributes["tac"]))
             if attributes.get("nci") is not None:
                 entry.setdefault("nci", str(attributes["nci"]))
-            if isinstance(attributes.get("backhaul_upf"), str) and attributes["backhaul_upf"]:
-                entry.setdefault("backhaul_upf", str(attributes["backhaul_upf"]))
+            backhaul_upfs = _coerce_string_list(attributes.get("backhaul_upfs"))
+            if backhaul_upfs:
+                entry["backhaul_upfs"] = _merge_string_lists(
+                    _coerce_string_list(entry.get("backhaul_upfs")), backhaul_upfs
+                )
             slices = entry.setdefault("slices", [])
             for descriptor in attributes.get("slices", []) if isinstance(attributes.get("slices"), list) else []:
                 slice_ref = _register_slice_payload(slice_payloads, descriptor)
@@ -486,9 +491,15 @@ def load_topology_graph(path: str | Path) -> TopologyGraphData:
 
         if edge_type == "tunneled_via":
             if source in gnb_node_ids and target in upf_node_ids:
-                gnb_to_upf[gnb_node_ids[source]] = upf_node_ids[target]
+                gnb_name = gnb_node_ids[source]
+                upf_name = upf_node_ids[target]
+                if upf_name not in gnb_to_upfs.setdefault(gnb_name, []):
+                    gnb_to_upfs[gnb_name].append(upf_name)
             elif target in gnb_node_ids and source in upf_node_ids:
-                gnb_to_upf[gnb_node_ids[target]] = upf_node_ids[source]
+                gnb_name = gnb_node_ids[target]
+                upf_name = upf_node_ids[source]
+                if upf_name not in gnb_to_upfs.setdefault(gnb_name, []):
+                    gnb_to_upfs[gnb_name].append(upf_name)
             continue
 
         if edge_type == "serves_slice":
@@ -532,10 +543,20 @@ def load_topology_graph(path: str | Path) -> TopologyGraphData:
                 sessions.append(session_payload)
                 entry["sessions"] = sessions
 
+    for gnb_name, entry in gnb_payloads.items():
+        declared_upfs = _coerce_string_list(entry.get("backhaul_upfs"))
+        if declared_upfs:
+            gnb_to_upfs[gnb_name] = _merge_string_lists(
+                declared_upfs, gnb_to_upfs.get(gnb_name, [])
+            )
+
     for ue_name, gnb_name in ue_to_gnb.items():
         ue_payloads.setdefault(ue_name, {"name": ue_name}).setdefault("gnb", gnb_name)
-    for gnb_name, upf_name in gnb_to_upf.items():
-        gnb_payloads.setdefault(gnb_name, {"name": gnb_name}).setdefault("backhaul_upf", upf_name)
+    for gnb_name, upf_names in gnb_to_upfs.items():
+        entry = gnb_payloads.setdefault(gnb_name, {"name": gnb_name})
+        entry["backhaul_upfs"] = _merge_string_lists(
+            _coerce_string_list(entry.get("backhaul_upfs")), upf_names
+        )
 
     for entry in ue_payloads.values():
         if isinstance(entry.get("sessions"), list):
@@ -551,7 +572,7 @@ def load_topology_graph(path: str | Path) -> TopologyGraphData:
         gnbs=gnb_payloads,
         ues=ue_payloads,
         ue_to_gnb=ue_to_gnb,
-        gnb_to_upf=gnb_to_upf,
+        gnb_to_upfs={name: tuple(values) for name, values in gnb_to_upfs.items()},
         gnb_positions=gnb_positions,
         ue_positions=ue_positions,
     )
@@ -617,12 +638,16 @@ def _merge_upf_item(existing: dict[str, object], derived: dict[str, object]) -> 
 
 def _merge_gnb_item(existing: dict[str, object], derived: dict[str, object]) -> dict[str, object]:
     merged = copy.deepcopy(existing)
-    for field in ("alias", "tac", "nci", "backhaul_upf"):
+    for field in ("alias", "tac", "nci"):
         if field not in merged and field in derived:
             merged[field] = copy.deepcopy(derived[field])
     merged["slices"] = _merge_string_lists(
         _coerce_string_list(merged.get("slices")),
         _coerce_string_list(derived.get("slices")),
+    )
+    merged["backhaul_upfs"] = _merge_string_lists(
+        _coerce_string_list(merged.get("backhaul_upfs")),
+        _coerce_string_list(derived.get("backhaul_upfs")),
     )
     return merged
 
@@ -728,9 +753,9 @@ def _align_graph_data_to_payload(
         ue_rename_map.get(ue_name, ue_name): gnb_rename_map.get(gnb_name, gnb_name)
         for ue_name, gnb_name in graph.ue_to_gnb.items()
     }
-    renamed_gnb_to_upf = {
-        gnb_rename_map.get(gnb_name, gnb_name): upf_name
-        for gnb_name, upf_name in graph.gnb_to_upf.items()
+    renamed_gnb_to_upfs = {
+        gnb_rename_map.get(gnb_name, gnb_name): upf_names
+        for gnb_name, upf_names in graph.gnb_to_upfs.items()
     }
 
     return TopologyGraphData(
@@ -740,7 +765,7 @@ def _align_graph_data_to_payload(
         gnbs=renamed_gnbs,
         ues=renamed_ues,
         ue_to_gnb=renamed_ue_to_gnb,
-        gnb_to_upf=renamed_gnb_to_upf,
+        gnb_to_upfs=renamed_gnb_to_upfs,
         gnb_positions=renamed_gnb_positions,
         ue_positions=renamed_ue_positions,
     )
@@ -791,10 +816,10 @@ def resolve_scenario_topology(scenario: ScenarioConfig) -> ResolvedScenarioTopol
         for ue in scenario.ues
         if ue.gnb is not None
     }
-    gnb_to_upf = {
-        gnb.name: gnb.backhaul_upf
+    gnb_to_upfs = {
+        gnb.name: list(gnb.backhaul_upfs)
         for gnb in scenario.gnbs
-        if gnb.backhaul_upf is not None
+        if gnb.backhaul_upfs
     }
     gnb_positions: dict[str, NodePosition] = {}
     ue_positions: dict[str, NodePosition] = {}
@@ -823,25 +848,26 @@ def resolve_scenario_topology(scenario: ScenarioConfig) -> ResolvedScenarioTopol
         for ue_name, gnb_name in graph.ue_to_gnb.items():
             if ue_name in {ue.name for ue in scenario.ues} and gnb_name in gnb_names:
                 ue_to_gnb[ue_name] = gnb_name
-        for gnb_name, upf_name in graph.gnb_to_upf.items():
-            if gnb_name in gnb_names and upf_name in upf_names:
-                gnb_to_upf[gnb_name] = upf_name
+        for gnb_name, graph_upfs in graph.gnb_to_upfs.items():
+            if gnb_name in gnb_names:
+                filtered = [upf_name for upf_name in graph_upfs if upf_name in upf_names]
+                if filtered:
+                    gnb_to_upfs[gnb_name] = filtered
 
     for ue in scenario.ues:
         policy_target = _find_policy_target(ue)
         if policy_target is not None:
             ue_to_gnb[ue.name] = policy_target
 
-    resolved_gnb_to_upf: dict[str, str] = {}
+    resolved_gnb_to_upfs: dict[str, tuple[str, ...]] = {}
     for gnb in scenario.gnbs:
-        candidate = gnb_to_upf.get(gnb.name)
-        if candidate is None and len(scenario.upfs) == 1:
-            candidate = scenario.upfs[0].name
-        if candidate is None:
+        candidates = list(dict.fromkeys(gnb_to_upfs.get(gnb.name, ())))
+        if not candidates:
             raise ValueError(f"gNB {gnb.name} has no resolved backhaul UPF")
-        if candidate not in upf_names:
-            raise ValueError(f"gNB {gnb.name} resolved unknown UPF {candidate}")
-        resolved_gnb_to_upf[gnb.name] = candidate
+        for candidate in candidates:
+            if candidate not in upf_names:
+                raise ValueError(f"gNB {gnb.name} resolved unknown UPF {candidate}")
+        resolved_gnb_to_upfs[gnb.name] = tuple(candidates)
 
     resolved_ue_to_gnb: dict[str, str] = {}
     for ue in scenario.ues:
@@ -854,7 +880,7 @@ def resolve_scenario_topology(scenario: ScenarioConfig) -> ResolvedScenarioTopol
 
     return ResolvedScenarioTopology(
         ue_to_gnb=resolved_ue_to_gnb,
-        gnb_to_upf=resolved_gnb_to_upf,
+        gnb_to_upfs=resolved_gnb_to_upfs,
         gnb_positions=gnb_positions,
         ue_positions=ue_positions,
         source_graph_file=source_graph_file,

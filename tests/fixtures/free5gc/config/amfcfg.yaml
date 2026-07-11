@@ -1,0 +1,19 @@
+configuration:
+  ngapIpList:
+    - 127.0.0.1
+  sbi:
+    registerIPv4: 127.0.0.1
+    bindingIPv4: 127.0.0.1
+  metrics:
+    bindingIPv4: 127.0.0.1
+  servedGuamiList:
+    - plmnId:
+        mcc: "208"
+        mnc: "93"
+  supportTaiList: []
+  plmnSupportList:
+    - plmnId:
+        mcc: "208"
+        mnc: "93"
+      snssaiList: []
+  supportDnnList: []

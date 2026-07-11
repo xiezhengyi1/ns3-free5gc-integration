@@ -19,6 +19,7 @@ from adapters.free5gc_ueransim.subscriber_bootstrap import (
 from bridge.common.ids import generate_run_id
 from bridge.common.scenario import ScenarioConfig, load_scenario
 from bridge.orchestrator.config_renderer import render_run_assets
+from tests.free5gc_fixture import with_free5gc_fixture
 from tests.test_topology import build_semantic_graph_summary
 
 
@@ -73,7 +74,7 @@ class SubscriberBootstrapTest(unittest.TestCase):
         )
 
     def test_renders_payload_file_and_webui_url(self) -> None:
-        scenario = load_scenario(PROJECT_ROOT / "scenarios" / "s1_basic_single_slice.yaml")
+        scenario = with_free5gc_fixture(load_scenario(PROJECT_ROOT / "scenarios" / "s1_basic_single_slice.yaml"))
         run_id = generate_run_id("testsubs")
         rendered = render_run_assets(PROJECT_ROOT, scenario, run_id)
         try:

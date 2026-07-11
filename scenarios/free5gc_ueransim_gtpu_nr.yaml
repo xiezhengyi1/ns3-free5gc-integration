@@ -30,7 +30,7 @@ gnbs:
     tac: 1
     nci: "0x000000001"
     slices: [slice-2-000001]
-    backhaul_upf: upf
+    backhaul_upfs: [upf]
 
 ues:
   - name: ue-telemed
@@ -182,7 +182,6 @@ bridge:
   n3_network_cidr: 10.201.1.0/29
   user_plane_gate:
     enabled: true
-    fail_closed: true
     max_pending_packets: 8192
     max_pending_bytes: 67108864
     socket_path: /tmp/ns3-free5gc-gate.sock

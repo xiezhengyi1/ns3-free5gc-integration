@@ -94,10 +94,18 @@ class GtpuParserTest(unittest.TestCase):
     def test_classifier_maps_qfi_before_tuple_fallback(self) -> None:
         classifier = FlowClassifier(
             bindings=[
-                FlowBinding("qfi-flow", qfi=9, ue_ip="10.60.0.1"),
+                FlowBinding(
+                    "qfi-flow",
+                    qfi=9,
+                    ue_ip="10.60.0.1",
+                    gnb_ip="10.0.0.2",
+                    upf_ip="10.0.0.3",
+                ),
                 FlowBinding(
                     "tuple-flow",
                     ue_ip="10.60.0.1",
+                    gnb_ip="10.0.0.2",
+                    upf_ip="10.0.0.3",
                     inner_protocol=17,
                     ue_port=4000,
                     remote_port=5000,
@@ -119,6 +127,8 @@ class GtpuParserTest(unittest.TestCase):
                 FlowBinding(
                     "tuple-flow",
                     ue_ip="10.60.0.1",
+                    gnb_ip="10.0.0.2",
+                    upf_ip="10.0.0.3",
                     inner_protocol=17,
                     ue_port=4000,
                     remote_port=5000,
@@ -139,6 +149,8 @@ class GtpuParserTest(unittest.TestCase):
                 FlowBinding(
                     "downlink",
                     ue_ip="10.60.0.1",
+                    gnb_ip="10.0.0.2",
+                    upf_ip="10.0.0.3",
                     inner_protocol=17,
                     ue_port=4000,
                     remote_port=5000,
@@ -175,6 +187,23 @@ class GtpuParserTest(unittest.TestCase):
 
     def test_unmapped_gpdu_fails_closed(self) -> None:
         classifier = FlowClassifier([], gnb_ips=["10.0.0.2"], upf_ips=["10.0.0.3"])
+
+        self.assertEqual(classifier.classify(_frame()).kind, DecisionKind.UNMAPPED)
+
+    def test_rejects_qfi_match_on_wrong_n3_edge(self) -> None:
+        classifier = FlowClassifier(
+            [
+                FlowBinding(
+                    "qfi-flow",
+                    ue_ip="10.60.0.1",
+                    gnb_ip="10.0.0.2",
+                    upf_ip="10.0.0.4",
+                    qfi=9,
+                )
+            ],
+            gnb_ips=["10.0.0.2"],
+            upf_ips=["10.0.0.3", "10.0.0.4"],
+        )
 
         self.assertEqual(classifier.classify(_frame()).kind, DecisionKind.UNMAPPED)
 

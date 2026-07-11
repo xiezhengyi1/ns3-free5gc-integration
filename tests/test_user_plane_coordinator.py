@@ -16,14 +16,13 @@ class PacketCoordinatorTest(unittest.TestCase):
         self.coordinator = PacketCoordinator(max_pending_packets=2, max_pending_bytes=8)
         self.epoch = self.coordinator.begin_epoch(start_ns3_us=1000)
 
-    def _capture(self, frame: bytes = b"abcd", expiry_us: int = 500):
+    def _capture(self, frame: bytes = b"abcd"):
         return self.coordinator.capture(
             frame=frame,
             flow_id="flow-1",
             direction="uplink",
             epoch_id=self.epoch,
             enqueue_ns3_us=1000,
-            virtual_expiry_us=expiry_us,
         )
 
     def test_allocates_monotonic_epoch_and_packet_ids(self) -> None:
@@ -35,7 +34,6 @@ class PacketCoordinatorTest(unittest.TestCase):
             direction="uplink",
             epoch_id=second_epoch,
             enqueue_ns3_us=2000,
-            virtual_expiry_us=500,
         )
 
         self.assertEqual((self.epoch, second_epoch), (1, 2))
@@ -105,19 +103,6 @@ class PacketCoordinatorTest(unittest.TestCase):
         with self.assertRaises(CapacityError):
             self._capture(b"x")
 
-    def test_expiry_uses_virtual_time(self) -> None:
-        packet = self._capture(expiry_us=500)
-        self.coordinator.mark_submitted(packet.packet_id)
-
-        self.assertEqual(self.coordinator.expire(ns3_now_us=1499), [])
-        actions = self.coordinator.expire(ns3_now_us=1500)
-
-        self.assertEqual([action.packet_id for action in actions], [packet.packet_id])
-        self.assertEqual(
-            self.coordinator.packet(packet.packet_id).terminal_reason,
-            "virtual-expiry",
-        )
-
     def test_peer_disconnect_fails_closed(self) -> None:
         first = self._capture(b"aa")
         second = self._capture(b"bb")
@@ -127,7 +112,6 @@ class PacketCoordinatorTest(unittest.TestCase):
 
         self.assertEqual({action.packet_id for action in actions}, {first.packet_id, second.packet_id})
         self.assertTrue(all(action.kind is ActionKind.DISCARD for action in actions))
-
 
 if __name__ == "__main__":
     unittest.main()

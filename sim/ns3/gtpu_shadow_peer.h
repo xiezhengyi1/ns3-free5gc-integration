@@ -7,11 +7,13 @@
 #include "ns3/object.h"
 
 #include <arpa/inet.h>
+#include <chrono>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <fcntl.h>
 #include <map>
-#include <poll.h>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -19,6 +21,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <vector>
+#include <thread>
 
 namespace ns3
 {
@@ -36,6 +39,8 @@ struct ShadowPacketRequest
     std::string flowId;
     std::string direction;
     uint32_t sizeBytes = 0;
+    uint32_t qfi = 0;
+    uint64_t enqueueNs3Us = 0;
     uint64_t virtualExpiryUs = 0;
 };
 
@@ -73,12 +78,14 @@ class GtpuShadowPeer : public Object
     void Configure(const std::string& socketPath,
                    uint64_t virtualEpochUs,
                    const std::vector<ShadowFlowAuthorization>& flows,
-                   InjectCallback inject)
+                   InjectCallback inject,
+                   uint64_t maxEpochs = 0)
     {
         m_socketPath = socketPath;
         m_virtualEpochUs = virtualEpochUs;
         m_flows = flows;
         m_inject = inject;
+        m_maxEpochs = maxEpochs;
     }
 
     void Start()
@@ -215,9 +222,27 @@ class GtpuShadowPeer : public Object
         return json.substr(valueStart, end - valueStart);
     }
 
+    static uint64_t FindOptionalUnsigned(const std::string& json,
+                                         const std::string& key,
+                                         uint64_t fallback)
+    {
+        const std::string marker = Quote(key) + ":";
+        const auto start = json.find(marker);
+        if (start == std::string::npos)
+        {
+            return fallback;
+        }
+        const size_t cursor = start + marker.size();
+        if (json.compare(cursor, 4, "null") == 0)
+        {
+            return fallback;
+        }
+        return FindUnsigned(json, key);
+    }
+
     void Connect()
     {
-        m_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        m_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
         if (m_fd < 0)
         {
             throw std::runtime_error("failed to create gate socket");
@@ -229,13 +254,14 @@ class GtpuShadowPeer : public Object
             throw std::runtime_error("gate socket path is too long");
         }
         std::strncpy(address.sun_path, m_socketPath.c_str(), sizeof(address.sun_path) - 1);
-        while (connect(m_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0)
+        if (connect(m_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0)
         {
-            if (errno != ENOENT && errno != ECONNREFUSED)
-            {
-                throw std::runtime_error("failed to connect to user-plane gate");
-            }
-            usleep(100000);
+            const int error = errno;
+            close(m_fd);
+            m_fd = -1;
+            throw std::runtime_error(
+                "user-plane gate is not ready for non-blocking connect: " +
+                std::string(std::strerror(error)));
         }
         Send(HELLO, JsonObject({{"role", Quote("ns3-shadow-peer")}}));
     }
@@ -252,10 +278,15 @@ class GtpuShadowPeer : public Object
             Send(TICK_COMPLETE,
                  JsonObject({{"epoch_id", Number(m_epochId)},
                              {"ns3_time_us", Number(Simulator::Now().GetMicroSeconds())}}));
+            if (m_maxEpochs > 0 && m_epochId >= m_maxEpochs)
+            {
+                return;
+            }
         }
         ++m_epochId;
         m_receivedThisEpoch = 0;
         m_expectedThisEpoch = m_flows.size() * 2;
+        m_epochWaitStarted = std::chrono::steady_clock::now();
         Send(EPOCH_START,
              JsonObject({{"epoch_id", Number(m_epochId)},
                          {"ns3_time_us", Number(Simulator::Now().GetMicroSeconds())}}));
@@ -280,8 +311,14 @@ class GtpuShadowPeer : public Object
         ReceiveAvailable();
         if (m_receivedThisEpoch < m_expectedThisEpoch)
         {
-            pollfd descriptor{m_fd, POLLIN, 0};
-            poll(&descriptor, 1, 10);
+            if (std::chrono::steady_clock::now() - m_epochWaitStarted >
+                std::chrono::seconds(30))
+            {
+                NS_FATAL_ERROR("timed out waiting for controlled packets in epoch "
+                               << m_epochId << ": received=" << m_receivedThisEpoch
+                               << " expected=" << m_expectedThisEpoch);
+            }
+            std::this_thread::yield();
             Simulator::ScheduleNow(&GtpuShadowPeer::PumpUntilEpochReady, this);
             return;
         }
@@ -327,6 +364,10 @@ class GtpuShadowPeer : public Object
             uint32_t networkLength;
             std::memcpy(&networkLength, m_receiveBuffer.data() + 8, sizeof(networkLength));
             const uint32_t payloadLength = ntohl(networkLength);
+            if (payloadLength > 1024 * 1024)
+            {
+                throw std::runtime_error("gate protocol payload exceeds 1 MiB limit");
+            }
             const size_t frameLength = headerSize + payloadLength;
             if (m_receiveBuffer.size() < frameLength)
             {
@@ -352,10 +393,50 @@ class GtpuShadowPeer : public Object
         request.flowId = FindString(payload, "flow_id");
         request.direction = FindString(payload, "direction");
         request.sizeBytes = static_cast<uint32_t>(FindUnsigned(payload, "size_bytes"));
+        request.qfi = static_cast<uint32_t>(FindOptionalUnsigned(payload, "qfi", 0));
+        request.enqueueNs3Us = FindUnsigned(payload, "enqueue_ns3_us");
         request.virtualExpiryUs = FindUnsigned(payload, "virtual_expiry_us");
         if (request.epochId != m_epochId)
         {
             throw std::runtime_error("received packet for the wrong virtual epoch");
+        }
+        if (request.packetId == 0 || !m_seenPacketIds.insert(request.packetId).second)
+        {
+            throw std::runtime_error("duplicate packet_id in shadow peer");
+        }
+        if (request.direction != "uplink" && request.direction != "downlink")
+        {
+            throw std::runtime_error("invalid shadow packet direction");
+        }
+        if (request.sizeBytes == 0 || request.virtualExpiryUs == 0)
+        {
+            throw std::runtime_error("shadow packet size and expiry must be positive");
+        }
+        if (request.qfi > 63)
+        {
+            throw std::runtime_error("shadow packet QFI is outside [0, 63]");
+        }
+        if (request.enqueueNs3Us !=
+            static_cast<uint64_t>(Simulator::Now().GetMicroSeconds()))
+        {
+            throw std::runtime_error("shadow packet enqueue time does not match ns-3 virtual time");
+        }
+        bool knownFlow = false;
+        for (const auto& flow : m_flows)
+        {
+            if (flow.flowId == request.flowId)
+            {
+                knownFlow = true;
+                break;
+            }
+        }
+        if (!knownFlow)
+        {
+            throw std::runtime_error("unknown shadow flow " + request.flowId);
+        }
+        if (m_receivedThisEpoch >= m_expectedThisEpoch)
+        {
+            throw std::runtime_error("too many packets received for virtual epoch");
         }
         m_pending.emplace(request.packetId, PendingPacket{request.epochId});
         ++m_receivedThisEpoch;
@@ -389,6 +470,10 @@ class GtpuShadowPeer : public Object
                 send(m_fd, frame.data() + sent, frame.size() - sent, MSG_NOSIGNAL);
             if (result <= 0)
             {
+                if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                {
+                    throw std::runtime_error("gate socket send buffer is full");
+                }
                 throw std::runtime_error("failed writing gate socket");
             }
             sent += static_cast<size_t>(result);
@@ -403,10 +488,13 @@ class GtpuShadowPeer : public Object
     uint64_t m_sequence = 0;
     uint64_t m_epochId = 0;
     uint64_t m_authorizationId = 0;
+    uint64_t m_maxEpochs = 0;
     size_t m_expectedThisEpoch = 0;
     size_t m_receivedThisEpoch = 0;
+    std::chrono::steady_clock::time_point m_epochWaitStarted;
     std::vector<uint8_t> m_receiveBuffer;
     std::map<uint64_t, PendingPacket> m_pending;
+    std::set<uint64_t> m_seenPacketIds;
 };
 
 } // namespace ns3

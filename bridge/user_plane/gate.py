@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Callable, Mapping
 
 from bridge.user_plane.coordinator import (
+    ActionKind,
     CapacityError,
     PacketCoordinator,
 )
@@ -34,23 +35,29 @@ class FrameGate:
         ports: Mapping[str, FramePort],
         peer_send: Callable[[Message], object],
         virtual_expiry_us_by_flow: Mapping[str, int],
+        egress_resolver: Callable[[str, bytes], tuple[str, ...]],
     ) -> None:
-        if set(ports) != {"gnb", "upf"}:
-            raise ValueError("ports must contain exactly 'gnb' and 'upf'")
+        if not ports:
+            raise ValueError("ports must not be empty")
         self.classifier = classifier
         self.coordinator = coordinator
         self.kpi = kpi
         self.ports = dict(ports)
         self.peer_send = peer_send
         self.virtual_expiry_us_by_flow = dict(virtual_expiry_us_by_flow)
+        self.egress_resolver = egress_resolver
         self.stats = GateStats()
         self._next_sequence = 1
         self._egress_by_packet: dict[int, str] = {}
 
     def capture_pre_epoch(self, *, frame: bytes, ingress_port: str) -> None:
         decision = self.classifier.classify(frame)
+        egress_ports = self._egress(ingress_port, frame)
+        if not egress_ports:
+            self.stats.unmapped += 1
+            return
         if decision.kind is DecisionKind.CONTROL_BYPASS:
-            self._write_frame(self._egress(ingress_port), frame)
+            self._write_frames(egress_ports, frame)
             self.stats.bypassed += 1
             return
         if decision.kind is DecisionKind.UNMAPPED:
@@ -68,10 +75,13 @@ class FrameGate:
         epoch_id: int,
         ns3_time_us: int,
     ) -> int | None:
-        egress_port = self._egress(ingress_port)
         decision = self.classifier.classify(frame)
+        egress_ports = self._egress(ingress_port, frame)
+        if not egress_ports:
+            self.stats.unmapped += 1
+            return None
         if decision.kind is DecisionKind.CONTROL_BYPASS:
-            self._write_frame(egress_port, frame)
+            self._write_frames(egress_ports, frame)
             self.stats.bypassed += 1
             return None
         if decision.kind is DecisionKind.UNMAPPED:
@@ -82,6 +92,10 @@ class FrameGate:
             return None
         if decision.flow_id is None or decision.direction is None or decision.packet is None:
             raise RuntimeError("managed classification is missing packet metadata")
+        if len(egress_ports) != 1:
+            self.stats.unmapped += 1
+            return None
+        egress_port = egress_ports[0]
         expiry_us = self.virtual_expiry_us_by_flow.get(decision.flow_id)
         if expiry_us is None:
             self.stats.unmapped += 1
@@ -93,7 +107,6 @@ class FrameGate:
                 direction=decision.direction.value,
                 epoch_id=epoch_id,
                 enqueue_ns3_us=ns3_time_us,
-                virtual_expiry_us=expiry_us,
             )
         except CapacityError:
             self.stats.capacity_drops += 1
@@ -173,40 +186,33 @@ class FrameGate:
             f"frame gate cannot handle message type {message.message_type.name}"
         )
 
-    def expire(self, *, ns3_time_us: int) -> None:
-        for action in self.coordinator.expire(ns3_now_us=ns3_time_us):
-            record = self.coordinator.packet(action.packet_id)
-            self.kpi.dropped(
-                packet_id=action.packet_id,
-                drop_ns3_us=ns3_time_us,
-                reason=action.reason or "virtual-expiry",
-            )
-            self._egress_by_packet.pop(action.packet_id)
-            self.coordinator.complete_action(action.packet_id)
-            self.stats.dropped += 1
-
     def peer_disconnected(self, *, ns3_time_us: int) -> None:
         for action in self.coordinator.peer_disconnected(ns3_time_us=ns3_time_us):
+            self._egress_by_packet.pop(action.packet_id)
             self.kpi.dropped(
                 packet_id=action.packet_id,
                 drop_ns3_us=ns3_time_us,
                 reason=action.reason or "ns3-peer-disconnected",
             )
-            self._egress_by_packet.pop(action.packet_id)
-            self.coordinator.complete_action(action.packet_id)
             self.stats.dropped += 1
+            self.coordinator.complete_action(action.packet_id)
 
     def _take_sequence(self) -> int:
         sequence = self._next_sequence
         self._next_sequence += 1
         return sequence
 
-    def _egress(self, ingress_port: str) -> str:
-        if ingress_port == "gnb":
-            return "upf"
-        if ingress_port == "upf":
-            return "gnb"
-        raise ValueError(f"unknown ingress port {ingress_port}")
+    def _egress(self, ingress_port: str, frame: bytes) -> tuple[str, ...]:
+        egress_ports = tuple(self.egress_resolver(ingress_port, frame))
+        if any(port not in self.ports for port in egress_ports):
+            raise ValueError(f"egress resolver returned an unknown port: {egress_ports}")
+        if ingress_port in egress_ports:
+            raise ValueError("egress resolver returned the ingress port")
+        return tuple(dict.fromkeys(egress_ports))
+
+    def _write_frames(self, port_names: tuple[str, ...], frame: bytes) -> None:
+        for port_name in port_names:
+            self._write_frame(port_name, frame)
 
     def _write_frame(self, port_name: str, frame: bytes) -> None:
         written = self.ports[port_name].write(frame)

@@ -1,15 +1,39 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from bridge.common.scenario import load_scenario
 from bridge.common.scenario import ScenarioConfig
-from bridge.common.topology import resolve_scenario_topology
+from bridge.common.topology import load_topology_graph, resolve_scenario_topology
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+class MultiLinkTopologyGraphTest(unittest.TestCase):
+    def test_preserves_multiple_tunneled_via_edges_for_one_gnb(self) -> None:
+        graph_payload = {
+            "nodes": [
+                {"id": "ran-1", "type": "ran_node", "attributes": {"name": "gNB-1"}},
+                {"id": "upf-1", "type": "core_node", "attributes": {"name": "upf-a"}},
+                {"id": "upf-2", "type": "core_node", "attributes": {"name": "upf-b"}},
+            ],
+            "links": [
+                {"source": "ran-1", "target": "upf-1", "type": "tunneled_via"},
+                {"source": "ran-1", "target": "upf-2", "type": "tunneled_via"},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            graph_file = Path(directory) / "topology.json"
+            graph_file.write_text(json.dumps(graph_payload), encoding="utf-8")
+
+            graph = load_topology_graph(graph_file)
+
+        self.assertEqual(graph.gnb_to_upfs["gNB-1"], ("upf-a", "upf-b"))
 
 
 def build_semantic_graph_summary() -> dict[str, object]:
@@ -169,9 +193,9 @@ class TopologyResolutionTest(unittest.TestCase):
 
         self.assertEqual(resolved.ue_to_gnb["ue-telemed"], "gNB-1")
         self.assertEqual(resolved.ue_to_gnb["ue-ar"], "gNB-1")
-        self.assertEqual(resolved.gnb_to_upf["gNB-1"], "upf")
+        self.assertEqual(resolved.gnb_to_upfs["gNB-1"], ("upf",))
         self.assertEqual(resolved.gnb_positions["gNB-1"].to_tuple(), (0.0, 0.0, 10.0))
-        self.assertEqual(resolved.ue_positions["ue-telemed"].to_tuple(), (10.0, 0.0, 1.5))
+        self.assertEqual(resolved.ue_positions["ue-telemed"].to_tuple(), (-20.0, 20.0, 1.5))
 
     def test_loads_ulcl_graph_derived_entities(self) -> None:
         scenario = load_scenario(PROJECT_ROOT / "scenarios" / "s2_medium_complexity.yaml")
@@ -187,11 +211,11 @@ class TopologyResolutionTest(unittest.TestCase):
         self.assertEqual(scenario.ues[0].free5gc_policy.preferred_gnbs, ("gNB-1", "gNB-3"))
         self.assertEqual(resolved.ue_to_gnb["ue1"], "gNB-1")
         self.assertEqual(resolved.ue_to_gnb["ue2"], "gNB-3")
-        self.assertEqual(resolved.gnb_to_upf["gNB-1"], "i-upf-1")
-        self.assertEqual(resolved.gnb_to_upf["gNB-2"], "i-upf-1")
-        self.assertEqual(resolved.gnb_to_upf["gNB-3"], "i-upf-1")
-        self.assertEqual(resolved.gnb_positions["gNB-2"].to_tuple(), (200.0, 0.0, 10.0))
-        self.assertEqual(resolved.ue_positions["ue1"].to_tuple(), (10.0, 0.0, 1.5))
+        self.assertEqual(resolved.gnb_to_upfs["gNB-1"], ("i-upf-1",))
+        self.assertEqual(resolved.gnb_to_upfs["gNB-2"], ("i-upf-1",))
+        self.assertEqual(resolved.gnb_to_upfs["gNB-3"], ("i-upf-1",))
+        self.assertEqual(resolved.gnb_positions["gNB-2"].to_tuple(), (150.0, 80.0, 10.0))
+        self.assertEqual(resolved.ue_positions["ue1"].to_tuple(), (20.0, -20.0, 1.5))
 
     def test_loads_ulcl_multi_slice_graph_entities(self) -> None:
         scenario = load_scenario(PROJECT_ROOT / "scenarios" / "s3_high_complexity.yaml")
@@ -221,8 +245,8 @@ class TopologyResolutionTest(unittest.TestCase):
         self.assertEqual(scenario.flows[1].session_ref, "imsi-208930000000002:app-5788:slice-2-000001:internet")
         self.assertEqual(resolved.ue_to_gnb["ue1"], "gNB-4")
         self.assertEqual(resolved.ue_to_gnb["ue2"], "gNB-2")
-        self.assertEqual(resolved.gnb_to_upf["gNB-1"], "i-upf-a")
-        self.assertEqual(resolved.gnb_to_upf["gNB-3"], "i-upf-b")
+        self.assertEqual(resolved.gnb_to_upfs["gNB-1"], ("i-upf-a",))
+        self.assertEqual(resolved.gnb_to_upfs["gNB-3"], ("i-upf-b",))
 
     def test_loads_semantic_graph_snapshot_into_scenario_model(self) -> None:
         payload = {
@@ -263,16 +287,16 @@ class TopologyResolutionTest(unittest.TestCase):
 
         self.assertEqual(scenario.topology.graph_snapshot_id, "graph-current-1")
         self.assertEqual(scenario.gnbs[0].name, "AN_gNB_0")
-        self.assertEqual(scenario.gnbs[0].backhaul_upf, "UPF_0")
+        self.assertEqual(scenario.gnbs[0].backhaul_upfs, ("UPF_0",))
         self.assertEqual(scenario.ues[0].gnb, "AN_gNB_0")
         self.assertEqual(scenario.apps[0].app_id, "app-6757")
         self.assertEqual(scenario.flows[0].flow_id, "flow-7743")
         self.assertEqual(scenario.flows[0].service_type, "eMBB")
-        self.assertEqual(scenario.flows[0].packet_size_bytes, 1000.0)
-        self.assertEqual(scenario.flows[0].dl_packet_size_bytes, 1000.0)
-        self.assertEqual(scenario.flows[0].ul_packet_size_bytes, 1000.0)
-        self.assertEqual(scenario.flows[0].sla_target.bandwidth_dl_mbps, 3.0)
-        self.assertEqual(scenario.flows[0].sla_target.guaranteed_bandwidth_ul_mbps, 3.0)
+        self.assertEqual(scenario.flows[0].packet_size_bytes, 12000.0)
+        self.assertEqual(scenario.flows[0].dl_packet_size_bytes, 12000.0)
+        self.assertEqual(scenario.flows[0].ul_packet_size_bytes, 12000.0)
+        self.assertEqual(scenario.flows[0].sla_target.bandwidth_dl_mbps, 18.0)
+        self.assertEqual(scenario.flows[0].sla_target.guaranteed_bandwidth_ul_mbps, 12.0)
 
 
 if __name__ == "__main__":

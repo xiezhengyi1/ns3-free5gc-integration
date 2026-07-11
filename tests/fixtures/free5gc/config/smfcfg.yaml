@@ -1,0 +1,47 @@
+configuration:
+  sbi:
+    registerIPv4: smf.free5gc.org
+    bindingIPv4: smf.free5gc.org
+  pfcp:
+    nodeID: smf.free5gc.org
+    listenAddr: smf.free5gc.org
+    externalAddr: smf.free5gc.org
+  metrics:
+    bindingIPv4: smf.free5gc.org
+  snssaiInfos:
+    - sNssai:
+        sst: 1
+        sd: "000001"
+      dnnInfos:
+        - dnn: internet
+          dns:
+            ipv4: 8.8.8.8
+            ipv6: 2001:4860:4860::8888
+  userplaneInformation:
+    upNodes:
+      gNB1:
+        type: AN
+        nodeID: gnb.free5gc.org
+      UPF:
+        type: UPF
+        nodeID: upf.free5gc.org
+        addr: upf.free5gc.org
+        interfaces:
+          - interfaceType: N3
+            endpoints:
+              - upf.free5gc.org
+            networkInstances:
+              - internet
+        sNssaiUpfInfos:
+          - sNssai:
+              sst: 1
+              sd: "000001"
+            dnnUpfInfoList:
+              - dnn: internet
+                pools:
+                  - cidr: 10.60.0.0/16
+                staticPools:
+                  - cidr: 10.60.100.0/24
+    links:
+      - A: gNB1
+        B: UPF

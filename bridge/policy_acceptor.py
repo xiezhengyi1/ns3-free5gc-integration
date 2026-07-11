@@ -1013,7 +1013,11 @@ def _evaluate_sm_record(
     if "loss_rate" in requested_state:
         compliant = compliant and _within_upper_bound(telemetry.get("loss_rate"), requested_state["loss_rate"])
 
-    violation_reason = "" if compliant else _infer_violation_reason(allocation, telemetry, requested_state)
+    if not applied:
+        compliant = False
+        violation_reason = "requested_allocation_unmet"
+    else:
+        violation_reason = "" if compliant else _infer_violation_reason(allocation, telemetry, requested_state)
 
     return (
         "APPLIED" if applied else "FAILED",
@@ -1325,7 +1329,7 @@ def _clear_port_binding(host: str, port: int, *, grace_period_sec: float = 2.0) 
     for pid in remaining:
         print(f"Force killing existing listener pid={pid} on {host}:{port}", flush=True)
         try:
-            os.kill(pid, signal.SIGKILL)
+            os.kill(pid, getattr(signal, "SIGKILL", 9))
         except ProcessLookupError:
             continue
 

@@ -23,7 +23,7 @@ nodes:
       alias: gnb1.free5gc.org
       tac: 1
       nci: "0x000000001"
-      backhaul_upf: upf
+      backhaul_upfs: [upf]
       slices:
         - slice_ref: slice-2-000001
       position:

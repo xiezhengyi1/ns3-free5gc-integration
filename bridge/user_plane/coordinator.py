@@ -42,7 +42,6 @@ class PacketRecord:
     direction: str
     frame: bytes
     enqueue_ns3_us: int
-    expiry_ns3_us: int
     state: PacketState = PacketState.CAPTURED
     terminal_ns3_us: int | None = None
     terminal_reason: str | None = None
@@ -57,14 +56,25 @@ class EpochRecord:
 
 
 _ALLOWED_TRANSITIONS = {
-    PacketState.CAPTURED: {PacketState.SUBMITTED, PacketState.DROPPED},
-    PacketState.SUBMITTED: {PacketState.DELIVERED, PacketState.DROPPED},
+    PacketState.CAPTURED: {
+        PacketState.SUBMITTED,
+        PacketState.DROPPED,
+    },
+    PacketState.SUBMITTED: {
+        PacketState.DELIVERED,
+        PacketState.DROPPED,
+    },
     PacketState.DELIVERED: {PacketState.RELEASED},
     PacketState.DROPPED: {PacketState.DISCARDED},
     PacketState.RELEASED: set(),
     PacketState.DISCARDED: set(),
 }
-_NS3_TERMINAL = {PacketState.DELIVERED, PacketState.DROPPED, PacketState.RELEASED, PacketState.DISCARDED}
+_NS3_TERMINAL = {
+    PacketState.DELIVERED,
+    PacketState.DROPPED,
+    PacketState.RELEASED,
+    PacketState.DISCARDED,
+}
 
 
 class PacketCoordinator:
@@ -73,13 +83,11 @@ class PacketCoordinator:
         *,
         max_pending_packets: int,
         max_pending_bytes: int,
-        fail_closed: bool = True,
     ) -> None:
         if max_pending_packets <= 0 or max_pending_bytes <= 0:
             raise ValueError("pending packet and byte limits must be positive")
         self.max_pending_packets = max_pending_packets
         self.max_pending_bytes = max_pending_bytes
-        self.fail_closed = fail_closed
         self._next_packet_id = 1
         self._next_epoch_id = 1
         self._packets: dict[int, PacketRecord] = {}
@@ -111,15 +119,12 @@ class PacketCoordinator:
         direction: str,
         epoch_id: int,
         enqueue_ns3_us: int,
-        virtual_expiry_us: int,
     ) -> PacketRecord:
         epoch = self._epochs.get(epoch_id)
         if epoch is None:
             raise CoordinatorError(f"unknown epoch {epoch_id}")
         if enqueue_ns3_us < epoch.start_ns3_us:
             raise CoordinatorError("packet enqueue time precedes epoch start")
-        if virtual_expiry_us <= 0:
-            raise CoordinatorError("virtual expiry must be positive")
         if self._pending_packets >= self.max_pending_packets:
             raise CapacityError("pending packet capacity exceeded")
         if self._pending_bytes + len(frame) > self.max_pending_bytes:
@@ -134,7 +139,6 @@ class PacketCoordinator:
             direction=direction,
             frame=bytes(frame),
             enqueue_ns3_us=enqueue_ns3_us,
-            expiry_ns3_us=enqueue_ns3_us + virtual_expiry_us,
         )
         self._packets[packet_id] = record
         epoch.packet_ids.append(packet_id)
@@ -199,51 +203,22 @@ class PacketCoordinator:
         epoch = self.epoch(epoch_id)
         return all(self._packets[packet_id].state in _NS3_TERMINAL for packet_id in epoch.packet_ids)
 
-    def expire(self, *, ns3_now_us: int) -> list[GateAction]:
-        actions: list[GateAction] = []
-        for record in self._packets.values():
-            if record.state is not PacketState.SUBMITTED:
-                continue
-            if record.expiry_ns3_us <= ns3_now_us:
-                actions.append(
-                    self.mark_dropped(
-                        record.packet_id,
-                        epoch_id=record.epoch_id,
-                        ns3_time_us=ns3_now_us,
-                        reason="virtual-expiry",
-                    )
-                )
-        return actions
-
     def peer_disconnected(self, *, ns3_time_us: int) -> list[GateAction]:
         actions: list[GateAction] = []
         for record in self._packets.values():
             if record.state not in {PacketState.CAPTURED, PacketState.SUBMITTED}:
                 continue
-            if self.fail_closed:
-                self._transition(record, PacketState.DROPPED)
-                record.terminal_ns3_us = ns3_time_us
-                record.terminal_reason = "ns3-peer-disconnected"
-                actions.append(
-                    GateAction(
-                        ActionKind.DISCARD,
-                        record.packet_id,
-                        record.frame,
-                        record.terminal_reason,
-                    )
+            self._transition(record, PacketState.DROPPED)
+            record.terminal_ns3_us = ns3_time_us
+            record.terminal_reason = "ns3-peer-disconnected"
+            actions.append(
+                GateAction(
+                    ActionKind.DISCARD,
+                    record.packet_id,
+                    record.frame,
+                    record.terminal_reason,
                 )
-            else:
-                self._transition(record, PacketState.DROPPED)
-                record.terminal_ns3_us = ns3_time_us
-                record.terminal_reason = "ns3-peer-disconnected-open"
-                actions.append(
-                    GateAction(
-                        ActionKind.RELEASE,
-                        record.packet_id,
-                        record.frame,
-                        record.terminal_reason,
-                    )
-                )
+            )
         return actions
 
     def _result_record(

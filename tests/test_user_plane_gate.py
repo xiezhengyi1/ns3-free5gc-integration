@@ -11,9 +11,13 @@ from bridge.user_plane.gtpu import (
     DecisionKind,
     Direction,
     GtpuPacket,
+    FlowBinding,
+    FlowClassifier,
 )
 from bridge.user_plane.kpi import PacketKpiCollector
 from bridge.user_plane.protocol import Message, MessageType
+from bridge.user_plane.routing import EndpointLink, EndpointRouter
+from tests.test_gtpu import _frame
 
 
 _PACKET = GtpuPacket(
@@ -27,6 +31,10 @@ _PACKET = GtpuPacket(
     inner_src_port=4000,
     inner_dst_port=5000,
 )
+
+
+def _two_port_route(ingress_port: str, _frame: bytes) -> tuple[str, ...]:
+    return {"gnb": ("upf",), "upf": ("gnb",)}[ingress_port]
 
 
 class _Classifier:
@@ -62,6 +70,7 @@ class UserPlaneGateTest(unittest.TestCase):
             ports={"gnb": self.gnb, "upf": self.upf},
             peer_send=self.messages.append,
             virtual_expiry_us_by_flow={"flow-1": 1000},
+            egress_resolver=_two_port_route,
         )
         self.epoch = self.coordinator.begin_epoch(start_ns3_us=100)
 
@@ -159,6 +168,7 @@ class UserPlaneGateTest(unittest.TestCase):
             ports={"gnb": self.gnb, "upf": self.upf},
             peer_send=self.messages.append,
             virtual_expiry_us_by_flow={"flow-1": 1000},
+            egress_resolver=_two_port_route,
         )
         gate.capture(
             frame=b"managed-first",
@@ -186,6 +196,68 @@ class UserPlaneGateTest(unittest.TestCase):
         self.assertEqual(self.upf.written_frames, [])
         self.assertEqual(self.coordinator.pending_packets, 0)
         self.assertEqual(self.gate.stats.dropped, 2)
+
+    def test_shared_upf_releases_downlink_to_the_selected_gnb(self) -> None:
+        ports = {
+            "gnb:1": MemoryFramePort(),
+            "gnb:2": MemoryFramePort(),
+            "upf:a": MemoryFramePort(),
+        }
+        coordinator = PacketCoordinator(max_pending_packets=8, max_pending_bytes=4096)
+        epoch = coordinator.begin_epoch(start_ns3_us=100)
+        router = EndpointRouter(
+            [
+                EndpointLink("gnb:1", "upf:a", "10.0.0.2", "10.0.0.5"),
+                EndpointLink("gnb:2", "upf:a", "10.0.0.3", "10.0.0.5"),
+            ]
+        )
+        gate = FrameGate(
+            classifier=FlowClassifier(
+                [
+                    FlowBinding(
+                        "flow-2",
+                        ue_ip="10.60.0.2",
+                        gnb_ip="10.0.0.3",
+                        upf_ip="10.0.0.5",
+                        qfi=9,
+                    )
+                ],
+                gnb_ips=["10.0.0.2", "10.0.0.3"],
+                upf_ips=["10.0.0.5"],
+            ),
+            coordinator=coordinator,
+            kpi=PacketKpiCollector(),
+            ports=ports,
+            peer_send=self.messages.append,
+            virtual_expiry_us_by_flow={"flow-2": 1000},
+            egress_resolver=router.route,
+        )
+        frame = _frame(
+            outer_src="10.0.0.5",
+            outer_dst="10.0.0.3",
+            inner_src="192.0.2.1",
+            inner_dst="10.60.0.2",
+            src_port=5000,
+            dst_port=4000,
+        )
+
+        packet_id = gate.capture(
+            frame=frame,
+            ingress_port="upf:a",
+            epoch_id=epoch,
+            ns3_time_us=100,
+        )
+        assert packet_id is not None
+        gate.handle_peer_message(
+            Message(
+                MessageType.PACKET_DELIVER,
+                sequence=2,
+                payload={"packet_id": packet_id, "epoch_id": epoch, "ns3_time_us": 200},
+            )
+        )
+
+        self.assertEqual(ports["gnb:1"].written_frames, [])
+        self.assertEqual(ports["gnb:2"].written_frames, [frame])
 
 
 if __name__ == "__main__":

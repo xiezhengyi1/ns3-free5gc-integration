@@ -42,7 +42,7 @@ class GatedProcessPlanTest(unittest.TestCase):
                 bridge_script=root / "bridge.sh",
                 bridge_probe_script=root / "probe.sh",
                 bridge_plans=[plan],
-                snapshot_file=root / "snapshot.jsonl",
+                snapshot_file=root / "ns3" / "tick-snapshots.jsonl",
                 clock_file=root / "clock.json",
                 flow_profile_file=root / "flows.tsv",
                 slice_resource_file=root / "slices.tsv",
@@ -70,8 +70,24 @@ class GatedProcessPlanTest(unittest.TestCase):
         self.assertLess(names.index("bridge-setup"), names.index("user-plane-gate"))
         self.assertEqual(names.index("user-plane-gate"), names.index("bridge-setup") + 1)
         self.assertLess(names.index("user-plane-gate"), names.index("ns3-run"))
-        self.assertIn("--controlled", commands["real-ue-flows"].argv)
+        self.assertLess(names.index("ns3-run"), names.index("validate-gated-metrics"))
+        self.assertLess(names.index("validate-gated-metrics"), names.index("compose-down"))
+        self.assertNotIn("--controlled", commands["real-ue-flows"].argv)
+        self.assertIn("--authorization-socket", commands["real-ue-flows"].argv)
         self.assertIn("--user-plane-gate-socket", commands["ns3-run"].argv)
+        self.assertEqual(
+            commands["validate-gated-metrics"].argv[:3],
+            ["python3", "-m", "bridge.orchestrator.metrics"],
+        )
+        self.assertIn(
+            str(root / "ns3" / "packet-events.jsonl"),
+            commands["validate-gated-metrics"].argv,
+        )
+        self.assertIn(
+            str(root / "ns3" / "packet-kpis.jsonl"),
+            commands["validate-gated-metrics"].argv,
+        )
+        self.assertIn("--wait-seconds", commands["validate-gated-metrics"].argv)
         self.assertNotIn("--bridge-gnb-taps", commands["ns3-run"].argv)
         self.assertEqual(manifest.user_plane_gate_file, str(root / "user-plane-gate.json"))
 

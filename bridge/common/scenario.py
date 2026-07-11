@@ -11,6 +11,14 @@ from typing import Any
 
 import yaml
 
+
+_NS3_SUPPORTED_FIVE_QI = frozenset(
+    {1, 2, 3, 4, 5, 6, 7, 8, 9, 65, 66, 67, 69, 70, 71, 72, 73, 74, 75, 76, 79, 80, 82, 83, 84, 85, 86, 87, 88, 89, 90}
+)
+_NS3_UM_FIVE_QI = frozenset(
+    {1, 2, 3, 7, 65, 66, 67, 72, 75, 76, 79, 82, 83, 86, 87, 88, 89, 90}
+)
+
 from bridge.common.graph_adapter import load_graph_snapshot_payload, merge_semantic_graph_payload
 from bridge.common.topology import merge_topology_graph_payload
 from bridge.common.ue_context_adapter import load_ue_context_rows, merge_ue_context_payload
@@ -125,6 +133,7 @@ class FlowConfig:
     ue_name: str | None = None
     app_name: str | None = None
     dnn: str | None = None
+    upf_ref: str | None = None
     five_qi: int = 9
     service_type: str | None = None
     service_type_id: int | None = None
@@ -168,7 +177,7 @@ class GnbConfig:
     tac: int = 1
     nci: str = "0x000000010"
     slices: tuple[str, ...] = ()
-    backhaul_upf: str | None = None
+    backhaul_upfs: tuple[str, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -236,7 +245,6 @@ class TopologyConfig:
 @dataclass(slots=True, frozen=True)
 class UserPlaneGateConfig:
     enabled: bool = False
-    fail_closed: bool = True
     max_pending_packets: int = 8192
     max_pending_bytes: int = 64 * 1024 * 1024
     socket_path: str = "/tmp/ns3-free5gc-gate.sock"
@@ -374,6 +382,31 @@ class ScenarioConfig:
             f"set flow.session_ref explicitly"
         )
 
+    def resolve_flow_gnb(self, flow: FlowConfig) -> str:
+        ue_by_name = {ue.name: ue for ue in self.ues}
+        ue_by_supi = {ue.supi: ue for ue in self.ues}
+        target_ue = ue_by_name[flow.ue_name] if flow.ue_name is not None else ue_by_supi[flow.supi]
+        target_gnb = (
+            target_ue.free5gc_policy.target_gnb
+            or (target_ue.free5gc_policy.preferred_gnbs[0] if target_ue.free5gc_policy.preferred_gnbs else None)
+            or target_ue.gnb
+        )
+        if target_gnb is None:
+            raise ValueError(f"flow {flow.flow_id} UE {target_ue.name} has no target gNB")
+        if target_gnb not in self.gnb_map():
+            raise ValueError(f"flow {flow.flow_id} resolves unknown gNB {target_gnb}")
+        return target_gnb
+
+    def resolve_flow_upf(self, flow: FlowConfig) -> str:
+        target_gnb = self.resolve_flow_gnb(flow)
+        candidates = self.gnb_map()[target_gnb].backhaul_upfs
+        selected = flow.upf_ref or candidates[0]
+        if selected not in candidates:
+            raise ValueError(
+                f"flow {flow.flow_id} selects UPF {selected}, which is not linked to gNB {target_gnb}"
+            )
+        return selected
+
     def ue_groups(self) -> dict[str, list[UeConfig]]:
         grouped: dict[str, list[UeConfig]] = {gnb.name: [] for gnb in self.gnbs}
         for ue in self.ues:
@@ -390,8 +423,21 @@ class ScenarioConfig:
         gnbs = self.gnb_map()
         if not self.gnbs:
             raise ValueError("scenario must define at least one gNB")
+        if not self.upfs:
+            raise ValueError("scenario must define at least one UPF")
         if not self.ues:
             raise ValueError("scenario must define at least one UE")
+        upf_names = {upf.name for upf in self.upfs}
+        for gnb in self.gnbs:
+            if not gnb.backhaul_upfs:
+                raise ValueError(f"gNB {gnb.name} must define backhaul_upfs")
+            if len(set(gnb.backhaul_upfs)) != len(gnb.backhaul_upfs):
+                raise ValueError(f"gNB {gnb.name} defines duplicate backhaul UPFs")
+            unknown_upfs = [name for name in gnb.backhaul_upfs if name not in upf_names]
+            if unknown_upfs:
+                raise ValueError(
+                    f"gNB {gnb.name} references unknown backhaul UPFs: {', '.join(unknown_upfs)}"
+                )
         if self.topology.graph_file and self.topology.graph_snapshot_id:
             raise ValueError("topology.graph_file and topology.graph_snapshot_id are mutually exclusive")
         if self.topology.graph_file and not Path(self.topology.graph_file).exists():
@@ -422,10 +468,6 @@ class ScenarioConfig:
         if self.bridge.user_plane_gate.enabled:
             if not self.bridge.enable_inline_harness:
                 raise ValueError("user-plane gate requires bridge.enable_inline_harness")
-            if len(self.gnbs) != 1:
-                raise ValueError("user-plane gate currently requires exactly one gNB N3 link")
-            if not self.bridge.user_plane_gate.fail_closed:
-                raise ValueError("user-plane gate requires fail_closed=true")
             if "Realtime" in self.ns3.simulator:
                 raise ValueError(
                     "user-plane gate requires an ns-3 virtual-time simulator, not RealtimeSimulatorImpl"
@@ -501,6 +543,18 @@ class ScenarioConfig:
             if flow.virtual_expiry_ms <= 0:
                 raise ValueError(f"flow {flow.flow_id} virtual_expiry_ms must be positive")
             if self.bridge.user_plane_gate.enabled:
+                if flow.five_qi not in _NS3_SUPPORTED_FIVE_QI:
+                    raise ValueError(
+                        f"flow {flow.flow_id} five_qi {flow.five_qi} is unsupported by 5G-LENA"
+                    )
+                resolved_rlc_mode = (
+                    "UM" if flow.five_qi in _NS3_UM_FIVE_QI else "AM"
+                )
+                if flow.rlc_mode != resolved_rlc_mode:
+                    raise ValueError(
+                        f"flow {flow.flow_id} rlc_mode {flow.rlc_mode} conflicts with "
+                        f"5G-LENA 5QI {flow.five_qi} mapping ({resolved_rlc_mode})"
+                    )
                 if flow.ue_ip is None:
                     raise ValueError(f"flow {flow.flow_id} ue_ip is required for user-plane gate")
                 try:
@@ -538,6 +592,7 @@ class ScenarioConfig:
                 raise ValueError(f"flow {flow.flow_id} references unknown app {flow.app_id}")
             target_ue = ue_by_name[flow.ue_name] if flow.ue_name is not None else ue_by_supi[flow.supi]
             self.resolve_flow_session(target_ue, flow)
+            self.resolve_flow_upf(flow)
             slice_config = slices[flow.slice_ref]
             expected_snssai = _slice_snssai(slice_config.sst, slice_config.sd)
             if flow.current_slice_snssai is not None and flow.current_slice_snssai.lower() != expected_snssai:
@@ -545,28 +600,6 @@ class ScenarioConfig:
                     f"flow {flow.flow_id} uses current_slice_snssai {flow.current_slice_snssai}, "
                     f"but slice {flow.slice_ref} resolves to {expected_snssai}"
                 )
-            if (
-                flow.dl_packet_size_bytes is not None
-                and flow.dl_arrival_rate_pps is not None
-                and flow.sla_target.bandwidth_dl_mbps is not None
-            ):
-                offered_dl_mbps = flow.dl_packet_size_bytes * 8.0 * flow.dl_arrival_rate_pps / 1_000_000.0
-                if offered_dl_mbps > flow.sla_target.bandwidth_dl_mbps + 1e-9:
-                    raise ValueError(
-                        f"flow {flow.flow_id} offered DL load {offered_dl_mbps:.6f} Mbps exceeds "
-                        f"sla_target.bandwidth_dl_mbps {flow.sla_target.bandwidth_dl_mbps:.6f}"
-                    )
-            if (
-                flow.ul_packet_size_bytes is not None
-                and flow.ul_arrival_rate_pps is not None
-                and flow.sla_target.bandwidth_ul_mbps is not None
-            ):
-                offered_ul_mbps = flow.ul_packet_size_bytes * 8.0 * flow.ul_arrival_rate_pps / 1_000_000.0
-                if offered_ul_mbps > flow.sla_target.bandwidth_ul_mbps + 1e-9:
-                    raise ValueError(
-                        f"flow {flow.flow_id} offered UL load {offered_ul_mbps:.6f} Mbps exceeds "
-                        f"sla_target.bandwidth_ul_mbps {flow.sla_target.bandwidth_ul_mbps:.6f}"
-                    )
             if slice_config.qos is not None:
                 if (
                     flow.sla_target.latency_ms is not None
@@ -691,6 +724,10 @@ class ScenarioConfig:
 
         gnbs = []
         for index, item in enumerate(payload.get("gnbs", []), start=1):
+            if "backhaul_upf" in item:
+                raise ValueError(
+                    "gnbs[].backhaul_upf was removed; use the required backhaul_upfs list"
+                )
             alias = item.get("alias") or f"gnb-{index}.free5gc.org"
             gnb = GnbConfig(
                 name=item["name"],
@@ -698,7 +735,7 @@ class ScenarioConfig:
                 tac=int(item.get("tac", 1)),
                 nci=str(item.get("nci", f"0x{index:09x}")),
                 slices=tuple(item.get("slices", tuple(slice_map.keys()))),
-                backhaul_upf=item.get("backhaul_upf"),
+                backhaul_upfs=tuple(item.get("backhaul_upfs", ())),
             )
             gnbs.append(gnb)
 
@@ -744,6 +781,13 @@ class ScenarioConfig:
         free5gc_payload = payload["free5gc"]
         ns3_payload = payload["ns3"]
         bridge_payload = payload.get("bridge", {})
+        user_plane_gate_payload = bridge_payload.get("user_plane_gate", {})
+        if not isinstance(user_plane_gate_payload, dict):
+            raise ValueError("bridge.user_plane_gate must be an object")
+        if "fail_closed" in user_plane_gate_payload:
+            raise ValueError(
+                "bridge.user_plane_gate.fail_closed was removed; the gate is always fail-closed"
+            )
         apps = tuple(
             AppConfig(
                 app_id=item["app_id"],
@@ -765,6 +809,7 @@ class ScenarioConfig:
                 ue_name=item.get("ue_name"),
                 app_name=item.get("app_name"),
                 dnn=item.get("dnn"),
+                upf_ref=item.get("upf_ref"),
                 five_qi=int(item.get("five_qi", 9)),
                 service_type=item.get("service_type"),
                 service_type_id=_optional_int(item.get("service_type_id")),
@@ -901,22 +946,15 @@ class ScenarioConfig:
                 bridge_prefix=bridge_payload.get("bridge_prefix", "br-ran"),
                 host_veth_prefix=bridge_payload.get("host_veth_prefix", "veth-ran"),
                 user_plane_gate=UserPlaneGateConfig(
-                    enabled=bool(bridge_payload.get("user_plane_gate", {}).get("enabled", False)),
-                    fail_closed=bool(
-                        bridge_payload.get("user_plane_gate", {}).get("fail_closed", True)
-                    ),
+                    enabled=bool(user_plane_gate_payload.get("enabled", False)),
                     max_pending_packets=int(
-                        bridge_payload.get("user_plane_gate", {}).get("max_pending_packets", 8192)
+                        user_plane_gate_payload.get("max_pending_packets", 8192)
                     ),
                     max_pending_bytes=int(
-                        bridge_payload.get("user_plane_gate", {}).get(
-                            "max_pending_bytes", 64 * 1024 * 1024
-                        )
+                        user_plane_gate_payload.get("max_pending_bytes", 64 * 1024 * 1024)
                     ),
                     socket_path=str(
-                        bridge_payload.get("user_plane_gate", {}).get(
-                            "socket_path", "/tmp/ns3-free5gc-gate.sock"
-                        )
+                        user_plane_gate_payload.get("socket_path", "/tmp/ns3-free5gc-gate.sock")
                     ),
                 ),
             ),

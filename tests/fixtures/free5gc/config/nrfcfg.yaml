@@ -1,0 +1,3 @@
+configuration:
+  sbi:
+    oauth: true

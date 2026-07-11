@@ -18,14 +18,17 @@
 #include "gtpu_shadow_peer.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -99,14 +102,17 @@ SplitCsv(const std::string& input)
 }
 
 std::vector<std::string>
-ParseStringList(const std::string& input, uint32_t expectedCount, const std::string& fieldName)
+ParseStringList(const std::string& input,
+                uint32_t expectedCount,
+                const std::string& fieldName,
+                bool keepEmpty = false)
 {
     if (input.empty())
     {
         return {};
     }
 
-    auto values = SplitCsv(input);
+    auto values = SplitString(input, ',', keepEmpty);
     if (values.size() != expectedCount)
     {
         NS_FATAL_ERROR(fieldName << " expects " << expectedCount << " values, got " << values.size());
@@ -163,6 +169,7 @@ struct FlowProfile
     std::string sliceRef;
     std::string sliceSnssai;
     std::string dnn;
+    std::string upfName;
     std::string serviceType;
     uint32_t serviceTypeId = 0;
     uint32_t fiveQi = 9;
@@ -221,6 +228,15 @@ struct SliceRuntimeTelemetry
     double allocatedUlMbps = 0.0;
     double queueBytes = 0.0;
     double droppedPackets = 0.0;
+};
+
+struct BearerMapOverride
+{
+    std::string flowId;
+    uint32_t fiveQi = 9;
+    uint32_t qfi = 0;
+    std::string rlcMode = "UM";
+    double virtualExpiryMs = 1000.0;
 };
 
 PositionOverrides
@@ -318,6 +334,167 @@ ParseOptionalBool(const std::string& value, bool fallback = false)
     return value == "true" || value == "1" || value == "True";
 }
 
+size_t
+SkipJsonWhitespace(const std::string& json, size_t cursor)
+{
+    while (cursor < json.size() &&
+           (json[cursor] == ' ' || json[cursor] == '\n' || json[cursor] == '\r' ||
+            json[cursor] == '\t'))
+    {
+        ++cursor;
+    }
+    return cursor;
+}
+
+size_t
+FindJsonValueStart(const std::string& json, const std::string& key)
+{
+    const std::string marker = Quote(key);
+    const auto keyStart = json.find(marker);
+    if (keyStart == std::string::npos)
+    {
+        return std::string::npos;
+    }
+    const auto colon = json.find(':', keyStart + marker.size());
+    if (colon == std::string::npos)
+    {
+        return std::string::npos;
+    }
+    return SkipJsonWhitespace(json, colon + 1);
+}
+
+std::string
+GetJsonStringValue(const std::string& json, const std::string& key, const std::string& fallback = "")
+{
+    size_t cursor = FindJsonValueStart(json, key);
+    if (cursor == std::string::npos || cursor >= json.size() || json[cursor] != '"')
+    {
+        return fallback;
+    }
+    ++cursor;
+    std::ostringstream value;
+    bool escaped = false;
+    for (; cursor < json.size(); ++cursor)
+    {
+        const char character = json[cursor];
+        if (escaped)
+        {
+            value << character;
+            escaped = false;
+            continue;
+        }
+        if (character == '\\')
+        {
+            escaped = true;
+            continue;
+        }
+        if (character == '"')
+        {
+            return value.str();
+        }
+        value << character;
+    }
+    return fallback;
+}
+
+double
+GetJsonNumberValue(const std::string& json, const std::string& key, double fallback)
+{
+    size_t cursor = FindJsonValueStart(json, key);
+    if (cursor == std::string::npos)
+    {
+        return fallback;
+    }
+    size_t end = cursor;
+    while (end < json.size() &&
+           (std::isdigit(static_cast<unsigned char>(json[end])) || json[end] == '.' ||
+            json[end] == '-'))
+    {
+        ++end;
+    }
+    if (end == cursor)
+    {
+        return fallback;
+    }
+    return std::stod(json.substr(cursor, end - cursor));
+}
+
+std::vector<std::string>
+ExtractJsonObjectsFromArray(const std::string& json, const std::string& key)
+{
+    std::vector<std::string> objects;
+    const size_t valueStart = FindJsonValueStart(json, key);
+    if (valueStart == std::string::npos || valueStart >= json.size() || json[valueStart] != '[')
+    {
+        return objects;
+    }
+    int arrayDepth = 0;
+    int objectDepth = 0;
+    size_t objectStart = std::string::npos;
+    bool inString = false;
+    bool escaped = false;
+    for (size_t cursor = valueStart; cursor < json.size(); ++cursor)
+    {
+        const char character = json[cursor];
+        if (escaped)
+        {
+            escaped = false;
+            continue;
+        }
+        if (character == '\\')
+        {
+            escaped = inString;
+            continue;
+        }
+        if (character == '"')
+        {
+            inString = !inString;
+            continue;
+        }
+        if (inString)
+        {
+            continue;
+        }
+        if (character == '[')
+        {
+            ++arrayDepth;
+            continue;
+        }
+        if (character == ']')
+        {
+            --arrayDepth;
+            if (arrayDepth == 0)
+            {
+                break;
+            }
+            continue;
+        }
+        if (arrayDepth != 1)
+        {
+            continue;
+        }
+        if (character == '{')
+        {
+            if (objectDepth == 0)
+            {
+                objectStart = cursor;
+            }
+            ++objectDepth;
+            continue;
+        }
+        if (character == '}')
+        {
+            --objectDepth;
+            if (objectDepth == 0 && objectStart != std::string::npos)
+            {
+                objects.push_back(json.substr(objectStart, cursor - objectStart + 1));
+                objectStart = std::string::npos;
+            }
+        }
+    }
+    return objects;
+}
+
 std::string
 GetColumnValue(const std::map<std::string, uint32_t>& headerIndex,
                const std::vector<std::string>& columns,
@@ -383,6 +560,7 @@ LoadFlowProfiles(const std::string& path)
         profile.sliceRef = GetColumnValue(headerIndex, columns, "slice_ref");
         profile.sliceSnssai = GetColumnValue(headerIndex, columns, "slice_snssai");
         profile.dnn = GetColumnValue(headerIndex, columns, "dnn");
+        profile.upfName = GetColumnValue(headerIndex, columns, "upf_ref");
         profile.serviceType = GetColumnValue(headerIndex, columns, "service_type");
         profile.serviceTypeId = ParseOptionalUint(GetColumnValue(headerIndex, columns, "service_type_id"), 0);
         profile.fiveQi = ParseOptionalUint(GetColumnValue(headerIndex, columns, "five_qi"), 9);
@@ -439,6 +617,97 @@ LoadFlowProfiles(const std::string& path)
     }
 
     return profiles;
+}
+
+std::map<std::string, BearerMapOverride>
+LoadBearerMapOverrides(const std::string& path)
+{
+    std::ifstream input(path);
+    if (!input.is_open())
+    {
+        NS_FATAL_ERROR("failed to open bearer map file: " << path);
+    }
+    const std::string payload((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    std::map<std::string, BearerMapOverride> overrides;
+    for (const auto& object : ExtractJsonObjectsFromArray(payload, "flows"))
+    {
+        BearerMapOverride item;
+        item.flowId = GetJsonStringValue(object, "flow_id");
+        if (item.flowId.empty())
+        {
+            NS_FATAL_ERROR("bearer map flow row is missing flow_id");
+        }
+        item.fiveQi = static_cast<uint32_t>(GetJsonNumberValue(object, "five_qi", 9.0));
+        item.qfi = static_cast<uint32_t>(GetJsonNumberValue(object, "qfi", 0.0));
+        item.rlcMode = GetJsonStringValue(object, "rlc_mode", "UM");
+        item.virtualExpiryMs = GetJsonNumberValue(object, "virtual_expiry_us", 1000000.0) / 1000.0;
+        overrides[item.flowId] = item;
+    }
+    if (overrides.empty())
+    {
+        NS_FATAL_ERROR("bearer map file has no flow overrides: " << path);
+    }
+    return overrides;
+}
+
+void
+ApplyBearerMapOverrides(std::vector<FlowProfile>* profiles,
+                        const std::map<std::string, BearerMapOverride>& overrides)
+{
+    std::set<std::string> matched;
+    for (auto& profile : *profiles)
+    {
+        auto overrideIt = overrides.find(profile.flowId);
+        if (overrideIt == overrides.end())
+        {
+            NS_FATAL_ERROR("gated flow " << profile.flowId << " is missing from bearer map");
+        }
+        const auto& override = overrideIt->second;
+        profile.fiveQi = override.fiveQi;
+        profile.qfi = override.qfi;
+        profile.rlcMode = override.rlcMode;
+        profile.virtualExpiryMs = override.virtualExpiryMs;
+        matched.insert(profile.flowId);
+    }
+    for (const auto& [flowId, _override] : overrides)
+    {
+        if (matched.find(flowId) == matched.end())
+        {
+            NS_FATAL_ERROR("bearer map references unknown flow " << flowId);
+        }
+    }
+}
+
+NrEpsBearer
+ResolveShadowBearer(const FlowProfile& profile)
+{
+    static const std::set<uint32_t> supportedFiveQi = {
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 65, 66, 67, 69, 70, 71, 72, 73,
+        74, 75, 76, 79, 80, 82, 83, 84, 85, 86, 87, 88, 89, 90,
+    };
+    if (supportedFiveQi.count(profile.fiveQi) == 0)
+    {
+        NS_FATAL_ERROR("gated flow " << profile.flowId
+                                      << " uses a 5QI unsupported by 5G-LENA: "
+                                      << profile.fiveQi);
+    }
+    NrEpsBearer bearer(static_cast<NrEpsBearer::Qci>(profile.fiveQi));
+    bearer.SetRelease(18);
+    const bool resolvesToUm = bearer.GetPacketErrorLossRate() > 1.0e-5;
+    const bool requestsUm = profile.rlcMode == "UM";
+    if (profile.rlcMode != "UM" && profile.rlcMode != "AM")
+    {
+        NS_FATAL_ERROR("gated flow " << profile.flowId << " has invalid RLC mode "
+                                      << profile.rlcMode);
+    }
+    if (resolvesToUm != requestsUm)
+    {
+        NS_FATAL_ERROR("gated flow " << profile.flowId << " requests RLC "
+                                      << profile.rlcMode << " but 5QI " << profile.fiveQi
+                                      << " maps to RLC " << (resolvesToUm ? "UM" : "AM")
+                                      << " in 5G-LENA PacketErrorRateBased mode");
+    }
+    return bearer;
 }
 
 std::map<std::string, SliceResourceProfile>
@@ -669,13 +938,6 @@ struct SnapshotContext
     bool gatedUserPlane = false;
     std::string externalTrafficTargetIp = "8.8.8.8";
     uint32_t externalTrafficSourceBasePort = 15000;
-    std::string userPlaneGateSocket;
-    std::string bearerMapFile;
-    uint32_t rngSeed = 1;
-    uint64_t rngRun = 1;
-    uint64_t virtualEpochUs = 100000;
-    double channelUpdateMs = 10.0;
-    bool shadowingEnabled = true;
     std::vector<std::string> upfNames;
     std::vector<std::string> sliceSds;
     std::vector<std::string> sliceIds;
@@ -714,30 +976,53 @@ class ShadowPacketTag : public Tag
 
     uint32_t GetSerializedSize() const override
     {
-        return 16;
+        return 30 + static_cast<uint32_t>(m_flowId.size());
     }
 
     void Serialize(TagBuffer buffer) const override
     {
         buffer.WriteU64(m_packetId);
         buffer.WriteU64(m_epochId);
+        buffer.WriteU64(m_enqueueNs3Us);
+        buffer.WriteU32(m_qfi);
+        buffer.WriteU16(static_cast<uint16_t>(m_flowId.size()));
+        buffer.Write(reinterpret_cast<const uint8_t*>(m_flowId.data()), m_flowId.size());
     }
 
     void Deserialize(TagBuffer buffer) override
     {
         m_packetId = buffer.ReadU64();
         m_epochId = buffer.ReadU64();
+        m_enqueueNs3Us = buffer.ReadU64();
+        m_qfi = buffer.ReadU32();
+        const uint16_t flowIdSize = buffer.ReadU16();
+        std::vector<uint8_t> flowId(flowIdSize);
+        buffer.Read(flowId.data(), flowIdSize);
+        m_flowId.assign(flowId.begin(), flowId.end());
     }
 
     void Print(std::ostream& stream) const override
     {
-        stream << "packetId=" << m_packetId << " epochId=" << m_epochId;
+        stream << "packetId=" << m_packetId << " epochId=" << m_epochId
+               << " flowId=" << m_flowId << " qfi=" << m_qfi
+               << " enqueueNs3Us=" << m_enqueueNs3Us;
     }
 
-    void Set(uint64_t packetId, uint64_t epochId)
+    void Set(uint64_t packetId,
+             uint64_t epochId,
+             const std::string& flowId,
+             uint32_t qfi,
+             uint64_t enqueueNs3Us)
     {
+        if (flowId.size() > 200)
+        {
+            NS_FATAL_ERROR("shadow flow ID exceeds packet-tag limit");
+        }
         m_packetId = packetId;
         m_epochId = epochId;
+        m_flowId = flowId;
+        m_qfi = qfi;
+        m_enqueueNs3Us = enqueueNs3Us;
     }
 
     uint64_t GetPacketId() const
@@ -748,6 +1033,9 @@ class ShadowPacketTag : public Tag
   private:
     uint64_t m_packetId = 0;
     uint64_t m_epochId = 0;
+    uint64_t m_enqueueNs3Us = 0;
+    uint32_t m_qfi = 0;
+    std::string m_flowId;
 };
 
 struct ShadowFlowEndpoint
@@ -776,6 +1064,36 @@ OnShadowSocketReceive(Ptr<GtpuShadowPeer> peer, Ptr<Socket> socket)
 }
 
 void
+OnShadowPacketDiscard(Ptr<GtpuShadowPeer> peer,
+                      std::string reason,
+                      Ptr<const Packet> packet)
+{
+    ShadowPacketTag tag;
+    if (packet->PeekPacketTag(tag))
+    {
+        peer->Drop(tag.GetPacketId(), reason);
+    }
+}
+
+void
+ConnectShadowRlcDropTraces(Ptr<GtpuShadowPeer> peer)
+{
+    const auto callback = MakeBoundCallback(&OnShadowPacketDiscard,
+                                            peer,
+                                            std::string("rlc-tx-drop"));
+    const bool gnbConnected = Config::ConnectWithoutContextFailSafe(
+        "/NodeList/*/DeviceList/*/NrGnbRrc/UeMap/*/DataRadioBearerMap/*/NrRlc/TxDrop",
+        callback);
+    const bool ueConnected = Config::ConnectWithoutContextFailSafe(
+        "/NodeList/*/DeviceList/*/NrUeRrc/DataRadioBearerMap/*/NrRlc/TxDrop",
+        callback);
+    if (!gnbConnected && !ueConnected)
+    {
+        NS_LOG_WARN("no NR RLC TxDrop trace was available for shadow packets");
+    }
+}
+
+void
 InjectShadowPacket(ShadowInjectionContext* context, ShadowPacketRequest request)
 {
     auto endpointIt = context->endpoints.find(request.flowId);
@@ -793,7 +1111,11 @@ InjectShadowPacket(ShadowInjectionContext* context, ShadowPacketRequest request)
     }
     Ptr<Packet> packet = Create<Packet>(std::max<uint32_t>(1, request.sizeBytes));
     ShadowPacketTag tag;
-    tag.Set(request.packetId, request.epochId);
+    tag.Set(request.packetId,
+            request.epochId,
+            request.flowId,
+            request.qfi,
+            request.enqueueNs3Us);
     packet->AddPacketTag(tag);
     if (socket->Send(packet) < 0)
     {
@@ -1247,46 +1569,6 @@ PriorityWeight(const FlowProfile& profile)
     return 1.0 / static_cast<double>(std::max<uint32_t>(1, profile.priority == 0 ? 1 : profile.priority));
 }
 
-const SliceResourceProfile*
-ResolveSliceProfile(const SnapshotContext* context, const FlowProfile& profile)
-{
-    auto bySliceRef = context->sliceResources.find(profile.sliceRef);
-    if (bySliceRef != context->sliceResources.end())
-    {
-        return &bySliceRef->second;
-    }
-    if (!profile.sliceSnssai.empty())
-    {
-        for (const auto& [sliceId, resource] : context->sliceResources)
-        {
-            if (resource.sliceSnssai == profile.sliceSnssai)
-            {
-                return &resource;
-            }
-        }
-    }
-    return nullptr;
-}
-
-double
-ClampMetricFactor(double factor)
-{
-    return std::clamp(factor, 0.9, 1.1);
-}
-
-double
-ComputeMetricFactor(const SnapshotContext* context,
-                    uint16_t port,
-                    double congestionRatio,
-                    double phaseOffset)
-{
-    const double wave =
-        std::sin((static_cast<double>(context->tickIndex) + static_cast<double>(port % 17)) * 0.55 + phaseOffset);
-    const double oscillation = 0.05 * wave;
-    const double congestionPenalty = 0.05 * std::clamp(congestionRatio, 0.0, 1.0);
-    return ClampMetricFactor(1.0 + oscillation + congestionPenalty);
-}
-
 void
 ApplyClientRate(const SnapshotContext::FlowRuntimeState& runtime)
 {
@@ -1733,7 +2015,11 @@ EmitSnapshot(SnapshotContext* context)
                           const std::string& destinationEntity,
                           const std::string& fallbackFlowId) {
         const uint32_t gnbIndex = context->ueToGnb[ueIndex];
-        const uint32_t upfIndex = context->gnbToUpf[gnbIndex];
+        const uint32_t primaryUpfIndex = context->gnbToUpf[gnbIndex];
+        const std::string upfName =
+            profile != nullptr && !profile->upfName.empty()
+                ? profile->upfName
+                : context->upfNames[primaryUpfIndex];
         const uint32_t sliceIndex = ueIndex % context->sliceSds.size();
         const std::string defaultSliceId = BuildDefaultSliceId(context->sliceIds, context->sliceSds, ueIndex);
         const std::string flowIdentifier =
@@ -1809,7 +2095,7 @@ EmitSnapshot(SnapshotContext* context)
              << Quote("app_name") << ":" << Quote(appName) << ","
              << Quote("session_ref") << ":" << Quote(sessionRef) << ","
              << Quote("src_gnb") << ":" << Quote("gnb-" + std::to_string(gnbIndex + 1)) << ","
-             << Quote("dst_upf") << ":" << Quote(context->upfNames[upfIndex]) << ","
+             << Quote("dst_upf") << ":" << Quote(upfName) << ","
              << Quote("slice_id") << ":" << Quote(sliceId) << ","
              << Quote("5qi") << ":" << fiveQi << ","
              << Quote("delay_ms") << ":" << delayMs << ","
@@ -1910,16 +2196,6 @@ EmitSnapshot(SnapshotContext* context)
                 countersIt != context->externalFlowCountersByPort.end()
                     ? countersIt->second
                     : SnapshotContext::ExternalFlowCounters{};
-            const double offeredMbps =
-                runtime.profile.packetSizeBytes * runtime.profile.arrivalRatePps * 8.0 / 1e6;
-            const double capacityUl =
-                runtime.profile.allocatedBandwidthUlMbps > 0.0
-                    ? runtime.profile.allocatedBandwidthUlMbps
-                    : (runtime.profile.bandwidthUlMbps > 0.0 ? runtime.profile.bandwidthUlMbps : offeredMbps);
-            const double capacityDl =
-                runtime.profile.allocatedBandwidthDlMbps > 0.0
-                    ? runtime.profile.allocatedBandwidthDlMbps
-                    : (runtime.profile.bandwidthDlMbps > 0.0 ? runtime.profile.bandwidthDlMbps : offeredMbps);
             const uint64_t txPacketsUl = counters.txPacketsUl;
             const uint64_t rxPacketsUl = counters.rxPacketsUl;
             const uint64_t txPacketsDl = counters.txPacketsDl;
@@ -2134,6 +2410,13 @@ main(int argc, char* argv[])
     bool externalTrafficOnly = false;
     std::string externalTrafficTargetIp = "8.8.8.8";
     uint32_t externalTrafficSourceBasePort = 15000;
+    std::string userPlaneGateSocket;
+    std::string bearerMapFile;
+    uint32_t rngSeed = 1;
+    uint64_t rngRun = 1;
+    uint64_t virtualEpochUs = 100000;
+    double channelUpdateMs = 10.0;
+    bool shadowingEnabled = true;
 
     CommandLine cmd(__FILE__);
     cmd.AddValue("gNbNum", "Number of gNBs", gNbNum);
@@ -2220,11 +2503,28 @@ main(int argc, char* argv[])
     }
 
     const auto bridgeGnbTaps = ParseStringList(bridgeGnbTapsCsv, gNbNum, "bridgeGnbTaps");
-    const auto bridgeUpfTaps = ParseStringList(bridgeUpfTapsCsv, gNbNum, "bridgeUpfTaps");
+    const auto bridgeUpfTaps =
+        ParseStringList(bridgeUpfTapsCsv, upfNames.size(), "bridgeUpfTaps", true);
 
     const auto gnbPositionOverrides = ParsePositionOverrides(gnbPositionsArg, gNbNum, "gnbPositions");
     const auto uePositionOverrides = ParsePositionOverrides(uePositionsArg, resolvedUeNum, "uePositions");
-    const auto flowProfiles = LoadFlowProfiles(flowProfileFile);
+    auto flowProfiles = LoadFlowProfiles(flowProfileFile);
+    for (const auto& profile : flowProfiles)
+    {
+        if (!profile.upfName.empty() &&
+            std::find(upfNames.begin(), upfNames.end(), profile.upfName) == upfNames.end())
+        {
+            NS_FATAL_ERROR("flow " << profile.flowId << " references unknown UPF " << profile.upfName);
+        }
+    }
+    if (!userPlaneGateSocket.empty())
+    {
+        if (bearerMapFile.empty())
+        {
+            NS_FATAL_ERROR("gated user plane requires bearerMapFile");
+        }
+        ApplyBearerMapOverrides(&flowProfiles, LoadBearerMapOverrides(bearerMapFile));
+    }
     const auto sliceResources = LoadSliceResources(sliceResourceFile);
     std::map<std::string, uint32_t> ueIndexBySupi;
     std::vector<std::string> ueSliceIds(resolvedUeNum);
@@ -2275,6 +2575,11 @@ main(int argc, char* argv[])
     uint32_t lambda = 1000;
 
     Config::SetDefault("ns3::NrRlcUm::MaxTxBufferSize", UintegerValue(999999999));
+    if (!userPlaneGateSocket.empty())
+    {
+        Config::SetDefault("ns3::NrGnbRrc::EpsBearerToRlcMapping",
+                           EnumValue(NrGnbRrc::PER_BASED)); // PacketErrorRateBased
+    }
 
     GridScenarioHelper gridScenario;
     gridScenario.SetRows(1);
@@ -2342,51 +2647,54 @@ main(int argc, char* argv[])
                                        TimeValue(Seconds(std::max(0.0, bridgeLinkDelayMs) / 1000.0)));
         TapBridgeHelper tapBridge;
         tapBridge.SetAttribute("Mode", StringValue("UseBridge"));
+        std::vector<std::pair<uint32_t, std::string>> activeUpfTaps;
+        for (uint32_t upfIndex = 0; upfIndex < bridgeUpfTaps.size(); ++upfIndex)
+        {
+            if (!bridgeUpfTaps[upfIndex].empty() && bridgeUpfTaps[upfIndex] != "-")
+            {
+                activeUpfTaps.emplace_back(upfIndex, bridgeUpfTaps[upfIndex]);
+            }
+        }
+        if (activeUpfTaps.empty())
+        {
+            NS_FATAL_ERROR("inline N3 bridge requires at least one UPF TAP");
+        }
+
+        NodeContainer segment;
+        segment.Create(gNbNum + static_cast<uint32_t>(activeUpfTaps.size()));
+        NetDeviceContainer devices = bridgeCsma.Install(segment);
+        if (bridgeLinkLossRate > 0.0)
+        {
+            for (uint32_t deviceIndex = 0; deviceIndex < devices.GetN(); ++deviceIndex)
+            {
+                Ptr<RateErrorModel> errorModel = CreateObject<RateErrorModel>();
+                errorModel->SetUnit(RateErrorModel::ERROR_UNIT_PACKET);
+                errorModel->SetRate(std::min(1.0, std::max(0.0, bridgeLinkLossRate)));
+                devices.Get(deviceIndex)->SetAttribute("ReceiveErrorModel", PointerValue(errorModel));
+            }
+        }
+
+        auto connectBridgeTraces = [&context](Ptr<NetDevice> device, bool gnbSide) {
+            device->TraceConnectWithoutContext("MacTx", MakeBoundCallback(&OnBridgeMacTx, &context, gnbSide));
+            device->TraceConnectWithoutContext("MacPromiscRx",
+                                               MakeBoundCallback(&OnBridgeMacRx, &context, gnbSide));
+            device->TraceConnectWithoutContext("PhyRxDrop",
+                                               MakeBoundCallback(&OnBridgeMacRxDrop, &context, gnbSide));
+            device->TraceConnectWithoutContext("PromiscSniffer",
+                                               MakeBoundCallback(&OnBridgePromiscSniffer, &context, gnbSide));
+        };
         for (uint32_t gnbIndex = 0; gnbIndex < gNbNum; ++gnbIndex)
         {
-            NodeContainer segment;
-            segment.Create(2);
-            NetDeviceContainer devices = bridgeCsma.Install(segment);
-            if (bridgeLinkLossRate > 0.0)
-            {
-                for (uint32_t deviceIndex = 0; deviceIndex < devices.GetN(); ++deviceIndex)
-                {
-                    Ptr<RateErrorModel> errorModel = CreateObject<RateErrorModel>();
-                    errorModel->SetUnit(RateErrorModel::ERROR_UNIT_PACKET);
-                    errorModel->SetRate(std::min(1.0, std::max(0.0, bridgeLinkLossRate)));
-                    devices.Get(deviceIndex)->SetAttribute("ReceiveErrorModel", PointerValue(errorModel));
-                }
-            }
-            const uint32_t upfIndex = gnbToUpf[gnbIndex];
-            const uint32_t gnbDeviceIndex = 0;
-            const uint32_t upfDeviceIndex = 1;
-            devices.Get(gnbDeviceIndex)->TraceConnectWithoutContext("MacTx",
-                                                                    MakeBoundCallback(&OnBridgeMacTx, &context, true));
-            devices.Get(gnbDeviceIndex)->TraceConnectWithoutContext(
-                "MacPromiscRx",
-                MakeBoundCallback(&OnBridgeMacRx, &context, true));
-            devices.Get(gnbDeviceIndex)->TraceConnectWithoutContext(
-                "PhyRxDrop",
-                MakeBoundCallback(&OnBridgeMacRxDrop, &context, true));
-            devices.Get(gnbDeviceIndex)->TraceConnectWithoutContext(
-                "PromiscSniffer",
-                MakeBoundCallback(&OnBridgePromiscSniffer, &context, true));
+            connectBridgeTraces(devices.Get(gnbIndex), true);
             tapBridge.SetAttribute("DeviceName", StringValue(bridgeGnbTaps[gnbIndex]));
-            tapBridge.Install(segment.Get(gnbDeviceIndex), devices.Get(gnbDeviceIndex));
-
-            devices.Get(upfDeviceIndex)->TraceConnectWithoutContext("MacTx",
-                                                                    MakeBoundCallback(&OnBridgeMacTx, &context, false));
-            devices.Get(upfDeviceIndex)->TraceConnectWithoutContext(
-                "MacPromiscRx",
-                MakeBoundCallback(&OnBridgeMacRx, &context, false));
-            devices.Get(upfDeviceIndex)->TraceConnectWithoutContext(
-                "PhyRxDrop",
-                MakeBoundCallback(&OnBridgeMacRxDrop, &context, false));
-            devices.Get(upfDeviceIndex)->TraceConnectWithoutContext(
-                "PromiscSniffer",
-                MakeBoundCallback(&OnBridgePromiscSniffer, &context, false));
-            tapBridge.SetAttribute("DeviceName", StringValue(bridgeUpfTaps[gnbIndex]));
-            tapBridge.Install(segment.Get(upfDeviceIndex), devices.Get(upfDeviceIndex));
+            tapBridge.Install(segment.Get(gnbIndex), devices.Get(gnbIndex));
+        }
+        for (uint32_t localUpfIndex = 0; localUpfIndex < activeUpfTaps.size(); ++localUpfIndex)
+        {
+            const uint32_t deviceIndex = gNbNum + localUpfIndex;
+            connectBridgeTraces(devices.Get(deviceIndex), false);
+            tapBridge.SetAttribute("DeviceName", StringValue(activeUpfTaps[localUpfIndex].second));
+            tapBridge.Install(segment.Get(deviceIndex), devices.Get(deviceIndex));
         }
     }
 
@@ -2533,10 +2841,7 @@ main(int argc, char* argv[])
                 static_cast<uint32_t>(std::max(64.0, profile.packetSizeBytes)),
             });
 
-            const auto qci = profile.rlcMode == "AM"
-                                 ? NrEpsBearer::NGBR_VIDEO_TCP_DEFAULT
-                                 : NrEpsBearer::NGBR_VOICE_VIDEO_GAMING;
-            NrEpsBearer bearer(qci);
+            NrEpsBearer bearer = ResolveShadowBearer(profile);
             Ptr<NrEpcTft> tft = Create<NrEpcTft>();
             NrEpcTft::PacketFilter downlinkFilter;
             downlinkFilter.localPortStart = downlinkPort;
@@ -2553,6 +2858,25 @@ main(int argc, char* argv[])
             virtualEpochUs,
             authorizations,
             MakeBoundCallback(&InjectShadowPacket, &shadowContext));
+        for (uint32_t index = 0; index < gnbNetDev.GetN(); ++index)
+        {
+            gnbNetDev.Get(index)->TraceConnectWithoutContext(
+                "Drop",
+                MakeBoundCallback(&OnShadowPacketDiscard,
+                                  shadowContext.peer,
+                                  std::string("nr-device-drop")));
+        }
+        for (uint32_t index = 0; index < ueNetDev.GetN(); ++index)
+        {
+            ueNetDev.Get(index)->TraceConnectWithoutContext(
+                "Drop",
+                MakeBoundCallback(&OnShadowPacketDiscard,
+                                  shadowContext.peer,
+                                  std::string("nr-device-drop")));
+        }
+        Simulator::Schedule(appStartTime,
+                            &ConnectShadowRlcDropTraces,
+                            shadowContext.peer);
         Simulator::Schedule(appStartTime, &GtpuShadowPeer::Start, shadowContext.peer);
     }
 

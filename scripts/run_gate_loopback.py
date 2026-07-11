@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from dataclasses import asdict
 import ipaddress
 import json
@@ -24,6 +25,14 @@ from bridge.user_plane.gtpu import (
 )
 from bridge.user_plane.kpi import PacketKpiCollector
 from bridge.user_plane.protocol import Message, MessageType
+
+
+def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
 
 
 class _DemoClassifier:
@@ -49,7 +58,7 @@ class _DemoClassifier:
         )
 
 
-def run_demo() -> dict[str, object]:
+def run_demo(output_dir: Path | None = None) -> dict[str, object]:
     gnb = MemoryFramePort()
     upf = MemoryFramePort()
     outbound: list[Message] = []
@@ -65,6 +74,10 @@ def run_demo() -> dict[str, object]:
         ports={"gnb": gnb, "upf": upf},
         peer_send=outbound.append,
         virtual_expiry_us_by_flow={"flow-1": 1000},
+        egress_resolver=lambda ingress, _frame: {
+            "gnb": ("upf",),
+            "upf": ("gnb",),
+        }[ingress],
     )
     epoch_id = coordinator.begin_epoch(start_ns3_us=1000)
     first = gate.capture(
@@ -109,6 +122,12 @@ def run_demo() -> dict[str, object]:
         start_ns3_us=1000,
         end_ns3_us=2000,
     )
+    if output_dir is not None:
+        _write_jsonl(
+            output_dir / "packet-events.jsonl",
+            [asdict(event) for event in kpi.events if event.epoch_id == epoch_id],
+        )
+        _write_jsonl(output_dir / "packet-kpis.jsonl", [asdict(summary)])
     return {
         "released_frames": [frame.decode("ascii") for frame in upf.written_frames],
         "enqueue_messages": [message.payload for message in outbound],
@@ -118,8 +137,11 @@ def run_demo() -> dict[str, object]:
     }
 
 
-def main() -> int:
-    print(json.dumps(run_demo(), indent=2, sort_keys=True))
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Run the deterministic GTP-U gate loopback demo")
+    parser.add_argument("--output-dir", type=Path)
+    args = parser.parse_args(argv)
+    print(json.dumps(run_demo(output_dir=args.output_dir), indent=2, sort_keys=True))
     return 0
 
 

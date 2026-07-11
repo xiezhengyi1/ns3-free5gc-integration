@@ -518,10 +518,8 @@ def _render_ulcl_smf_config(
         rendered_links.append({"A": left, "B": right})
 
     for gnb in scenario.gnbs:
-        add_link(
-            gnb_node_names[gnb.name],
-            upf_node_names[resolved_topology.gnb_to_upf[gnb.name]],
-        )
+        for upf_name in resolved_topology.gnb_to_upfs[gnb.name]:
+            add_link(gnb_node_names[gnb.name], upf_node_names[upf_name])
 
     for branch_node_name in branching_upf_node_names:
         for anchor_node_name in anchor_upf_node_names:
@@ -1061,6 +1059,7 @@ def _render_ns3_flow_profiles(scenario: ScenarioConfig, output_path: Path) -> No
         "slice_ref",
         "slice_snssai",
         "dnn",
+        "upf_ref",
         "service_type",
         "service_type_id",
         "five_qi",
@@ -1111,6 +1110,7 @@ def _render_ns3_flow_profiles(scenario: ScenarioConfig, output_path: Path) -> No
             flow.slice_ref,
             f"{slice_config.sst:02d}{slice_config.sd.lower()}",
             flow.dnn,
+            scenario.resolve_flow_upf(flow),
             flow.service_type,
             flow.service_type_id,
             flow.five_qi,
@@ -1190,13 +1190,22 @@ def _render_user_plane_assets(
     bridge_plans: list[Any],
     generated_dir: Path,
 ) -> tuple[Path, Path]:
-    if len(bridge_plans) != 1:
-        raise ValueError("user-plane gate currently requires exactly one bridge plan")
-    plan = bridge_plans[0]
+    if not bridge_plans:
+        raise ValueError("user-plane gate requires at least one bridge plan")
     gate = scenario.bridge.user_plane_gate
+    bridge_plan_by_pair = {
+        (plan.gnb_name, plan.upf_name): plan for plan in bridge_plans
+    }
     flow_rows = [
         {
             "flow_id": flow.flow_id,
+            "upf_ref": scenario.resolve_flow_upf(flow),
+            "gnb_ip": bridge_plan_by_pair[
+                (scenario.resolve_flow_gnb(flow), scenario.resolve_flow_upf(flow))
+            ].gnb_n3_ip,
+            "upf_ip": bridge_plan_by_pair[
+                (scenario.resolve_flow_gnb(flow), scenario.resolve_flow_upf(flow))
+            ].upf_n3_ip,
             "ue_ip": flow.ue_ip,
             "qfi": flow.qfi,
             "inner_protocol": flow.inner_protocol,
@@ -1206,16 +1215,24 @@ def _render_user_plane_assets(
         }
         for flow in scenario.flows
     ]
+    link_rows = [
+        {
+            "link_id": f"n3-{plan.link_index}",
+            "gnb_name": plan.gnb_name,
+            "upf_name": plan.upf_name,
+            "gnb_tap": plan.gnb_tap,
+            "upf_tap": plan.upf_tap,
+            "gnb_ip": plan.gnb_n3_ip,
+            "upf_ip": plan.upf_n3_ip,
+        }
+        for plan in bridge_plans
+    ]
     gate_payload = {
-        "gnb_tap": plan.gnb_tap,
-        "upf_tap": plan.upf_tap,
+        "links": link_rows,
         "socket_path": gate.socket_path,
         "authorization_socket": f"{gate.socket_path}.agents",
         "max_pending_packets": gate.max_pending_packets,
         "max_pending_bytes": gate.max_pending_bytes,
-        "fail_closed": gate.fail_closed,
-        "gnb_ips": [plan.gnb_n3_ip],
-        "upf_ips": [plan.upf_n3_ip],
         "event_log": str(generated_dir / scenario.ns3.output_subdir / "packet-events.jsonl"),
         "kpi_log": str(generated_dir / scenario.ns3.output_subdir / "packet-kpis.jsonl"),
         "flows": flow_rows,

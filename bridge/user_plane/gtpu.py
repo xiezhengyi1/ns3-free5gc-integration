@@ -55,6 +55,8 @@ class GtpuPacket:
 class FlowBinding:
     flow_id: str
     ue_ip: ipaddress.IPv4Address | str
+    gnb_ip: ipaddress.IPv4Address | str
+    upf_ip: ipaddress.IPv4Address | str
     qfi: int | None = None
     inner_protocol: int | None = None
     ue_port: int | None = None
@@ -62,6 +64,8 @@ class FlowBinding:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "ue_ip", ipaddress.IPv4Address(self.ue_ip))
+        object.__setattr__(self, "gnb_ip", ipaddress.IPv4Address(self.gnb_ip))
+        object.__setattr__(self, "upf_ip", ipaddress.IPv4Address(self.upf_ip))
         if self.qfi is not None and not 0 <= self.qfi <= 63:
             raise ValueError("qfi must be within [0, 63]")
 
@@ -232,7 +236,11 @@ class FlowClassifier:
 
         if packet.qfi is not None:
             for binding in self._bindings:
-                if binding.ue_ip == ue_ip and binding.qfi == packet.qfi:
+                if (
+                    binding.ue_ip == ue_ip
+                    and binding.qfi == packet.qfi
+                    and self._matches_endpoints(binding, packet, direction)
+                ):
                     return Classification(
                         DecisionKind.MANAGED,
                         packet=packet,
@@ -268,7 +276,9 @@ class FlowClassifier:
         direction: Direction,
         ue_ip: ipaddress.IPv4Address,
     ) -> bool:
-        if binding.ue_ip != ue_ip:
+        if binding.ue_ip != ue_ip or not FlowClassifier._matches_endpoints(
+            binding, packet, direction
+        ):
             return False
         if binding.inner_protocol is not None and binding.inner_protocol != packet.inner_protocol:
             return False
@@ -290,3 +300,13 @@ class FlowClassifier:
             value is not None
             for value in (binding.inner_protocol, binding.ue_port, binding.remote_port)
         )
+
+    @staticmethod
+    def _matches_endpoints(
+        binding: FlowBinding,
+        packet: GtpuPacket,
+        direction: Direction,
+    ) -> bool:
+        if direction is Direction.UPLINK:
+            return packet.outer_src == binding.gnb_ip and packet.outer_dst == binding.upf_ip
+        return packet.outer_src == binding.upf_ip and packet.outer_dst == binding.gnb_ip

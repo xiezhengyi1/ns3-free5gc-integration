@@ -1,0 +1,10 @@
+pfcp:
+  addr: i-upf-1.free5gc.org
+  nodeID: i-upf-1.free5gc.org
+gtpu:
+  ifList:
+    - addr: i-upf-1.free5gc.org
+      type: N3
+dnnList:
+  - dnn: internet
+    cidr: 10.60.0.0/16

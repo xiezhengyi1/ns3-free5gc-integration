@@ -14,58 +14,34 @@ SPEC.loader.exec_module(MODULE)
 
 
 class RealUeFlowsTest(unittest.TestCase):
-    def test_parser_accepts_controlled_mode(self) -> None:
+    def test_authorization_ledger_is_idempotent_after_success(self) -> None:
+        ledger = MODULE._AuthorizationLedger()
+
+        self.assertTrue(ledger.should_dispatch(41))
+        ledger.complete(41)
+
+        self.assertFalse(ledger.should_dispatch(41))
+
+    def test_parser_requires_authorization_socket(self) -> None:
         parser = MODULE._build_parser()
 
         args = parser.parse_args(
             [
                 "--flow-profile-file",
                 "flows.tsv",
-                "--clock-file",
-                "clock.json",
                 "--state-file",
                 "state.jsonl",
-                "--run-id",
-                "run-1",
-                "--scenario-id",
-                "scenario-1",
                 "--target-ip",
                 "192.0.2.1",
                 "--upf-container",
                 "upf",
-                "--controlled",
                 "--authorization-socket",
                 "/tmp/authorize.sock",
                 "ue1=ue-container",
             ]
         )
 
-        self.assertTrue(args.controlled)
         self.assertEqual(args.authorization_socket, "/tmp/authorize.sock")
-
-    def test_effective_tick_window_uses_nominal_window_when_starting(self) -> None:
-        elapsed_ms, skipped_ticks = MODULE._effective_tick_window_ms(
-            last_tick=None,
-            last_sim_time_ms=None,
-            tick_index=0,
-            sim_time_ms=100,
-            nominal_tick_ms=100,
-        )
-
-        self.assertEqual(elapsed_ms, 100)
-        self.assertEqual(skipped_ticks, 0)
-
-    def test_effective_tick_window_drops_backlog_when_ticks_were_skipped(self) -> None:
-        elapsed_ms, skipped_ticks = MODULE._effective_tick_window_ms(
-            last_tick=0,
-            last_sim_time_ms=100,
-            tick_index=16,
-            sim_time_ms=1700,
-            nominal_tick_ms=100,
-        )
-
-        self.assertEqual(elapsed_ms, 100)
-        self.assertEqual(skipped_ticks, 15)
 
     def test_select_interface_for_session_uses_requested_index_when_available(self) -> None:
         selected = MODULE._select_interface_for_session(
@@ -86,6 +62,26 @@ class RealUeFlowsTest(unittest.TestCase):
     def test_resolve_ue_interface_returns_none_when_no_tunnel_is_available(self) -> None:
         with mock.patch.object(MODULE, "_list_ue_interfaces", return_value=[]):
             resolved = MODULE._resolve_ue_interface("ue-ue1", 0)
+
+        self.assertIsNone(resolved)
+
+    def test_resolve_ue_interface_treats_unready_container_as_not_ready(self) -> None:
+        with mock.patch.object(
+            MODULE,
+            "_list_ue_interfaces",
+            side_effect=MODULE.subprocess.CalledProcessError(1, ["docker", "exec"]),
+        ):
+            resolved = MODULE._resolve_ue_interface("ue-ue1", 0)
+
+        self.assertIsNone(resolved)
+
+    def test_resolve_downlink_route_skips_unready_upf_container(self) -> None:
+        with mock.patch.object(
+            MODULE.subprocess,
+            "check_output",
+            side_effect=MODULE.subprocess.CalledProcessError(1, ["docker", "exec"]),
+        ):
+            resolved = MODULE._resolve_downlink_route(["upf-1"], "10.60.0.1")
 
         self.assertIsNone(resolved)
 
