@@ -5,32 +5,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 NS3_ROOT="${NS3_ROOT:-/home/xiezhengyi/workspace/ns-allinone-3.46.1/ns-3.46.1}"
 
-ensure_tap_creator_permissions() {
-  local tap_creator
-  tap_creator="$(find "$NS3_ROOT/build/src/tap-bridge" -maxdepth 1 -type f -name 'ns*-tap-creator*' | head -n 1 || true)"
-  if [[ -z "$tap_creator" || ! -f "$tap_creator" ]]; then
-    return 0
-  fi
-
-  if [[ -u "$tap_creator" && "$(stat -c '%U' "$tap_creator")" == "root" ]]; then
-    return 0
-  fi
-
-  if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
-    sudo chown root "$tap_creator"
-    sudo chmod u+s "$tap_creator"
-    return 0
-  fi
-
-  if command -v docker >/dev/null 2>&1; then
-    docker run --rm --privileged --pid host --network host -v /:/host free5gc/base:latest \
-      chroot /host /bin/bash -lc "chown root '$tap_creator' && chmod u+s '$tap_creator'"
-    return 0
-  fi
-
-  echo "warning: could not set tap-creator permissions automatically: $tap_creator" >&2
-}
-
 RUN_ID=""
 SCENARIO_ID=""
 GNB_NUM="1"
@@ -48,18 +22,9 @@ UPF_NAMES="upf"
 SLICE_SDS="010203"
 UE_SUPIS=""
 UE_GNB_MAP=""
-GNB_UPF_MAP=""
+GNB_UPF_LINKS=""
 GNB_POSITIONS=""
 UE_POSITIONS=""
-BRIDGE_GNB_TAPS=""
-BRIDGE_UPF_TAPS=""
-BRIDGE_LINK_RATE_MBPS="1000"
-BRIDGE_LINK_DELAY_MS="1"
-BRIDGE_LINK_LOSS_RATE="0"
-EXTERNAL_TRAFFIC_ONLY="false"
-EXTERNAL_TRAFFIC_TARGET_IP="8.8.8.8"
-EXTERNAL_TRAFFIC_SOURCE_BASE_PORT="15000"
-SPLIT_MODE="false"
 NR_NUMEROLOGY="1"
 NR_BANDWIDTH_HZ="100000000"
 NR_CENTRAL_FREQUENCY_HZ="3500000000"
@@ -141,8 +106,8 @@ while [[ $# -gt 0 ]]; do
       UE_GNB_MAP="$2"
       shift 2
       ;;
-    --gnb-upf-map)
-      GNB_UPF_MAP="$2"
+    --gnb-upf-links)
+      GNB_UPF_LINKS="$2"
       shift 2
       ;;
     --gnb-positions)
@@ -152,42 +117,6 @@ while [[ $# -gt 0 ]]; do
     --ue-positions)
       UE_POSITIONS="$2"
       shift 2
-      ;;
-    --bridge-gnb-taps)
-      BRIDGE_GNB_TAPS="$2"
-      shift 2
-      ;;
-    --bridge-upf-taps)
-      BRIDGE_UPF_TAPS="$2"
-      shift 2
-      ;;
-    --bridge-link-rate-mbps)
-      BRIDGE_LINK_RATE_MBPS="$2"
-      shift 2
-      ;;
-    --bridge-link-delay-ms)
-      BRIDGE_LINK_DELAY_MS="$2"
-      shift 2
-      ;;
-    --bridge-link-loss-rate)
-      BRIDGE_LINK_LOSS_RATE="$2"
-      shift 2
-      ;;
-    --external-traffic-only)
-      EXTERNAL_TRAFFIC_ONLY="true"
-      shift
-      ;;
-    --external-traffic-target-ip)
-      EXTERNAL_TRAFFIC_TARGET_IP="$2"
-      shift 2
-      ;;
-    --external-traffic-source-base-port)
-      EXTERNAL_TRAFFIC_SOURCE_BASE_PORT="$2"
-      shift 2
-      ;;
-    --split-mode)
-      SPLIT_MODE="true"
-      shift
       ;;
     --nr-numerology)
       NR_NUMEROLOGY="$2"
@@ -261,7 +190,6 @@ if [[ -n "$CLOCK_FILE" ]]; then
   mkdir -p "$(dirname "$CLOCK_FILE")"
 fi
 cp "$PROJECT_ROOT/sim/ns3/nr_multignb_multiupf_split.cc" "$NS3_ROOT/scratch/nr_multignb_multiupf_split.cc"
-ensure_tap_creator_permissions
 
 NS3_ARGS=(
   "--runId=$RUN_ID"
@@ -275,9 +203,6 @@ NS3_ARGS=(
   "--upfNames=$UPF_NAMES"
   "--sliceSds=$SLICE_SDS"
   "--policyReloadMs=$POLICY_RELOAD_MS"
-  "--bridgeLinkRateMbps=$BRIDGE_LINK_RATE_MBPS"
-  "--bridgeLinkDelayMs=$BRIDGE_LINK_DELAY_MS"
-  "--bridgeLinkLossRate=$BRIDGE_LINK_LOSS_RATE"
   "--nrNumerology=$NR_NUMEROLOGY"
   "--nrBandwidthHz=$NR_BANDWIDTH_HZ"
   "--nrCentralFrequencyHz=$NR_CENTRAL_FREQUENCY_HZ"
@@ -307,8 +232,8 @@ fi
 if [[ -n "$UE_GNB_MAP" ]]; then
   NS3_ARGS+=("--ueGnbMap=$UE_GNB_MAP")
 fi
-if [[ -n "$GNB_UPF_MAP" ]]; then
-  NS3_ARGS+=("--gnbUpfMap=$GNB_UPF_MAP")
+if [[ -n "$GNB_UPF_LINKS" ]]; then
+  NS3_ARGS+=("--gnbUpfLinks=$GNB_UPF_LINKS")
 fi
 if [[ -n "$GNB_POSITIONS" ]]; then
   NS3_ARGS+=("--gnbPositions=$GNB_POSITIONS")
@@ -316,23 +241,6 @@ fi
 if [[ -n "$UE_POSITIONS" ]]; then
   NS3_ARGS+=("--uePositions=$UE_POSITIONS")
 fi
-if [[ -n "$BRIDGE_GNB_TAPS" ]]; then
-  NS3_ARGS+=("--bridgeGnbTaps=$BRIDGE_GNB_TAPS")
-fi
-if [[ -n "$BRIDGE_UPF_TAPS" ]]; then
-  NS3_ARGS+=("--bridgeUpfTaps=$BRIDGE_UPF_TAPS")
-fi
-if [[ "$EXTERNAL_TRAFFIC_ONLY" == "true" ]]; then
-  NS3_ARGS+=(
-    "--externalTrafficOnly=true"
-    "--externalTrafficTargetIp=$EXTERNAL_TRAFFIC_TARGET_IP"
-    "--externalTrafficSourceBasePort=$EXTERNAL_TRAFFIC_SOURCE_BASE_PORT"
-  )
-fi
-if [[ "$SPLIT_MODE" == "true" ]]; then
-  NS3_ARGS+=("--splitMode=true")
-fi
-
 cd "$NS3_ROOT"
 NS3_BINARY="$(find "$NS3_ROOT/build/scratch" -maxdepth 1 -type f -name 'ns3.*-nr_multignb_multiupf_split-*' | head -n 1 || true)"
 if [[ -z "$NS3_BINARY" || ! -x "$NS3_BINARY" ]]; then

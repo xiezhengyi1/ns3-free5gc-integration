@@ -1,15 +1,14 @@
+
 """CLI for ingesting tick snapshots into local state and optional HTTP sink."""
 
 from __future__ import annotations
 
 import argparse
-from collections import deque
 import json
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
 
 from bridge.common.schema import TickSnapshot
 from bridge.writer.http_sink import HttpIngestionClient
@@ -20,126 +19,6 @@ from bridge.writer.log_parser import (
 )
 from bridge.writer.local_store import SnapshotStore
 from bridge.writer.postgres_graph_store import PostgresGraphStore
-
-
-class RealTrafficStateReader:
-    def __init__(self, path: str, timeout_seconds: float) -> None:
-        self.path = Path(path).expanduser().resolve()
-        self.timeout_seconds = max(0.0, float(timeout_seconds))
-        self._offset = 0
-        self._pending: deque[dict[str, Any]] = deque()
-        self._latest_payload: dict[str, Any] | None = None
-
-    def payload_for_tick(self, target_tick: int) -> dict[str, Any] | None:
-        status, payload = self.payload_status_for_tick(target_tick)
-        if status != "exact":
-            return None
-        return payload
-
-    def payload_status_for_tick(self, target_tick: int) -> tuple[str, dict[str, Any] | None]:
-        deadline = time.monotonic() + self.timeout_seconds
-        normalized_target = int(target_tick)
-        while True:
-            self._read_available()
-            self._advance_to_tick(normalized_target)
-
-            latest_tick = self._tick_of(self._latest_payload)
-            if latest_tick == normalized_target:
-                return "exact", self._latest_payload
-            next_tick = self._tick_of(self._pending[0]) if self._pending else -1
-            if next_tick > normalized_target:
-                return "skipped", None
-            if time.monotonic() >= deadline:
-                return "pending", None
-            time.sleep(0.05)
-
-    def _advance_to_tick(self, target_tick: int) -> None:
-        while self._pending:
-            next_tick = self._tick_of(self._pending[0])
-            if next_tick > target_tick:
-                break
-            self._latest_payload = self._pending.popleft()
-
-    def _read_available(self) -> None:
-        try:
-            file_size = self.path.stat().st_size
-        except FileNotFoundError:
-            return
-
-        if file_size < self._offset:
-            self._offset = 0
-            self._pending.clear()
-            self._latest_payload = None
-
-        with self.path.open("r", encoding="utf-8") as handle:
-            handle.seek(self._offset)
-            while True:
-                line_start = handle.tell()
-                line = handle.readline()
-                if not line:
-                    break
-                if not line.endswith("\n"):
-                    handle.seek(line_start)
-                    break
-                self._offset = handle.tell()
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                try:
-                    payload = json.loads(stripped)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(payload, dict):
-                    continue
-                tick_index = payload.get("tick_index")
-                if tick_index is None:
-                    continue
-                try:
-                    payload["tick_index"] = int(tick_index)
-                except (TypeError, ValueError):
-                    continue
-                self._pending.append(payload)
-
-    @staticmethod
-    def _tick_of(payload: dict[str, Any] | None) -> int:
-        if not isinstance(payload, dict):
-            return -1
-        tick_index = payload.get("tick_index")
-        try:
-            return int(tick_index)
-        except (TypeError, ValueError):
-            return -1
-
-
-def _get_real_traffic_reader(args: argparse.Namespace) -> RealTrafficStateReader | None:
-    state_file = getattr(args, "real_traffic_state_file", None)
-    if not state_file:
-        return None
-
-    path = Path(state_file).expanduser().resolve()
-    timeout_seconds = float(getattr(args, "real_traffic_timeout_seconds", 15.0))
-    reader = getattr(args, "_real_traffic_reader", None)
-    if isinstance(reader, RealTrafficStateReader) and reader.path == path:
-        return reader
-
-    reader = RealTrafficStateReader(str(path), timeout_seconds)
-    setattr(args, "_real_traffic_reader", reader)
-    return reader
-
-
-def _as_float(value: object) -> float | None:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _throughput_mbps(packet_count: int, packet_size_bytes: int, tick_ms: int) -> float:
-    normalized_tick_ms = max(1, int(tick_ms))
-    bits = max(0, int(packet_count)) * max(0, int(packet_size_bytes)) * 8
-    return bits / normalized_tick_ms / 1000.0
 
 
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
@@ -167,8 +46,6 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
         default="v1",
         help="topology version label stored with the run",
     )
-    parser.add_argument("--real-traffic-state-file", help="JSONL file written by run_real_ue_flows.py")
-    parser.add_argument("--real-traffic-timeout-seconds", type=float, default=15.0)
 
 
 def _build_writer(
@@ -184,111 +61,6 @@ def _build_writer(
     return store, client, graph_store
 
 
-def _merge_real_traffic_state(
-    snapshot: TickSnapshot,
-    args: argparse.Namespace,
-    *,
-    state_payload: dict[str, Any] | None = None,
-) -> TickSnapshot:
-    if state_payload is None:
-        reader = _get_real_traffic_reader(args)
-        if reader is None:
-            return snapshot
-        state_payload = reader.payload_for_tick(snapshot.tick_index)
-        if state_payload is None:
-            return snapshot
-    real_flows = {
-        str(item["flow_id"]): item
-        for item in state_payload.get("flows", [])
-        if isinstance(item, dict) and "flow_id" in item
-    }
-    effective_tick_ms = int(
-        state_payload.get("effective_tick_ms")
-        or getattr(args, "tick_ms", snapshot.sim_time_ms)
-        or 1
-    )
-    ue_ip_by_supi: dict[str, str] = {}
-    for flow in snapshot.flows:
-        real_flow = real_flows.get(flow.flow_id)
-        if real_flow is None:
-            continue
-        ue_ip = str(real_flow["ue_ip"])
-        source_port = int(real_flow["source_port"])
-        destination_port = int(real_flow["destination_port"])
-        packet_size_bytes = int(real_flow.get("packet_size_bytes", 0) or 0)
-        ul_packets_sent = int(real_flow.get("ul_packets_sent", 0) or 0)
-        dl_packets_sent = int(real_flow.get("dl_packets_sent", 0) or 0)
-        packet_sent = ul_packets_sent + dl_packets_sent
-        packet_received = packet_sent
-        loss_rate = float(flow.loss_rate)
-        telemetry = dict(flow.telemetry)
-        throughput_ul_mbps = _throughput_mbps(ul_packets_sent, packet_size_bytes, effective_tick_ms)
-        throughput_dl_mbps = _throughput_mbps(dl_packets_sent, packet_size_bytes, effective_tick_ms)
-        traffic = dict(flow.traffic)
-        traffic["five_tuple"] = {
-            "protocol": 17,
-            "source_ip": ue_ip,
-            "source_port": source_port,
-            "destination_ip": traffic.get("five_tuple", {}).get("destination_ip", "8.8.8.8")
-            if isinstance(traffic.get("five_tuple"), dict)
-            else "8.8.8.8",
-            "destination_port": destination_port,
-        }
-        if dl_packets_sent > 0:
-            traffic["reverse_five_tuple"] = {
-                "protocol": 17,
-                "source_ip": traffic["five_tuple"]["destination_ip"],
-                "source_port": destination_port,
-                "destination_ip": ue_ip,
-                "destination_port": source_port,
-            }
-        else:
-            traffic.pop("reverse_five_tuple", None)
-        if ul_packets_sent > 0 and dl_packets_sent > 0:
-            traffic["direction"] = "bidirectional"
-        elif dl_packets_sent > 0:
-            traffic["direction"] = "downlink"
-        else:
-            traffic["direction"] = "uplink"
-        traffic["ue_interface"] = str(real_flow["interface"])
-        traffic["dl_upf_container"] = str(real_flow["dl_container"])
-        flow.traffic = traffic
-        flow.throughput_ul_mbps = throughput_ul_mbps
-        flow.throughput_dl_mbps = throughput_dl_mbps
-        flow.loss_rate = loss_rate
-        telemetry["loss_rate"] = loss_rate
-        telemetry["packet_sent"] = packet_sent
-        telemetry["packet_received"] = packet_received
-        telemetry["throughput_ul"] = throughput_ul_mbps
-        telemetry["throughput_dl"] = throughput_dl_mbps
-        flow.telemetry = telemetry
-        ue_ip_by_supi[flow.supi] = ue_ip
-
-    for ue in snapshot.ues:
-        if ue.supi in ue_ip_by_supi:
-            ue.ip_address = ue_ip_by_supi[ue.supi]
-
-    if snapshot.flows:
-        mean_delay_ms = sum(float(flow.delay_ms) for flow in snapshot.flows) / len(snapshot.flows)
-        mean_loss_rate = sum(float(flow.loss_rate) for flow in snapshot.flows) / len(snapshot.flows)
-        throughput_dl_total = sum(float(flow.throughput_dl_mbps) for flow in snapshot.flows)
-        throughput_ul_total = sum(float(flow.throughput_ul_mbps) for flow in snapshot.flows)
-        kpis = dict(snapshot.kpis)
-        kpis["active_flows"] = float(len(snapshot.flows))
-        kpis["mean_delay_ms"] = mean_delay_ms
-        kpis["mean_loss_rate"] = mean_loss_rate
-        kpis["throughput_dl_mbps_total"] = throughput_dl_total
-        kpis["throughput_ul_mbps_total"] = throughput_ul_total
-        snapshot.kpis = kpis
-
-        reward_inputs = dict(snapshot.reward_inputs)
-        reward_inputs["delay_penalty"] = mean_delay_ms
-        reward_inputs["loss_penalty"] = mean_loss_rate
-        reward_inputs["throughput_score"] = throughput_dl_total + throughput_ul_total
-        snapshot.reward_inputs = reward_inputs
-    return snapshot
-
-
 def _ingest_line(
     line: str,
     store: SnapshotStore,
@@ -299,25 +71,6 @@ def _ingest_line(
     if not line.strip():
         return "ingested"
     snapshot = TickSnapshot.from_dict(json.loads(line))
-    reader = _get_real_traffic_reader(args)
-    if reader is not None:
-        status, state_payload = reader.payload_status_for_tick(snapshot.tick_index)
-        if status == "pending":
-            return "pending"
-        if status == "skipped":
-            print(
-                json.dumps(
-                    {
-                        "skipped": True,
-                        "run_id": snapshot.run_id,
-                        "tick_index": snapshot.tick_index,
-                        "reason": "real_traffic_tick_missing",
-                    },
-                    ensure_ascii=False,
-                )
-            )
-            return "skipped"
-        snapshot = _merge_real_traffic_state(snapshot, args, state_payload=state_payload)
     result = store.ingest_snapshot(
         snapshot,
         seed=args.seed,
@@ -420,18 +173,14 @@ def _ingest_file(args: argparse.Namespace) -> int:
     store, client, graph_store = _build_writer(args)
     with Path(args.path).expanduser().resolve().open("r", encoding="utf-8") as handle:
         for line in handle:
-            outcome = _ingest_line(line, store, client, graph_store, args)
-            if outcome == "pending":
-                raise RuntimeError(f"missing real traffic state for ingested tick in {args.path}")
+            _ingest_line(line, store, client, graph_store, args)
     return 0
 
 
 def _ingest_stdin(args: argparse.Namespace) -> int:
     store, client, graph_store = _build_writer(args)
     for line in sys.stdin:
-        outcome = _ingest_line(line, store, client, graph_store, args)
-        if outcome == "pending":
-            raise RuntimeError("missing real traffic state for ingested tick from stdin")
+        _ingest_line(line, store, client, graph_store, args)
     return 0
 
 

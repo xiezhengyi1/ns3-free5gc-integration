@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ns3-free5gc-integration"
 version = "0.1.0"
-description = "Orchestration and snapshot tooling for free5GC, UERANSIM, and ns-3 NR twin runs."
+description = "Split control-plane/user-plane orchestration for free5GC, UERANSIM, and ns-3 NR."
 requires-python = ">=3.10"
 dependencies = [
   "PyYAML>=6.0",
@@ -14,16 +14,5 @@ dependencies = [
   "requests>=2.32",
 ]
 
-[project.scripts]
-ns3-free5gc-gate = "bridge.user_plane.cli:main"
-
-[tool.setuptools]
-packages = [
-  "bridge",
-  "bridge.common",
-  "bridge.orchestrator",
-  "bridge.user_plane",
-  "bridge.writer",
-  "adapters",
-  "adapters.free5gc_ueransim",
-]
+[tool.setuptools.packages.find]
+include = ["bridge*", "adapters*"]

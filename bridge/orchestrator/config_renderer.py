@@ -11,7 +11,6 @@ from typing import Any
 
 import yaml
 
-from adapters.free5gc_ueransim.bridge_setup import build_bridge_plan, render_bridge_probe_script, render_bridge_script
 from adapters.free5gc_ueransim.compose_override import (
     AMF_CONTROL_IP,
     N3NetworkPlan,
@@ -23,9 +22,8 @@ from adapters.free5gc_ueransim.compose_override import (
     upf_service_ip,
 )
 from adapters.free5gc_ueransim.subscriber_bootstrap import render_subscriber_bootstrap_assets
-from bridge.common.scenario import FlowConfig, ScenarioConfig, SliceConfig, load_scenario
+from bridge.common.scenario import FlowConfig, ScenarioConfig, SliceConfig
 from bridge.common.topology import ResolvedScenarioTopology, resolve_scenario_topology
-from bridge.orchestrator.process_plan import RunManifest, build_run_manifest
 
 
 def _yaml_load(path: Path) -> dict[str, Any]:
@@ -312,25 +310,6 @@ def _ulcl_upnode_name(upf_name: str, role: str, used_names: set[str]) -> str:
     return f"{candidate}-{suffix}"
 
 
-def _compose_inspect_targets(compose_payload: dict[str, Any]) -> dict[str, str]:
-    payload: dict[str, str] = {}
-    services = compose_payload.get("services")
-    if not isinstance(services, dict):
-        return payload
-    for service_name, service_payload in services.items():
-        target = service_name
-        if isinstance(service_payload, dict):
-            container_name = service_payload.get("container_name")
-            if isinstance(container_name, str) and container_name:
-                target = container_name
-        payload[str(service_name)] = target
-    return payload
-
-
-def _bridge_plan_by_gnb_name(bridge_plans: list[Any]) -> dict[str, Any]:
-    return {plan.gnb_name: plan for plan in bridge_plans}
-
-
 def _gnb_n3_ip(index: int, gnb_name: str, n3_network_plan: N3NetworkPlan | None) -> str:
     if n3_network_plan is None:
         return gnb_service_ip(index)
@@ -348,7 +327,6 @@ def _render_ulcl_smf_config(
     config_dir: Path,
     ulcl_root: Path,
     resolved_topology: ResolvedScenarioTopology,
-    bridge_plans: list[Any],
     n3_network_plan: N3NetworkPlan | None,
 ) -> None:
     slice_apn_map = _scenario_slice_apns(scenario)
@@ -547,7 +525,6 @@ def _render_ulcl_upf_config(
     upf_name: str,
     upf_role: str,
     upf_index: int,
-    bridge_plans: list[Any],
     n3_network_plan: N3NetworkPlan | None,
 ) -> None:
     slice_apn_map = _scenario_slice_apns(scenario)
@@ -748,7 +725,6 @@ def _render_single_upf_configs(
     scenario: ScenarioConfig,
     config_dir: Path,
     base_root: Path,
-    bridge_plans: list[Any],
     n3_network_plan: N3NetworkPlan | None,
 ) -> None:
     slice_apn_map = _scenario_slice_apns(scenario)
@@ -900,7 +876,6 @@ def _render_core_configs(
     scenario: ScenarioConfig,
     config_dir: Path,
     resolved_topology: ResolvedScenarioTopology,
-    bridge_plans: list[Any],
     n3_network_plan: N3NetworkPlan | None,
 ) -> None:
     base_root = Path(scenario.free5gc.config_root)
@@ -910,7 +885,7 @@ def _render_core_configs(
 
     if scenario.free5gc.mode == "ulcl":
         ulcl_root = base_root / "ULCL"
-        _render_ulcl_smf_config(scenario, config_dir, ulcl_root, resolved_topology, bridge_plans, n3_network_plan)
+        _render_ulcl_smf_config(scenario, config_dir, ulcl_root, resolved_topology, n3_network_plan)
 
         for index, upf in enumerate(scenario.upfs, start=1):
             _render_ulcl_upf_config(
@@ -920,32 +895,38 @@ def _render_core_configs(
                 upf.name,
                 upf.role,
                 index,
-                bridge_plans,
                 n3_network_plan,
             )
         _render_ulcl_uerouting_config(scenario, config_dir, ulcl_root, resolved_topology)
         return
 
-    _render_single_upf_configs(scenario, config_dir, base_root, bridge_plans, n3_network_plan)
+    _render_single_upf_configs(scenario, config_dir, base_root, n3_network_plan)
 
 
 @dataclass(slots=True)
-class RenderedRun:
+class RenderedControlPlaneAssets:
     run_id: str
     project_root: Path
     run_dir: Path
     generated_dir: Path
     config_dir: Path
     compose_file: Path
-    bridge_script: Path
-    manifest: RunManifest
+    snapshot_file: Path
+    clock_file: Path
+    ns3_slice_resource_file: Path
+    state_db: Path
+    archive_dir: Path
+    service_map: dict[str, dict[str, str]]
+    core_services: list[str]
+    ran_services: list[str]
+    subscriber_payloads: list[Path]
+    free5gc_webui_url: str
 
 
 def _render_gnb_configs(
     scenario: ScenarioConfig,
     config_dir: Path,
     resolved_topology: ResolvedScenarioTopology,
-    bridge_plans: list[Any],
     n3_network_plan: N3NetworkPlan | None,
 ) -> None:
     slice_map = scenario.slice_map()
@@ -1045,110 +1026,6 @@ def _format_tsv_value(value: object) -> str:
     return str(value).replace("\t", " ").replace("\n", " ")
 
 
-def _render_ns3_flow_profiles(scenario: ScenarioConfig, output_path: Path) -> None:
-    slice_map = scenario.slice_map()
-    app_map = scenario.app_map()
-    header = [
-        "flow_id",
-        "flow_name",
-        "ue_name",
-        "supi",
-        "app_id",
-        "app_name",
-        "session_ref",
-        "slice_ref",
-        "slice_snssai",
-        "dnn",
-        "upf_ref",
-        "service_type",
-        "service_type_id",
-        "five_qi",
-        "packet_size_bytes",
-        "arrival_rate_pps",
-        "dl_packet_size_bytes",
-        "ul_packet_size_bytes",
-        "dl_arrival_rate_pps",
-        "ul_arrival_rate_pps",
-        "latency_ms",
-        "jitter_ms",
-        "loss_rate",
-        "bandwidth_dl_mbps",
-        "bandwidth_ul_mbps",
-        "guaranteed_bandwidth_dl_mbps",
-        "guaranteed_bandwidth_ul_mbps",
-        "priority",
-        "allocated_bandwidth_dl_mbps",
-        "allocated_bandwidth_ul_mbps",
-        "optimize_requested",
-        "policy_filter",
-        "precedence",
-        "qos_ref",
-        "qfi",
-        "ue_ip",
-        "inner_protocol",
-        "ue_port",
-        "remote_port",
-        "charging_method",
-        "quota",
-        "unit_cost",
-        "rlc_mode",
-        "virtual_expiry_ms",
-    ]
-    lines = ["\t".join(header)]
-    for flow in scenario.flows:
-        slice_config = slice_map[flow.slice_ref]
-        app_config = app_map.get(flow.app_id)
-        app_name = flow.app_name or (app_config.name if app_config is not None else flow.app_id)
-        values = [
-            flow.flow_id,
-            flow.name,
-            flow.ue_name,
-            flow.supi,
-            flow.app_id,
-            app_name,
-            flow.session_ref,
-            flow.slice_ref,
-            f"{slice_config.sst:02d}{slice_config.sd.lower()}",
-            flow.dnn,
-            scenario.resolve_flow_upf(flow),
-            flow.service_type,
-            flow.service_type_id,
-            flow.five_qi,
-            flow.packet_size_bytes,
-            flow.arrival_rate_pps,
-            flow.dl_packet_size_bytes,
-            flow.ul_packet_size_bytes,
-            flow.dl_arrival_rate_pps,
-            flow.ul_arrival_rate_pps,
-            flow.sla_target.latency_ms,
-            flow.sla_target.jitter_ms,
-            flow.sla_target.loss_rate,
-            flow.sla_target.bandwidth_dl_mbps,
-            flow.sla_target.bandwidth_ul_mbps,
-            flow.sla_target.guaranteed_bandwidth_dl_mbps,
-            flow.sla_target.guaranteed_bandwidth_ul_mbps,
-            flow.sla_target.priority,
-            flow.allocated_bandwidth_dl_mbps,
-            flow.allocated_bandwidth_ul_mbps,
-            flow.optimize_requested,
-            flow.policy_filter,
-            flow.precedence,
-            flow.qos_ref,
-            flow.qfi,
-            flow.ue_ip,
-            flow.inner_protocol,
-            flow.ue_port,
-            flow.remote_port,
-            flow.charging_method,
-            flow.quota,
-            flow.unit_cost,
-            flow.rlc_mode,
-            flow.virtual_expiry_ms,
-        ]
-        lines.append("\t".join(_format_tsv_value(value) for value in values))
-    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
 def _render_ns3_slice_resources(scenario: ScenarioConfig, output_path: Path) -> None:
     header = [
         "slice_ref",
@@ -1185,98 +1062,16 @@ def _render_ns3_slice_resources(scenario: ScenarioConfig, output_path: Path) -> 
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _render_user_plane_assets(
-    scenario: ScenarioConfig,
-    bridge_plans: list[Any],
-    generated_dir: Path,
-) -> tuple[Path, Path]:
-    if not bridge_plans:
-        raise ValueError("user-plane gate requires at least one bridge plan")
-    gate = scenario.bridge.user_plane_gate
-    bridge_plan_by_pair = {
-        (plan.gnb_name, plan.upf_name): plan for plan in bridge_plans
-    }
-    flow_rows = [
-        {
-            "flow_id": flow.flow_id,
-            "upf_ref": scenario.resolve_flow_upf(flow),
-            "gnb_ip": bridge_plan_by_pair[
-                (scenario.resolve_flow_gnb(flow), scenario.resolve_flow_upf(flow))
-            ].gnb_n3_ip,
-            "upf_ip": bridge_plan_by_pair[
-                (scenario.resolve_flow_gnb(flow), scenario.resolve_flow_upf(flow))
-            ].upf_n3_ip,
-            "ue_ip": flow.ue_ip,
-            "qfi": flow.qfi,
-            "inner_protocol": flow.inner_protocol,
-            "ue_port": flow.ue_port,
-            "remote_port": flow.remote_port,
-            "virtual_expiry_us": round(flow.virtual_expiry_ms * 1000.0),
-        }
-        for flow in scenario.flows
-    ]
-    link_rows = [
-        {
-            "link_id": f"n3-{plan.link_index}",
-            "gnb_name": plan.gnb_name,
-            "upf_name": plan.upf_name,
-            "gnb_tap": plan.gnb_tap,
-            "upf_tap": plan.upf_tap,
-            "gnb_ip": plan.gnb_n3_ip,
-            "upf_ip": plan.upf_n3_ip,
-        }
-        for plan in bridge_plans
-    ]
-    gate_payload = {
-        "links": link_rows,
-        "socket_path": gate.socket_path,
-        "authorization_socket": f"{gate.socket_path}.agents",
-        "max_pending_packets": gate.max_pending_packets,
-        "max_pending_bytes": gate.max_pending_bytes,
-        "event_log": str(generated_dir / scenario.ns3.output_subdir / "packet-events.jsonl"),
-        "kpi_log": str(generated_dir / scenario.ns3.output_subdir / "packet-kpis.jsonl"),
-        "flows": flow_rows,
-    }
-    bearer_payload = {
-        "rng_seed": scenario.seed,
-        "rng_run": scenario.ns3.rng_run,
-        "virtual_epoch_us": scenario.ns3.virtual_epoch_us,
-        "channel_update_ms": scenario.ns3.channel_update_ms,
-        "shadowing_enabled": scenario.ns3.shadowing_enabled,
-        "flows": [
-            {
-                **row,
-                "rlc_mode": flow.rlc_mode,
-                "five_qi": flow.five_qi,
-            }
-            for row, flow in zip(flow_rows, scenario.flows, strict=True)
-        ],
-    }
-    gate_file = generated_dir / "user-plane-gate.json"
-    bearer_file = generated_dir / "bearer-map.json"
-    gate_file.write_text(
-        json.dumps(gate_payload, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    bearer_file.write_text(
-        json.dumps(bearer_payload, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    return gate_file, bearer_file
-
-
-def render_run_assets(
+def render_control_plane_assets(
     project_root: Path,
     scenario: ScenarioConfig,
     run_id: str,
-    live_graph_snapshot_id: str | None = None,
-) -> RenderedRun:
+) -> RenderedControlPlaneAssets:
     run_dir = project_root / "artifacts" / "runs" / run_id
     generated_dir = run_dir / "generated"
     config_dir = generated_dir / "config"
     subscriber_dir = generated_dir / "subscribers"
     ns3_dir = generated_dir / scenario.ns3.output_subdir
-    flow_profile_file = generated_dir / "ns3-flow-profiles.tsv"
     slice_resource_file = ns3_dir / "slice-resources.tsv"
     state_dir = run_dir / "state"
     archive_dir = _resolve_output_path(run_dir, scenario.writer.archive_dir)
@@ -1295,29 +1090,10 @@ def render_run_assets(
     )
 
     compose_render = render_compose_for_run(scenario, config_dir, resolved_topology)
-    bridge_plans = (
-        build_bridge_plan(
-            scenario,
-            compose_render.service_map,
-            n3_network_plan=n3_network_plan,
-            resolved_topology=resolved_topology,
-            inspect_targets=_compose_inspect_targets(compose_render.compose_payload),
-        )
-        if scenario.bridge.enable_inline_harness
-        else []
-    )
-
-    _render_core_configs(scenario, config_dir, resolved_topology, bridge_plans, n3_network_plan)
-    _render_gnb_configs(scenario, config_dir, resolved_topology, bridge_plans, n3_network_plan)
+    _render_core_configs(scenario, config_dir, resolved_topology, n3_network_plan)
+    _render_gnb_configs(scenario, config_dir, resolved_topology, n3_network_plan)
     _render_ue_configs(scenario, config_dir, resolved_topology)
-    _render_ns3_flow_profiles(scenario, flow_profile_file)
     _render_ns3_slice_resources(scenario, slice_resource_file)
-    user_plane_gate_file: Path | None = None
-    bearer_map_file: Path | None = None
-    if scenario.bridge.user_plane_gate.enabled:
-        user_plane_gate_file, bearer_map_file = _render_user_plane_assets(
-            scenario, bridge_plans, generated_dir
-        )
 
     compose_file = generated_dir / "free5gc-compose.generated.yaml"
     _yaml_dump(compose_file, compose_render.compose_payload)
@@ -1330,43 +1106,7 @@ def render_run_assets(
         resolved_topology,
     )
 
-    bridge_script = generated_dir / "setup-inline-bridge.sh"
-    render_bridge_script(bridge_plans, bridge_script)
-    bridge_probe_script = generated_dir / "probe-inline-bridge.sh"
-    render_bridge_probe_script(bridge_plans, bridge_probe_script)
-
     snapshot_file = ns3_dir / "tick-snapshots.jsonl"
-    manifest = build_run_manifest(
-        project_root=project_root,
-        scenario=scenario,
-        run_id=run_id,
-        run_dir=run_dir,
-        compose_file=compose_file,
-        bridge_script=bridge_script,
-        bridge_probe_script=bridge_probe_script,
-        bridge_plans=bridge_plans,
-        snapshot_file=snapshot_file,
-        clock_file=clock_file,
-        flow_profile_file=flow_profile_file,
-        slice_resource_file=slice_resource_file,
-        user_plane_gate_file=user_plane_gate_file,
-        bearer_map_file=bearer_map_file,
-        state_db=state_db,
-        archive_dir=archive_dir,
-        service_map=compose_render.service_map,
-        core_services=compose_render.core_services,
-        ran_services=compose_render.ran_services,
-        subscriber_payloads=subscriber_assets.payload_files,
-        free5gc_webui_url=subscriber_assets.webui_base_url,
-        resolved_topology=resolved_topology,
-        live_graph_snapshot_id=live_graph_snapshot_id,
-    )
-
-    manifest_path = run_dir / "run-manifest.json"
-    manifest_path.write_text(
-        json.dumps(manifest.to_dict(), indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
     (run_dir / "resolved-scenario.json").write_text(
         json.dumps(
             {
@@ -1385,22 +1125,21 @@ def render_run_assets(
         encoding="utf-8",
     )
 
-    return RenderedRun(
+    return RenderedControlPlaneAssets(
         run_id=run_id,
         project_root=project_root,
         run_dir=run_dir,
         generated_dir=generated_dir,
         config_dir=config_dir,
         compose_file=compose_file,
-        bridge_script=bridge_script,
-        manifest=manifest,
+        snapshot_file=snapshot_file,
+        clock_file=clock_file,
+        ns3_slice_resource_file=slice_resource_file,
+        state_db=state_db,
+        archive_dir=archive_dir,
+        service_map=compose_render.service_map,
+        core_services=compose_render.core_services,
+        ran_services=compose_render.ran_services,
+        subscriber_payloads=subscriber_assets.payload_files,
+        free5gc_webui_url=subscriber_assets.webui_base_url,
     )
-
-
-def render_run_from_scenario_file(
-    project_root: Path,
-    scenario_file: Path,
-    run_id: str,
-) -> RenderedRun:
-    scenario = load_scenario(scenario_file)
-    return render_run_assets(project_root, scenario, run_id)

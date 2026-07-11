@@ -54,7 +54,7 @@ def upf_service_ip(index: int) -> str:
 
 
 def build_n3_network_plan(scenario: ScenarioConfig) -> N3NetworkPlan | None:
-    subnet_cidr = scenario.bridge.n3_network_cidr
+    subnet_cidr = scenario.n3_network.cidr
     if not subnet_cidr:
         return None
 
@@ -81,7 +81,7 @@ def build_n3_network_plan(scenario: ScenarioConfig) -> N3NetworkPlan | None:
             raise ValueError(f"bridge.n3_network_cidr {subnet_cidr} cannot allocate UPF N3 IPs") from exc
 
     return N3NetworkPlan(
-        network_name=scenario.bridge.n3_network_name,
+        network_name=scenario.n3_network.name,
         subnet_cidr=subnet_cidr,
         gateway_ip=gateway_ip,
         gnb_ips=gnb_ips,

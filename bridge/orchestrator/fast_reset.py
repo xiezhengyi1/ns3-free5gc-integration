@@ -27,26 +27,20 @@ _COLD_START_COMMANDS = {
     "compose-up-smf",
     "wait-for-pfcp-ready",
     "compose-up-ue",
-    "bridge-setup",
     "ns3-build",
 }
 _BASELINE_RESTORE_COMMANDS = (
     "bootstrap-subscribers",
     "bootstrap-app-data",
     "wait-for-pfcp-ready",
-    "bridge-setup",
 )
 _RUNTIME_ORDER = (
     "writer-follow-free5gc",
     "writer-follow-ueransim",
-    "writer-follow-ns3",
     "writer-follow-split-ns3",
     "policy-acceptor",
-    "user-plane-gate",
     "split-gate",
-    "real-ue-flows",
     "split-results",
-    "bridge-probe-post-ns3",
     "ns3-run",
 )
 
@@ -363,21 +357,9 @@ class FastResetController:
             self.manifest.get("result_file"),
             str(self.state_dir / "policy-acceptor-state.json"),
         ]
-        clock_file = Path(str(self.manifest.get("clock_file") or ""))
-        if str(clock_file):
-            files.append(str(clock_file.parent / "real-ue-flows.jsonl"))
         state_db = Path(str(self.manifest.get("state_db") or ""))
         if str(state_db):
             files.extend((str(state_db) + "-wal", str(state_db) + "-shm"))
-
-        gate_file = self.manifest.get("user_plane_gate_file")
-        if gate_file:
-            gate_payload = json.loads(Path(str(gate_file)).read_text(encoding="utf-8"))
-            files.extend((gate_payload.get("event_log"), gate_payload.get("kpi_log")))
-            for socket_key in ("socket_path", "authorization_socket"):
-                socket_path = gate_payload.get(socket_key)
-                if socket_path:
-                    Path(str(socket_path)).unlink(missing_ok=True)
 
         for raw_path in files:
             if not raw_path:

@@ -23,11 +23,6 @@ import requests
 
 EXECUTION_PATH = "/policy-executions"
 HEALTHCHECK_PATH = f"{EXECUTION_PATH}/launch-healthcheck"
-LEGACY_PATHS = {
-    "/pcf/policies",
-    "/npcf-am-policy-control/v1/policies",
-    "/monitor/status",
-}
 AM_POLICY_TYPE = "PcfAmPolicyControlPolicyAssociation"
 URSP_POLICY_TYPE = "UrspRuleRequest"
 QOS_TOLERANCE_RATIO = 0.10
@@ -1119,16 +1114,6 @@ class PolicyAcceptorHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         normalized_path = self._normalized_path()
-        if normalized_path in LEGACY_PATHS:
-            self._send_json(
-                410,
-                {
-                    "status": "failed",
-                    "error": "legacy policy endpoint is no longer supported",
-                    "replacement": EXECUTION_PATH,
-                },
-            )
-            return
         if normalized_path != EXECUTION_PATH:
             self._send_json(404, {"status": "failed", "error": "not found"})
             return
@@ -1151,16 +1136,6 @@ class PolicyAcceptorHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         normalized_path = self._normalized_path()
-        if normalized_path in LEGACY_PATHS or normalized_path.startswith("/monitor/status/"):
-            self._send_json(
-                410,
-                {
-                    "status": "failed",
-                    "error": "legacy monitoring endpoint is no longer supported",
-                    "replacement": f"{EXECUTION_PATH}/{{policy_id}}",
-                },
-            )
-            return
         if normalized_path == HEALTHCHECK_PATH:
             if self.runtime is None:
                 self._send_json(500, {"status": "failed", "error": "runtime is not configured"})

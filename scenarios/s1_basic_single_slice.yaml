@@ -156,11 +156,10 @@ free5gc:
 
 ns3:
   ns3_root: /home/yyx/6gcore/ns-allinone-3.46.1/ns-3.46.1
-  scratch_name: nr_single_slice
+  scratch_name: nr_multignb_multiupf_split
   output_subdir: ns3
   simulator: RealtimeSimulatorImpl
   sim_time_ms: 300000
-  bridge_mode: l2_inline
   slice_isolation: true
 
 writer:
@@ -171,7 +170,6 @@ writer:
 topology:
   graph_file: graphs/s1_basic_single_slice.yaml
 
-bridge:
-  enable_inline_harness: true
-  n3_network_name: n3net
-  n3_network_cidr: 10.201.1.0/29
+n3_network:
+  name: n3net
+  cidr: 10.201.1.0/29

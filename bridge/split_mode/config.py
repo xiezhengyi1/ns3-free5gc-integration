@@ -11,16 +11,6 @@ import yaml
 from bridge.common.scenario import ScenarioConfig, load_scenario
 
 
-_FORBIDDEN_KEYS = {
-    "bridge",
-    "gnb_n3_ip",
-    "upf_n3_ip",
-    "n3_network_cidr",
-    "n3_network_name",
-    "gnb_n3_ifname",
-    "upf_n3_ifname",
-}
-_FORBIDDEN_VALUE_TOKENS = ("10.210.", "n3g", "n3u")
 _DEFAULT_SPLIT_NR_CENTRAL_FREQUENCY_HZ = 3.5e9
 _DEFAULT_SPLIT_NR_BANDWIDTH_HZ = 100e6
 _DEFAULT_TDD_PATTERN_UL_FRIENDLY = "DL|UL|UL|F|DL|UL|UL|F|"
@@ -47,23 +37,18 @@ def _coerce_bool(value: object, *, default: bool) -> bool:
     raise ValueError(f"expected boolean-like value, got: {value!r}")
 
 
-def _find_forbidden(payload: object, path: str = "") -> list[str]:
-    hits: list[str] = []
-    if isinstance(payload, dict):
-        for key, value in payload.items():
-            current = f"{path}.{key}" if path else str(key)
-            if str(key) in _FORBIDDEN_KEYS:
-                hits.append(current)
-            hits.extend(_find_forbidden(value, current))
-    elif isinstance(payload, list):
-        for index, item in enumerate(payload):
-            hits.extend(_find_forbidden(item, f"{path}[{index}]"))
-    elif isinstance(payload, str):
-        for token in _FORBIDDEN_VALUE_TOKENS:
-            if token in payload:
-                hits.append(path or "<root>")
-                break
-    return hits
+def _require_mapping(value: object, field_name: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"split-mode {field_name} must be a mapping")
+    return value
+
+
+def _reject_unknown_keys(payload: dict[str, Any], allowed: set[str], field_name: str) -> None:
+    unknown = sorted(set(payload) - allowed)
+    if unknown:
+        raise ValueError(f"split-mode {field_name} contains unknown fields: {', '.join(unknown)}")
 
 
 @dataclass(slots=True, frozen=True)
@@ -120,7 +105,6 @@ class SplitModeConfig:
             base_ns3,
             output_subdir=self.ns3.output_subdir,
             scratch_name=self.ns3.scratch_name,
-            bridge_mode="split_cp_up",
             policy_reload_ms=self.ns3.policy_reload_ms,
             sim_time_ms=self.ns3.sim_time_ms if self.ns3.sim_time_ms is not None else base_ns3.sim_time_ms,
         )
@@ -129,7 +113,6 @@ class SplitModeConfig:
             name=self.name,
             scenario_id=self.scenario_id,
             ns3=updated_ns3,
-            bridge=replace(self.base_scenario.bridge, enable_inline_harness=False),
         )
 
     @classmethod
@@ -139,10 +122,7 @@ class SplitModeConfig:
         *,
         base_dir: Path | None = None,
     ) -> "SplitModeConfig":
-        forbidden_hits = _find_forbidden(payload)
-        if forbidden_hits:
-            joined = ", ".join(sorted(set(forbidden_hits)))
-            raise ValueError(f"split-mode scenario must not define synthetic N3 fields: {joined}")
+        _reject_unknown_keys(payload, {"name", "scenario_id", "base_scenario", "ns3", "runtime", "radio"}, "scenario")
 
         name = str(payload.get("name") or payload.get("scenario_id") or "split-mode")
         scenario_id = str(payload.get("scenario_id") or name)
@@ -152,9 +132,26 @@ class SplitModeConfig:
         base_scenario_path = _resolve_path(base_scenario_value, base_dir)
         base_scenario = load_scenario(base_scenario_path)
 
-        ns3_payload = dict(payload.get("ns3") or {})
-        runtime_payload = dict(payload.get("runtime") or {})
-        radio_payload = dict(payload.get("radio") or {})
+        ns3_payload = _require_mapping(payload.get("ns3"), "ns3")
+        runtime_payload = _require_mapping(payload.get("runtime"), "runtime")
+        radio_payload = _require_mapping(payload.get("radio"), "radio")
+        _reject_unknown_keys(
+            ns3_payload,
+            {
+                "output_subdir", "scratch_name", "policy_reload_ms", "activation_poll_ms",
+                "sim_time_ms", "nr_numerology", "nr_bandwidth_hz", "nr_central_frequency_hz",
+            },
+            "ns3",
+        )
+        _reject_unknown_keys(runtime_payload, {"startup_timeout_seconds", "state_poll_ms"}, "runtime")
+        _reject_unknown_keys(
+            radio_payload,
+            {
+                "scheduler_type", "tdd_pattern", "gnb_tx_power_dbm", "ue_tx_power_dbm",
+                "enable_uplink_power_control", "gnb_noise_figure_db", "ue_noise_figure_db",
+            },
+            "radio",
+        )
         ns3 = SplitNs3Config(
             output_subdir=str(ns3_payload.get("output_subdir") or SplitNs3Config.output_subdir),
             scratch_name=str(ns3_payload.get("scratch_name") or SplitNs3Config.scratch_name),

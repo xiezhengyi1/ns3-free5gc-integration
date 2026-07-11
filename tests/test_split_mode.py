@@ -28,15 +28,15 @@ def _load_split_mode_config_with_fixture(path: Path):
 
 
 class SplitModeConfigTest(unittest.TestCase):
-    def test_rejects_synthetic_n3_fields(self) -> None:
+    def test_rejects_unknown_split_fields(self) -> None:
         temp_dir = Path(tempfile.mkdtemp(prefix="splitcfg"))
         try:
             scenario_path = temp_dir / "invalid.yaml"
             scenario_path.write_text(
-                "name: invalid\nscenario_id: invalid\nbase_scenario: ../scenarios/s2_medium_complexity.yaml\nbridge:\n  enable_inline_harness: true\n",
+                "name: invalid\nscenario_id: invalid\nbase_scenario: ../scenarios/s2_medium_complexity.yaml\nunknown_mode: true\n",
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(ValueError, "synthetic N3 fields"):
+            with self.assertRaisesRegex(ValueError, "unknown fields"):
                 load_split_mode_config(scenario_path)
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -91,10 +91,9 @@ class SplitModeConfigTest(unittest.TestCase):
                 self.assertEqual(config.ns3.scratch_name, "nr_multignb_multiupf_split")
                 self.assertEqual(config.radio.scheduler_type, "pf")
                 self.assertEqual(config.radio.resolved_tdd_pattern(), "DL|UL|UL|F|DL|UL|UL|F|")
-                self.assertFalse(config.control_plane_scenario.bridge.enable_inline_harness)
                 self.assertEqual(
-                    config.control_plane_scenario.bridge.n3_network_cidr,
-                    config.base_scenario.bridge.n3_network_cidr,
+                    config.control_plane_scenario.n3_network.cidr,
+                    config.base_scenario.n3_network.cidr,
                 )
 
     def test_renderer_passes_explicit_radio_arguments(self) -> None:
@@ -108,6 +107,52 @@ class SplitModeConfigTest(unittest.TestCase):
             self.assertIn("DL|UL|UL|F|DL|UL|UL|F|", ns3_run.argv)
             self.assertIn("--ue-tx-power-db", ns3_run.argv)
             self.assertIn("23.0", ns3_run.argv)
+        finally:
+            shutil.rmtree(rendered.run_dir, ignore_errors=True)
+
+    def test_renderer_preserves_multi_n3_edges_and_flow_upf_selection(self) -> None:
+        config = _load_split_mode_config_with_fixture(
+            PROJECT_ROOT / "scenarios" / "split_mode" / "s3_high_complexity.yaml"
+        )
+        scenario = config.base_scenario
+        target_gnb = scenario.gnbs[0]
+        selected_flow = next(
+            flow for flow in scenario.flows if scenario.resolve_flow_gnb(flow) == target_gnb.name
+        )
+        alternate_upf = next(upf.name for upf in scenario.upfs if upf.name not in target_gnb.backhaul_upfs)
+        updated_gnbs = (
+            replace(target_gnb, backhaul_upfs=(*target_gnb.backhaul_upfs, alternate_upf)),
+            *scenario.gnbs[1:],
+        )
+        updated_flows = tuple(
+            replace(flow, upf_ref=alternate_upf) if flow.flow_id == selected_flow.flow_id else flow
+            for flow in scenario.flows
+        )
+        config = replace(
+            config,
+            base_scenario=replace(
+                scenario,
+                gnbs=updated_gnbs,
+                flows=updated_flows,
+                topology=replace(scenario.topology, graph_file=None),
+            ),
+        )
+
+        rendered = render_split_run(PROJECT_ROOT, config, run_id="split-render-multi-n3")
+        try:
+            ns3_run = next(item for item in rendered.manifest.commands if item.name == "ns3-run")
+            links_index = ns3_run.argv.index("--gnb-upf-links") + 1
+            declared_links = set(ns3_run.argv[links_index].split(";"))
+            self.assertIn("1:1", declared_links)
+            self.assertIn("1:2", declared_links)
+
+            rows = Path(rendered.manifest.flow_profile_file).read_text(encoding="utf-8").splitlines()
+            header = rows[0].split("\t")
+            flow_id_index = header.index("flow_id")
+            upf_index = header.index("upf_ref")
+            selected_row = next(row.split("\t") for row in rows[1:] if row.split("\t")[flow_id_index] == selected_flow.flow_id)
+            self.assertEqual(selected_row[upf_index], alternate_upf)
+            self.assertNotIn("--split-mode", ns3_run.argv)
         finally:
             shutil.rmtree(rendered.run_dir, ignore_errors=True)
 

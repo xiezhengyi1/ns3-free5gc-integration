@@ -73,7 +73,6 @@ class FastResetControllerTest(unittest.TestCase):
         root: Path,
         *,
         snapshot_file: Path | None = None,
-        split: bool = False,
     ) -> Path:
         run_dir = root / "artifacts" / "runs" / "reset-run"
         generated = run_dir / "generated"
@@ -83,33 +82,19 @@ class FastResetControllerTest(unittest.TestCase):
             directory.mkdir(parents=True, exist_ok=True)
         compose_file = generated / "compose.yaml"
         compose_file.write_text("services: {}\n", encoding="utf-8")
-        gate_file = generated / "user-plane-gate.json"
-        gate_file.write_text(
-            json.dumps(
-                {
-                    "socket_path": str(run_dir / "gate.sock"),
-                    "authorization_socket": str(run_dir / "gate.sock.agents"),
-                    "event_log": str(ns3_dir / "packet-events.jsonl"),
-                    "kpi_log": str(ns3_dir / "packet-kpis.jsonl"),
-                }
-            ),
-            encoding="utf-8",
-        )
         commands = [
             _command("compose-up-core", root),
             _command("bootstrap-subscribers", root),
             _command("bootstrap-app-data", root),
             _command("compose-up-upf", root),
             _command("compose-up-gnb", root),
-            _command("bridge-setup", root),
             _command("compose-up-smf", root),
-            *([_command("wait-for-pfcp-ready", root)] if split else []),
+            _command("wait-for-pfcp-ready", root),
             _command("compose-up-ue", root),
-            _command("writer-follow-ns3", root, background=True),
+            _command("writer-follow-split-ns3", root, background=True),
             _command("policy-acceptor", root, background=True),
-            _command("user-plane-gate", root, background=True),
-            _command("real-ue-flows", root, background=True),
-            _command("bridge-probe-post-ns3", root, background=True),
+            _command("split-gate", root, background=True),
+            _command("split-results", root, background=True),
             _command("ns3-build", root),
             _command("ns3-run", root),
             _command("compose-down", root),
@@ -125,23 +110,10 @@ class FastResetControllerTest(unittest.TestCase):
             "clock_file": str(ns3_dir / "clock.json"),
             "state_db": str(state_dir / "writer.db"),
             "archive_dir": str(run_dir / "archive"),
-            "user_plane_gate_file": str(gate_file),
+            "runtime_state_file": str(state_dir / "split-runtime.json"),
+            "result_file": str(run_dir / "split-result.json"),
             "commands": commands,
         }
-        if split:
-            manifest["runtime_state_file"] = str(state_dir / "split-runtime.json")
-            manifest["result_file"] = str(run_dir / "split-result.json")
-            manifest["user_plane_gate_file"] = None
-            replacements = {
-                "writer-follow-ns3": "writer-follow-split-ns3",
-                "user-plane-gate": "split-gate",
-                "real-ue-flows": "split-results",
-            }
-            for command in commands:
-                name = str(command["name"])
-                if name in replacements:
-                    command["name"] = replacements[name]
-                    command["argv"][1] = replacements[name]
         manifest_file = run_dir / "run-manifest.json"
         manifest_file.write_text(json.dumps(manifest), encoding="utf-8")
         return manifest_file
@@ -155,7 +127,7 @@ class FastResetControllerTest(unittest.TestCase):
                 Path(manifest["snapshot_file"]),
                 Path(manifest["clock_file"]),
                 Path(manifest["state_db"]),
-                Path(manifest["run_dir"]) / "generated" / "ns3" / "packet-events.jsonl",
+                Path(manifest["runtime_state_file"]),
             ]
             for path in stale_files:
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -182,11 +154,10 @@ class FastResetControllerTest(unittest.TestCase):
             self.assertEqual(
                 [process.name for process in cold.processes],
                 [
-                    "writer-follow-ns3",
+                    "writer-follow-split-ns3",
                     "policy-acceptor",
-                    "user-plane-gate",
-                    "real-ue-flows",
-                    "bridge-probe-post-ns3",
+                    "split-gate",
+                    "split-results",
                     "ns3-run",
                 ],
             )
@@ -203,7 +174,7 @@ class FastResetControllerTest(unittest.TestCase):
             self.assertNotIn("ns3-build", [item for argv, _ in calls for item in argv])
             self.assertEqual(
                 [argv[1] for argv, _ in calls[1:]],
-                ["bootstrap-subscribers", "bootstrap-app-data", "bridge-setup"],
+                ["bootstrap-subscribers", "bootstrap-app-data", "wait-for-pfcp-ready"],
             )
             self.assertEqual(
                 fast.restarted_services,
@@ -217,7 +188,7 @@ class FastResetControllerTest(unittest.TestCase):
     def test_split_manifest_resets_split_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            manifest_file = self._write_manifest(root, split=True)
+            manifest_file = self._write_manifest(root)
             manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
             for key in ("runtime_state_file", "result_file"):
                 path = Path(manifest[key])
@@ -245,7 +216,6 @@ class FastResetControllerTest(unittest.TestCase):
                     "policy-acceptor",
                     "split-gate",
                     "split-results",
-                    "bridge-probe-post-ns3",
                     "ns3-run",
                 ],
             )

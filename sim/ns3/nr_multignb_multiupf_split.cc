@@ -1,19 +1,17 @@
+
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include "ns3/antenna-module.h"
 #include "ns3/applications-module.h"
 #include "ns3/core-module.h"
-#include "ns3/csma-module.h"
 #include "ns3/flow-monitor-module.h"
 #include "ns3/internet-apps-module.h"
 #include "ns3/internet-module.h"
 #include "ns3/mobility-module.h"
 #include "ns3/nr-module.h"
-#include "ns3/error-model.h"
 #include "ns3/epc-gtpu-header.h"
 #include "ns3/ethernet-header.h"
 #include "ns3/point-to-point-module.h"
-#include "ns3/tap-bridge-module.h"
 #include "ns3/udp-header.h"
 
 #include <algorithm>
@@ -25,6 +23,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -214,6 +213,54 @@ ParseIndexList(const std::string& input,
     return parsed;
 }
 
+struct N3Link
+{
+    uint32_t gnbIndex;
+    uint32_t upfIndex;
+};
+
+std::vector<N3Link>
+ParseN3Links(const std::string& input, uint32_t gnbCount, uint32_t upfCount)
+{
+    if (input.empty())
+    {
+        NS_FATAL_ERROR("gnbUpfLinks must define at least one N3 link");
+    }
+
+    std::vector<N3Link> links;
+    std::set<std::pair<uint32_t, uint32_t>> seen;
+    for (const auto& value : SplitString(input, ';'))
+    {
+        const auto pair = SplitString(value, ':');
+        if (pair.size() != 2)
+        {
+            NS_FATAL_ERROR("invalid gnbUpfLinks entry: " << value);
+        }
+        const auto gnb = static_cast<uint32_t>(std::stoul(pair[0]));
+        const auto upf = static_cast<uint32_t>(std::stoul(pair[1]));
+        if (gnb < 1 || gnb > gnbCount || upf < 1 || upf > upfCount)
+        {
+            NS_FATAL_ERROR("gnbUpfLinks entry is out of range: " << value);
+        }
+        const auto zeroBased = std::make_pair(gnb - 1, upf - 1);
+        if (seen.insert(zeroBased).second)
+        {
+            links.push_back(N3Link{zeroBased.first, zeroBased.second});
+        }
+    }
+    for (uint32_t gnb = 0; gnb < gnbCount; ++gnb)
+    {
+        const bool connected = std::any_of(links.begin(), links.end(), [gnb](const N3Link& link) {
+            return link.gnbIndex == gnb;
+        });
+        if (!connected)
+        {
+            NS_FATAL_ERROR("gNB " << (gnb + 1) << " has no declared N3 link");
+        }
+    }
+    return links;
+}
+
 struct PositionOverrides
 {
     std::vector<bool> hasPosition;
@@ -232,6 +279,7 @@ struct FlowProfile
     std::string sliceRef;
     std::string sliceSnssai;
     std::string dnn;
+    std::string upfName;
     std::string serviceType;
     uint32_t serviceTypeId = 0;
     uint32_t fiveQi = 9;
@@ -456,6 +504,7 @@ LoadFlowProfiles(const std::string& path)
         profile.sliceRef = GetColumnValue(headerIndex, columns, "slice_ref");
         profile.sliceSnssai = GetColumnValue(headerIndex, columns, "slice_snssai");
         profile.dnn = GetColumnValue(headerIndex, columns, "dnn");
+        profile.upfName = GetColumnValue(headerIndex, columns, "upf_ref");
         profile.serviceType = GetColumnValue(headerIndex, columns, "service_type");
         profile.serviceTypeId = ParseOptionalUint(GetColumnValue(headerIndex, columns, "service_type_id"), 0);
         profile.fiveQi = ParseOptionalUint(GetColumnValue(headerIndex, columns, "five_qi"), 9);
@@ -550,6 +599,7 @@ LoadSliceResources(const std::string& path)
         if (columns.size() < headerColumns.size())
         {
             columns.resize(headerColumns.size());
+
         }
 
         SliceResourceProfile profile;
@@ -661,12 +711,6 @@ DbToLinear(double valueDb)
     return std::pow(10.0, valueDb / 10.0);
 }
 
-double
-LinearToDb(double valueLinear)
-{
-    return 10.0 * std::log10(std::max(valueLinear, 1e-12));
-}
-
 std::string
 NormalizeSchedulerType(const std::string& schedulerType)
 {
@@ -732,48 +776,9 @@ struct SnapshotContext
         std::map<uint16_t, uint64_t> ethernetTypes;
     };
 
-    struct ExternalTraceDebug
-    {
-        uint64_t macTxGnb = 0;
-        uint64_t macTxUpf = 0;
-        uint64_t macRxGnb = 0;
-        uint64_t macRxUpf = 0;
-        uint64_t macRxDropGnb = 0;
-        uint64_t macRxDropUpf = 0;
-        uint64_t promiscSnifferGnb = 0;
-        uint64_t promiscSnifferUpf = 0;
-        TraceParseCounters macTx;
-        TraceParseCounters macRx;
-        TraceParseCounters macRxDrop;
-        TraceParseCounters promiscSniffer;
-    };
-
-    struct ExternalFlowCounters
-    {
-        uint64_t txPacketsUl = 0;
-        uint64_t rxPacketsUl = 0;
-        uint64_t dropPacketsUl = 0;
-        uint64_t txPacketsDl = 0;
-        uint64_t rxPacketsDl = 0;
-        uint64_t dropPacketsDl = 0;
-        double delaySumMsUl = 0.0;
-        double delaySumMsDl = 0.0;
-        uint64_t delaySamplesUl = 0;
-        uint64_t delaySamplesDl = 0;
-        double jitterSumMsUl = 0.0;
-        double jitterSumMsDl = 0.0;
-        double lastDelayMsUl = 0.0;
-        double lastDelayMsDl = 0.0;
-        bool hasLastDelayUl = false;
-        bool hasLastDelayDl = false;
-        std::deque<Time> txTimesUl;
-        std::deque<Time> txTimesDl;
-    };
-
     struct FlowRuntimeState
     {
         FlowProfile profile;
-        Ptr<UdpClient> client;
         Ptr<PacketSink> downlinkSink;
         Ptr<PacketSink> uplinkSink;
         uint16_t port = 0;
@@ -796,9 +801,6 @@ struct SnapshotContext
         uint64_t ipObservedPgwLocalDeliverUl = 0;
         uint64_t ipObservedPgwForwardUl = 0;
         uint64_t ipObservedPgwDropUl = 0;
-        uint64_t bridgeObservedGnbMacTxUl = 0;
-        uint64_t bridgeObservedUpfPromiscRxUl = 0;
-        uint64_t bridgeObservedUpfMacRxDropUl = 0;
         uint32_t detailedTraceLogs = 0;
         uint64_t lastLoggedUeTxUl = 0;
         uint64_t lastLoggedPgwForwardUl = 0;
@@ -868,17 +870,10 @@ struct SnapshotContext
     uint32_t tickIndex = 0;
     uint32_t gNbNum;
     uint32_t ueNum;
-    double bridgeLinkRateMbps = 1000.0;
-    double bridgeLinkDelayMs = 1.0;
-    double bridgeLinkLossRate = 0.0;
-    bool externalTrafficOnly = false;
-    bool splitMode = false;
-    std::string externalTrafficTargetIp = "8.8.8.8";
-    uint32_t externalTrafficSourceBasePort = 15000;
     std::vector<std::string> upfNames;
     std::vector<std::string> sliceSds;
     std::vector<std::string> sliceIds;
-    std::vector<uint32_t> gnbToUpf;
+    std::vector<N3Link> n3Links;
     std::vector<std::string> ueSliceIds;
     std::vector<Ipv4Address> ueIps;
     std::vector<uint32_t> ueToGnb;
@@ -898,8 +893,6 @@ struct SnapshotContext
     std::map<uint16_t, uint32_t> ueIndexByRnti;
     std::map<uint16_t, uint32_t> gnbIndexByCellId;
     std::map<uint16_t, FlowRuntimeState> flowRuntimeByPort;
-    std::map<uint16_t, ExternalFlowCounters> externalFlowCountersByPort;
-    ExternalTraceDebug externalTraceDebug;
     uint64_t unmatchedIpv4TraceLogs = 0;
     uint64_t unmatchedIpv4DecisionLogs = 0;
     std::map<std::string, SliceResourceProfile> sliceResources;
@@ -909,6 +902,29 @@ struct SnapshotContext
     Time appStartTime;
     Time simTime;
 };
+
+uint32_t
+ResolveFlowUpfIndex(const SnapshotContext* context, uint32_t gnbIndex, const FlowProfile* profile)
+{
+    if (profile == nullptr || profile->upfName.empty())
+    {
+        NS_FATAL_ERROR("split flow is missing upf_ref");
+    }
+    const auto upfIt = std::find(context->upfNames.begin(), context->upfNames.end(), profile->upfName);
+    if (upfIt == context->upfNames.end())
+    {
+        NS_FATAL_ERROR("flow " << profile->flowId << " references unknown UPF " << profile->upfName);
+    }
+    const auto upfIndex = static_cast<uint32_t>(std::distance(context->upfNames.begin(), upfIt));
+    const bool linked = std::any_of(context->n3Links.begin(), context->n3Links.end(), [gnbIndex, upfIndex](const N3Link& link) {
+        return link.gnbIndex == gnbIndex && link.upfIndex == upfIndex;
+    });
+    if (!linked)
+    {
+        NS_FATAL_ERROR("flow " << profile->flowId << " selects an UPF without a declared N3 link");
+    }
+    return upfIndex;
+}
 
 class SplitFlowUdpApp : public Application
 {
@@ -1135,6 +1151,7 @@ ExtractUdpTupleFromPacket(SnapshotContext::TraceParseCounters* debug,
             }
             offset = 14;
         }
+
     }
 
     if (packetSize < offset + 20)
@@ -1273,87 +1290,6 @@ ExtractUdpTupleFromPacket(SnapshotContext::TraceParseCounters* debug,
 
     debug->parseOkOuterUdp++;
     return true;
-}
-
-bool
-ExtractExternalFlowKey(const SnapshotContext* context,
-                       SnapshotContext::TraceParseCounters* debug,
-                       Ptr<const Packet> packet,
-                       uint16_t* port,
-                       bool* uplink)
-{
-    NS_ASSERT(context != nullptr);
-    NS_ASSERT(debug != nullptr);
-    NS_ASSERT(port != nullptr);
-    NS_ASSERT(uplink != nullptr);
-    debug->extractCalls++;
-
-    uint16_t sourcePort = 0;
-    uint16_t destinationPort = 0;
-    if (!ExtractUdpTupleFromPacket(debug, packet, &sourcePort, &destinationPort))
-    {
-        return false;
-    }
-
-    if (context->flowRuntimeByPort.find(destinationPort) != context->flowRuntimeByPort.end())
-    {
-        debug->matchDestinationPort++;
-        *port = destinationPort;
-        *uplink = false;
-        return true;
-    }
-
-    for (const auto& [flowPort, runtime] : context->flowRuntimeByPort)
-    {
-        if (runtime.uplinkPort == destinationPort && runtime.uplinkSourcePort == sourcePort)
-        {
-            debug->matchSourcePort++;
-            *port = flowPort;
-            *uplink = true;
-            return true;
-        }
-    }
-
-    const auto resolveMappedPort = [&](uint16_t candidatePort,
-                                       bool directionUplink,
-                                       bool matchedAsDestination) -> bool {
-        if (candidatePort < context->externalTrafficSourceBasePort)
-        {
-            return false;
-        }
-        const uint32_t flowIndex = candidatePort - context->externalTrafficSourceBasePort;
-        if (flowIndex > static_cast<uint32_t>(std::numeric_limits<uint16_t>::max() - 5000))
-        {
-            return false;
-        }
-        const uint16_t mappedPort = static_cast<uint16_t>(5000 + flowIndex);
-        if (context->flowRuntimeByPort.find(mappedPort) == context->flowRuntimeByPort.end())
-        {
-            return false;
-        }
-        if (matchedAsDestination)
-        {
-            debug->matchDestinationPort++;
-        }
-        else
-        {
-            debug->matchSourcePort++;
-        }
-        *port = mappedPort;
-        *uplink = directionUplink;
-        return true;
-    };
-
-    if (resolveMappedPort(destinationPort, false, true))
-    {
-        return true;
-    }
-    if (resolveMappedPort(sourcePort, true, false))
-    {
-        return true;
-    }
-    debug->unmatchedPorts++;
-    return false;
 }
 
 bool
@@ -1735,6 +1671,7 @@ OnIpv4Trace(SnapshotContext* context, Ipv4TraceRole role, Ptr<const Packet> pack
         break;
     case Ipv4TraceRole::RemoteTx:
         if (!uplink)
+
         {
             ++runtime->ipObservedRemoteTxDl;
         }
@@ -1764,6 +1701,10 @@ OnIpv4Trace(SnapshotContext* context, Ipv4TraceRole role, Ptr<const Packet> pack
         {
             ++runtime->ipObservedPgwTxUl;
         }
+        break;
+    case Ipv4TraceRole::PgwLocalDeliver:
+    case Ipv4TraceRole::PgwForward:
+    case Ipv4TraceRole::PgwDrop:
         break;
     }
 }
@@ -1854,156 +1795,6 @@ OnIpv4DropTrace(SnapshotContext* context,
     }
 }
 
-void
-OnBridgeMacTx(SnapshotContext* context, bool gnbSide, Ptr<const Packet> packet)
-{
-    if (gnbSide)
-    {
-        context->externalTraceDebug.macTxGnb++;
-    }
-    else
-    {
-        context->externalTraceDebug.macTxUpf++;
-    }
-    uint16_t port = 0;
-    bool uplink = false;
-    if (!ExtractExternalFlowKey(context, &context->externalTraceDebug.macTx, packet, &port, &uplink))
-    {
-        return;
-    }
-    auto runtimeIt = context->flowRuntimeByPort.find(port);
-    if (runtimeIt != context->flowRuntimeByPort.end() && gnbSide && uplink)
-    {
-        runtimeIt->second.bridgeObservedGnbMacTxUl++;
-    }
-}
-
-void
-OnBridgeMacRx(SnapshotContext* context, bool gnbSide, Ptr<const Packet> packet)
-{
-    if (gnbSide)
-    {
-        context->externalTraceDebug.macRxGnb++;
-    }
-    else
-    {
-        context->externalTraceDebug.macRxUpf++;
-    }
-    uint16_t port = 0;
-    bool uplink = false;
-    if (!ExtractExternalFlowKey(context, &context->externalTraceDebug.macRx, packet, &port, &uplink))
-    {
-        return;
-    }
-    auto runtimeIt = context->flowRuntimeByPort.find(port);
-    auto& counters = context->externalFlowCountersByPort[port];
-    if (gnbSide && uplink)
-    {
-        counters.txPacketsUl++;
-        counters.txTimesUl.push_back(Simulator::Now());
-    }
-    else if (!gnbSide && uplink)
-    {
-        counters.rxPacketsUl++;
-        if (runtimeIt != context->flowRuntimeByPort.end())
-        {
-            runtimeIt->second.bridgeObservedUpfPromiscRxUl++;
-        }
-        if (!counters.txTimesUl.empty())
-        {
-            const double delayMs = (Simulator::Now() - counters.txTimesUl.front()).GetSeconds() * 1000.0;
-            counters.txTimesUl.pop_front();
-            counters.delaySumMsUl += delayMs;
-            counters.delaySamplesUl++;
-            if (counters.hasLastDelayUl)
-            {
-                counters.jitterSumMsUl += std::abs(delayMs - counters.lastDelayMsUl);
-            }
-            counters.lastDelayMsUl = delayMs;
-            counters.hasLastDelayUl = true;
-        }
-    }
-    else if (!gnbSide && !uplink)
-    {
-        counters.txPacketsDl++;
-        counters.txTimesDl.push_back(Simulator::Now());
-    }
-    else if (gnbSide && !uplink)
-    {
-        counters.rxPacketsDl++;
-        if (!counters.txTimesDl.empty())
-        {
-            const double delayMs = (Simulator::Now() - counters.txTimesDl.front()).GetSeconds() * 1000.0;
-            counters.txTimesDl.pop_front();
-            counters.delaySumMsDl += delayMs;
-            counters.delaySamplesDl++;
-            if (counters.hasLastDelayDl)
-            {
-                counters.jitterSumMsDl += std::abs(delayMs - counters.lastDelayMsDl);
-            }
-            counters.lastDelayMsDl = delayMs;
-            counters.hasLastDelayDl = true;
-        }
-    }
-}
-
-void
-OnBridgeMacRxDrop(SnapshotContext* context, bool gnbSide, Ptr<const Packet> packet)
-{
-    if (gnbSide)
-    {
-        context->externalTraceDebug.macRxDropGnb++;
-    }
-    else
-    {
-        context->externalTraceDebug.macRxDropUpf++;
-    }
-    uint16_t port = 0;
-    bool uplink = false;
-    if (!ExtractExternalFlowKey(context, &context->externalTraceDebug.macRxDrop, packet, &port, &uplink))
-    {
-        return;
-    }
-    auto runtimeIt = context->flowRuntimeByPort.find(port);
-    auto& counters = context->externalFlowCountersByPort[port];
-    if (!gnbSide && uplink)
-    {
-        counters.dropPacketsUl++;
-        if (runtimeIt != context->flowRuntimeByPort.end())
-        {
-            runtimeIt->second.bridgeObservedUpfMacRxDropUl++;
-        }
-        if (!counters.txTimesUl.empty())
-        {
-            counters.txTimesUl.pop_front();
-        }
-    }
-    else if (gnbSide && !uplink)
-    {
-        counters.dropPacketsDl++;
-        if (!counters.txTimesDl.empty())
-        {
-            counters.txTimesDl.pop_front();
-        }
-    }
-}
-
-void
-OnBridgePromiscSniffer(SnapshotContext* context, bool gnbSide, Ptr<const Packet> packet)
-{
-    if (gnbSide)
-    {
-        context->externalTraceDebug.promiscSnifferGnb++;
-    }
-    else
-    {
-        context->externalTraceDebug.promiscSnifferUpf++;
-    }
-    uint16_t port = 0;
-    bool uplink = false;
-    ExtractExternalFlowKey(context, &context->externalTraceDebug.promiscSniffer, packet, &port, &uplink);
-}
-
 std::string
 NormalizeSimulatorType(const std::string& simulator)
 {
@@ -2084,46 +1875,6 @@ double
 PriorityWeight(const FlowProfile& profile)
 {
     return 1.0 / static_cast<double>(std::max<uint32_t>(1, profile.priority == 0 ? 1 : profile.priority));
-}
-
-const SliceResourceProfile*
-ResolveSliceProfile(const SnapshotContext* context, const FlowProfile& profile)
-{
-    auto bySliceRef = context->sliceResources.find(profile.sliceRef);
-    if (bySliceRef != context->sliceResources.end())
-    {
-        return &bySliceRef->second;
-    }
-    if (!profile.sliceSnssai.empty())
-    {
-        for (const auto& [sliceId, resource] : context->sliceResources)
-        {
-            if (resource.sliceSnssai == profile.sliceSnssai)
-            {
-                return &resource;
-            }
-        }
-    }
-    return nullptr;
-}
-
-double
-ClampMetricFactor(double factor)
-{
-    return std::clamp(factor, 0.9, 1.1);
-}
-
-double
-ComputeMetricFactor(const SnapshotContext* context,
-                    uint16_t port,
-                    double congestionRatio,
-                    double phaseOffset)
-{
-    const double wave =
-        std::sin((static_cast<double>(context->tickIndex) + static_cast<double>(port % 17)) * 0.55 + phaseOffset);
-    const double oscillation = 0.05 * wave;
-    const double congestionPenalty = 0.05 * std::clamp(congestionRatio, 0.0, 1.0);
-    return ClampMetricFactor(1.0 + oscillation + congestionPenalty);
 }
 
 std::pair<double, double>
@@ -2371,31 +2122,7 @@ UpdateUeAndGnbRadioTelemetry(SnapshotContext* context)
         telemetry.ulAvailableReg = static_cast<uint64_t>(
             std::max(0.0, theoreticalUlCapacityMbps) * 1e6 / 8.0 * tickSeconds);
     }
-}
 
-void
-ApplyClientRate(const SnapshotContext::FlowRuntimeState& runtime)
-{
-    if (runtime.client == nullptr)
-    {
-        return;
-    }
-    if (!runtime.profile.enabled)
-    {
-        runtime.client->SetAttribute("Interval", TimeValue(Hours(24)));
-        return;
-    }
-    const auto packetSize = static_cast<uint32_t>(std::max(64.0, ResolvePacketSizeBytes(runtime.profile, true)));
-    runtime.client->SetAttribute("PacketSize", UintegerValue(packetSize));
-
-    double ratePps = ResolveArrivalRatePps(runtime.profile, true);
-    const double packetSizeBytes = ResolvePacketSizeBytes(runtime.profile, true);
-    if (runtime.profile.allocatedBandwidthDlMbps > 0.0 && packetSizeBytes > 0.0)
-    {
-        ratePps = runtime.profile.allocatedBandwidthDlMbps * 1e6 / 8.0 / packetSizeBytes;
-    }
-    ratePps = std::max(1.0, ratePps);
-    runtime.client->SetAttribute("Interval", TimeValue(Seconds(1.0 / ratePps)));
 }
 
 void
@@ -2502,10 +2229,10 @@ ApplySlaDrivenAllocations(SnapshotContext* context)
         const auto resourceIt = context->sliceResources.find(sliceId);
         const double capacityDl = resourceIt != context->sliceResources.end()
                                       ? resourceIt->second.capacityDlMbps
-                                      : std::max(1.0, context->bridgeLinkRateMbps);
+                                      : std::numeric_limits<double>::infinity();
         const double capacityUl = resourceIt != context->sliceResources.end()
                                       ? resourceIt->second.capacityUlMbps
-                                      : std::max(1.0, context->bridgeLinkRateMbps);
+                                      : std::numeric_limits<double>::infinity();
         const double guaranteedDl = resourceIt != context->sliceResources.end()
                                         ? resourceIt->second.guaranteedDlMbps
                                         : capacityDl;
@@ -2679,7 +2406,6 @@ ApplySlaDrivenAllocations(SnapshotContext* context)
             {
                 runtime->profile.allocatedBandwidthDlMbps = 0.0;
                 runtime->profile.allocatedBandwidthUlMbps = 0.0;
-                ApplyClientRate(*runtime);
                 continue;
             }
             telemetry.allocatedDlMbps += runtime->profile.allocatedBandwidthDlMbps;
@@ -2698,7 +2424,6 @@ ApplySlaDrivenAllocations(SnapshotContext* context)
             telemetry.droppedPackets += averagePacketSizeBytes > 0.0
                                             ? flowQueueBytes / averagePacketSizeBytes
                                             : 0.0;
-            ApplyClientRate(*runtime);
         }
     }
 }
@@ -2809,9 +2534,6 @@ EmitSnapshot(SnapshotContext* context)
                   << " ip_remote_rx_ul=" << runtime.ipObservedRemoteRxUl
                   << " ip_remote_tx_dl=" << runtime.ipObservedRemoteTxDl
                   << " ip_ue_rx_dl=" << runtime.ipObservedUeRxDl
-                  << " bridge_gnb_mac_tx_ul=" << runtime.bridgeObservedGnbMacTxUl
-                  << " bridge_upf_promisc_rx_ul=" << runtime.bridgeObservedUpfPromiscRxUl
-                  << " bridge_upf_mac_rx_drop_ul=" << runtime.bridgeObservedUpfMacRxDropUl
                   << std::endl;
         MaybeEmitUplinkStallTrace(context, &runtime);
     }
@@ -2819,9 +2541,7 @@ EmitSnapshot(SnapshotContext* context)
     context->monitor->CheckForLostPackets();
     const auto stats = context->monitor->GetFlowStats();
     const double elapsedSeconds =
-        context->externalTrafficOnly
-            ? std::max(0.001, Simulator::Now().GetSeconds())
-            : std::max(0.001, (Simulator::Now() - context->appStartTime).GetSeconds());
+        std::max(0.001, (Simulator::Now() - context->appStartTime).GetSeconds());
 
     std::map<std::string, uint32_t> ipToUeIndex;
     for (uint32_t index = 0; index < context->ueIps.size(); ++index)
@@ -2890,10 +2610,17 @@ EmitSnapshot(SnapshotContext* context)
              << Quote("type") << ":" << Quote("attached_to") << ","
              << Quote("attributes") << ":{}}";
 
-        json << ",{" << Quote("source") << ":" << Quote("ran-node-" + std::to_string(gnbIndex)) << ","
-             << Quote("target") << ":"
-               << Quote("core-node-" + std::to_string(context->gnbToUpf[context->ueToGnb[ue]] + 1))
-             << "," << Quote("type") << ":" << Quote("tunneled_via") << ","
+    }
+    for (const auto& link : context->n3Links)
+    {
+        if (!first)
+        {
+            json << ",";
+        }
+        first = false;
+        json << "{" << Quote("source") << ":" << Quote("ran-node-" + std::to_string(link.gnbIndex + 1)) << ","
+             << Quote("target") << ":" << Quote("core-node-" + std::to_string(link.upfIndex + 1)) << ","
+             << Quote("type") << ":" << Quote("tunneled_via") << ","
              << Quote("attributes") << ":{}}";
     }
     json << "],";
@@ -2926,8 +2653,22 @@ EmitSnapshot(SnapshotContext* context)
             firstUe = false;
             json << Quote("ue-" + std::to_string(ue + 1));
         }
-        json << "]," << Quote("dst_upf") << ":"
-             << Quote(context->upfNames[context->gnbToUpf[gnb]]) << ","
+        json << "]," << Quote("dst_upfs") << ":[";
+        bool firstUpf = true;
+        for (const auto& link : context->n3Links)
+        {
+            if (link.gnbIndex != gnb)
+            {
+                continue;
+            }
+            if (!firstUpf)
+            {
+                json << ",";
+            }
+            firstUpf = false;
+            json << Quote(context->upfNames[link.upfIndex]);
+        }
+        json << "],"
              << Quote("telemetry") << ":{" << Quote("ran") << ":{" << Quote("active_ue_count") << ":"
              << radioTelemetry.activeUeCount << "," << Quote("ul_scheduled_bytes") << ":"
              << radioTelemetry.ulScheduledBytes << "," << Quote("dl_scheduled_bytes") << ":"
@@ -2977,6 +2718,7 @@ EmitSnapshot(SnapshotContext* context)
             json << "{"
                  << Quote("session_ref") << ":" << Quote(runtime.profile.sessionRef) << ","
                  << Quote("slice_id") << ":" << Quote(runtime.profile.sliceRef) << ","
+
                  << Quote("flow_id") << ":" << Quote(runtime.profile.flowId) << ","
                  << Quote("enabled") << ":" << (runtime.profile.enabled ? "true" : "false") << "}";
         }
@@ -3012,12 +2754,12 @@ EmitSnapshot(SnapshotContext* context)
                           const std::string& sourceEntity,
                           const std::string& destinationEntity,
                           const std::string& fallbackFlowId) {
-        if (context->splitMode && profile != nullptr && !profile->enabled)
+        if (profile == nullptr || !profile->enabled)
         {
             return;
         }
         const uint32_t gnbIndex = context->ueToGnb[ueIndex];
-        const uint32_t upfIndex = context->gnbToUpf[gnbIndex];
+        const uint32_t upfIndex = ResolveFlowUpfIndex(context, gnbIndex, profile);
         const uint32_t sliceIndex = ueIndex % context->sliceSds.size();
         const std::string defaultSliceId = BuildDefaultSliceId(context->sliceIds, context->sliceSds, ueIndex);
         const std::string flowIdentifier =
@@ -3188,12 +2930,6 @@ EmitSnapshot(SnapshotContext* context)
              << Quote("remote_tx_dl") << ":"
              << (runtimeState != nullptr ? runtimeState->ipObservedRemoteTxDl : 0) << ","
              << Quote("ue_rx_dl") << ":" << (runtimeState != nullptr ? runtimeState->ipObservedUeRxDl : 0)
-             << "," << Quote("bridge_gnb_mac_tx_ul") << ":"
-             << (runtimeState != nullptr ? runtimeState->bridgeObservedGnbMacTxUl : 0) << ","
-             << Quote("bridge_upf_promisc_rx_ul") << ":"
-             << (runtimeState != nullptr ? runtimeState->bridgeObservedUpfPromiscRxUl : 0) << ","
-             << Quote("bridge_upf_mac_rx_drop_ul") << ":"
-             << (runtimeState != nullptr ? runtimeState->bridgeObservedUpfMacRxDropUl : 0)
              << "},"
              << Quote("ran") << ":{" << Quote("ul") << ":{" << Quote("tx_pkts") << ":" << ranUlTxPkts << ","
              << Quote("rx_pkts") << ":" << ranUlRxPkts << "," << Quote("drop_before_pgw_pkts") << ":"
@@ -3219,8 +2955,6 @@ EmitSnapshot(SnapshotContext* context)
              << (allocatedBandwidthUlMbps + 1e-6 < targetBandwidthUlMbps ? "true" : "false") << "}}";
     };
 
-    if (!context->externalTrafficOnly)
-    {
         struct FlowSnapshotAggregate
         {
             SnapshotContext::FlowRuntimeState* runtime = nullptr;
@@ -3333,7 +3067,7 @@ EmitSnapshot(SnapshotContext* context)
             auto aggregateIt = aggregates.find(port);
             if (aggregateIt == aggregates.end())
             {
-                if (context->splitMode && runtime.profile.enabled)
+                if (runtime.profile.enabled)
                 {
                     std::cerr << "[split-ns3] missing-flow-stats"
                               << " tick=" << context->tickIndex
@@ -3398,176 +3132,6 @@ EmitSnapshot(SnapshotContext* context)
                        "ue_pdu_ip",
                        aggregate.profile != nullptr ? aggregate.profile->flowId : ("flow-" + std::to_string(port)));
         }
-    }
-    else
-    {
-        const double tickSeconds = std::max(0.001, static_cast<double>(context->tickMs) / 1000.0);
-        for (const auto& [port, runtime] : context->flowRuntimeByPort)
-        {
-            const auto countersIt = context->externalFlowCountersByPort.find(port);
-            const SnapshotContext::ExternalFlowCounters counters =
-                countersIt != context->externalFlowCountersByPort.end()
-                    ? countersIt->second
-                    : SnapshotContext::ExternalFlowCounters{};
-            const double offeredMbps =
-                ResolvePacketSizeBytes(runtime.profile, false) * ResolveArrivalRatePps(runtime.profile, false) * 8.0 / 1e6;
-            const double capacityUl =
-                runtime.profile.allocatedBandwidthUlMbps > 0.0
-                    ? runtime.profile.allocatedBandwidthUlMbps
-                    : (runtime.profile.bandwidthUlMbps > 0.0 ? runtime.profile.bandwidthUlMbps : offeredMbps);
-            const double capacityDl =
-                runtime.profile.allocatedBandwidthDlMbps > 0.0
-                    ? runtime.profile.allocatedBandwidthDlMbps
-                    : (runtime.profile.bandwidthDlMbps > 0.0 ? runtime.profile.bandwidthDlMbps : offeredMbps);
-            const uint64_t txPacketsUl = counters.txPacketsUl;
-            const uint64_t rxPacketsUl = counters.rxPacketsUl;
-            const uint64_t txPacketsDl = counters.txPacketsDl;
-            const uint64_t rxPacketsDl = counters.rxPacketsDl;
-            const uint64_t txPackets = txPacketsUl + txPacketsDl;
-            const uint64_t rxPackets = rxPacketsUl + rxPacketsDl;
-            const uint64_t deliveredPackets = std::min(txPackets, rxPackets);
-            const uint64_t lostPackets = txPackets > deliveredPackets ? (txPackets - deliveredPackets) : 0;
-            const uint64_t delaySamples = counters.delaySamplesUl + counters.delaySamplesDl;
-            const uint64_t jitterSamples =
-                (counters.hasLastDelayUl ? counters.delaySamplesUl - 1 : 0) +
-                (counters.hasLastDelayDl ? counters.delaySamplesDl - 1 : 0);
-            const double throughputUl =
-                rxPacketsUl * ResolvePacketSizeBytes(runtime.profile, false) * 8.0 / tickSeconds / 1e6;
-            const double throughputDl =
-                rxPacketsDl * ResolvePacketSizeBytes(runtime.profile, true) * 8.0 / tickSeconds / 1e6;
-            const double lossRate =
-                txPackets > 0 ? static_cast<double>(lostPackets) / static_cast<double>(txPackets) : 0.0;
-            const double shortfallRatio =
-                offeredMbps > 0.0
-                    ? std::max(0.0, 1.0 - std::min(throughputUl, throughputDl) / offeredMbps)
-                    : 0.0;
-            const double measuredDelayMs =
-                delaySamples > 0
-                    ? (counters.delaySumMsUl + counters.delaySumMsDl) / static_cast<double>(delaySamples)
-                    : 0.0;
-            const double measuredJitterMs =
-                jitterSamples > 0
-                    ? (counters.jitterSumMsUl + counters.jitterSumMsDl) / static_cast<double>(jitterSamples)
-                    : 0.0;
-            const double delayMs = measuredDelayMs > 0.0 ? measuredDelayMs : std::max(0.1, context->bridgeLinkDelayMs);
-            const double jitterMs = measuredJitterMs > 0.0 ? measuredJitterMs : 0.0;
-            appendFlow(const_cast<SnapshotContext::FlowRuntimeState*>(&runtime),
-                       &runtime.profile,
-                       runtime.ueIndex,
-                       17,
-                       ToString(context->ueIps[runtime.ueIndex]),
-                       context->externalTrafficSourceBasePort + (port - 5000),
-                       context->externalTrafficTargetIp,
-                       port,
-                       delayMs,
-                       jitterMs,
-                       lossRate,
-                       throughputUl,
-                       throughputDl,
-                       txPackets,
-                       rxPackets,
-                       "bidirectional",
-                       "ue_pdu_ip",
-                       "external_data_network",
-                       runtime.profile.flowId);
-        }
-        const auto& debug = context->externalTraceDebug;
-        auto formatEtherTypes = [](const SnapshotContext::TraceParseCounters& counters) {
-            std::ostringstream stream;
-            bool firstEtherType = true;
-            for (const auto& [etherType, count] : counters.ethernetTypes)
-            {
-                if (!firstEtherType)
-                {
-                    stream << ",";
-                }
-                firstEtherType = false;
-                stream << "0x" << std::hex << etherType << std::dec << ":" << count;
-            }
-            return stream.str();
-        };
-        auto formatParseSummary = [&](const char* label, const SnapshotContext::TraceParseCounters& counters) {
-            std::ostringstream stream;
-            stream << label
-                   << "(calls=" << counters.extractCalls
-                   << ",etherTypes=[" << formatEtherTypes(counters) << "]"
-                   << ",nonIpv4Ether=" << counters.ethernetNonIpv4
-                   << ",okOuter=" << counters.parseOkOuterUdp
-                   << ",okGtpu=" << counters.parseOkGtpuInnerUdp
-                   << ",noIpv4=" << counters.parseNoIpv4
-                   << ",nonUdpOuter=" << counters.parseNonUdpOuter
-                   << ",noOuterUdp=" << counters.parseNoOuterUdp
-                   << ",gtpuNoHeader=" << counters.parseGtpuNoHeader
-                   << ",gtpuNoInnerIpv4=" << counters.parseGtpuNoInnerIpv4
-                   << ",gtpuInnerNonUdp=" << counters.parseGtpuInnerNonUdp
-                   << ",gtpuNoInnerUdp=" << counters.parseGtpuNoInnerUdp
-                   << ",matchDst=" << counters.matchDestinationPort
-                   << ",matchSrc=" << counters.matchSourcePort
-                   << ",unmatched=" << counters.unmatchedPorts
-                   << ")";
-            return stream.str();
-        };
-        auto appendParseSummaryJson = [&](std::ostream& stream,
-                                          const char* label,
-                                          const SnapshotContext::TraceParseCounters& counters) {
-            stream << Quote(label) << ":{" << Quote("extract_calls") << ":" << counters.extractCalls << ","
-                   << Quote("non_ipv4_ether") << ":" << counters.ethernetNonIpv4 << ","
-                   << Quote("ok_outer_udp") << ":" << counters.parseOkOuterUdp << ","
-                   << Quote("ok_gtpu_inner_udp") << ":" << counters.parseOkGtpuInnerUdp << ","
-                   << Quote("no_ipv4") << ":" << counters.parseNoIpv4 << ","
-                   << Quote("non_udp_outer") << ":" << counters.parseNonUdpOuter << ","
-                   << Quote("no_outer_udp") << ":" << counters.parseNoOuterUdp << ","
-                   << Quote("gtpu_no_header") << ":" << counters.parseGtpuNoHeader << ","
-                   << Quote("gtpu_no_inner_ipv4") << ":" << counters.parseGtpuNoInnerIpv4 << ","
-                   << Quote("gtpu_inner_non_udp") << ":" << counters.parseGtpuInnerNonUdp << ","
-                   << Quote("gtpu_no_inner_udp") << ":" << counters.parseGtpuNoInnerUdp << ","
-                   << Quote("match_destination_port") << ":" << counters.matchDestinationPort << ","
-                   << Quote("match_source_port") << ":" << counters.matchSourcePort << ","
-                   << Quote("unmatched_ports") << ":" << counters.unmatchedPorts << ","
-                   << Quote("ethernet_types") << ":{";
-            bool firstEtherType = true;
-            for (const auto& [etherType, count] : counters.ethernetTypes)
-            {
-                if (!firstEtherType)
-                {
-                    stream << ",";
-                }
-                firstEtherType = false;
-                std::ostringstream key;
-                key << "0x" << std::hex << etherType;
-                stream << Quote(key.str()) << ":" << count;
-            }
-            stream << "}}";
-        };
-        std::cerr << "[external-trace] tick=" << context->tickIndex
-                  << " macTx(gnb=" << debug.macTxGnb << ",upf=" << debug.macTxUpf << ")"
-                  << " macRx(gnb=" << debug.macRxGnb << ",upf=" << debug.macRxUpf << ")"
-                  << " macRxDrop(gnb=" << debug.macRxDropGnb << ",upf=" << debug.macRxDropUpf << ")"
-                  << " promiscSniffer(gnb=" << debug.promiscSnifferGnb
-                  << ",upf=" << debug.promiscSnifferUpf << ")"
-                  << " " << formatParseSummary("macTx", debug.macTx)
-                  << " " << formatParseSummary("macRx", debug.macRx)
-                  << " " << formatParseSummary("macRxDrop", debug.macRxDrop)
-                  << " " << formatParseSummary("sniffer", debug.promiscSniffer)
-                  << std::endl;
-        json << "," << Quote("external_trace") << ":{" << Quote("mac_tx") << ":{" << Quote("gnb") << ":"
-             << debug.macTxGnb << "," << Quote("upf") << ":" << debug.macTxUpf << "},"
-             << Quote("mac_rx") << ":{" << Quote("gnb") << ":" << debug.macRxGnb << "," << Quote("upf") << ":"
-             << debug.macRxUpf << "}," << Quote("mac_rx_drop") << ":{" << Quote("gnb") << ":"
-             << debug.macRxDropGnb << "," << Quote("upf") << ":" << debug.macRxDropUpf << "},"
-             << Quote("promisc_sniffer") << ":{" << Quote("gnb") << ":" << debug.promiscSnifferGnb << ","
-             << Quote("upf") << ":" << debug.promiscSnifferUpf << "},";
-        appendParseSummaryJson(json, "mac_tx_parse", debug.macTx);
-        json << ",";
-        appendParseSummaryJson(json, "mac_rx_parse", debug.macRx);
-        json << ",";
-        appendParseSummaryJson(json, "mac_rx_drop_parse", debug.macRxDrop);
-        json << ",";
-        appendParseSummaryJson(json, "promisc_sniffer_parse", debug.promiscSniffer);
-        json << "}";
-        context->externalTraceDebug = SnapshotContext::ExternalTraceDebug{};
-        context->externalFlowCountersByPort.clear();
-    }
     json << "],";
 
     json << Quote("slices") << ":[";
@@ -3577,6 +3141,7 @@ EmitSnapshot(SnapshotContext* context)
         {
             json << ",";
         }
+
         const auto& sliceId = context->sliceIds[index];
         uint32_t sst = 1;
         std::string sd = context->sliceSds[index % context->sliceSds.size()];
@@ -3674,18 +3239,9 @@ main(int argc, char* argv[])
     std::string sliceSdsCsv = "010203";
     std::string ueSupisCsv;
     std::string ueGnbMapCsv;
-    std::string gnbUpfMapCsv;
+    std::string gnbUpfLinksArg;
     std::string gnbPositionsArg;
     std::string uePositionsArg;
-    std::string bridgeGnbTapsCsv;
-    std::string bridgeUpfTapsCsv;
-    double bridgeLinkRateMbps = 1000.0;
-    double bridgeLinkDelayMs = 1.0;
-    double bridgeLinkLossRate = 0.0;
-    bool externalTrafficOnly = false;
-    bool splitMode = false;
-    std::string externalTrafficTargetIp = "8.8.8.8";
-    uint32_t externalTrafficSourceBasePort = 15000;
     uint16_t numerology = 1;
     double centralFrequency = 3.5e9;
     double bandwidth = 100e6;
@@ -3715,18 +3271,9 @@ main(int argc, char* argv[])
     cmd.AddValue("sliceSds", "Comma separated slice SD list", sliceSdsCsv);
     cmd.AddValue("ueSupis", "Comma separated UE SUPI list", ueSupisCsv);
     cmd.AddValue("ueGnbMap", "Comma separated 1-based gNB index for each UE", ueGnbMapCsv);
-    cmd.AddValue("gnbUpfMap", "Comma separated 1-based UPF index for each gNB", gnbUpfMapCsv);
+    cmd.AddValue("gnbUpfLinks", "Semicolon separated 1-based gNB:UPF N3 links", gnbUpfLinksArg);
     cmd.AddValue("gnbPositions", "Semicolon separated x:y:z gNB positions or auto", gnbPositionsArg);
     cmd.AddValue("uePositions", "Semicolon separated x:y:z UE positions or auto", uePositionsArg);
-    cmd.AddValue("bridgeGnbTaps", "Comma separated tap names attached to each gNB bridge", bridgeGnbTapsCsv);
-    cmd.AddValue("bridgeUpfTaps", "Comma separated tap names attached to each UPF bridge", bridgeUpfTapsCsv);
-    cmd.AddValue("bridgeLinkRateMbps", "Bridge link data rate in Mbps", bridgeLinkRateMbps);
-    cmd.AddValue("bridgeLinkDelayMs", "Bridge link delay in milliseconds", bridgeLinkDelayMs);
-    cmd.AddValue("bridgeLinkLossRate", "Bridge link packet loss rate applied via ReceiveErrorModel", bridgeLinkLossRate);
-    cmd.AddValue("externalTrafficOnly", "Use real UE UDP flows and disable built-in ns-3 UDP apps", externalTrafficOnly);
-    cmd.AddValue("splitMode", "Enable split control-plane/user-plane mode", splitMode);
-    cmd.AddValue("externalTrafficTargetIp", "Destination IP used by the real UE UDP generator", externalTrafficTargetIp);
-    cmd.AddValue("externalTrafficSourceBasePort", "First source port used by the real UE UDP generator", externalTrafficSourceBasePort);
     cmd.AddValue("nrNumerology", "NR numerology used by split-mode radio", numerology);
     cmd.AddValue("nrBandwidthHz", "NR channel bandwidth in Hz used by split-mode radio", bandwidth);
     cmd.AddValue("nrCentralFrequencyHz", "NR central frequency in Hz used by split-mode radio", centralFrequency);
@@ -3749,7 +3296,6 @@ main(int argc, char* argv[])
               << " scenario_id=" << scenarioId
               << " tick_ms=" << tickMs
               << " sim_time_ms=" << simTimeMs
-              << " split_mode=" << (splitMode ? "true" : "false")
               << " nr_numerology=" << numerology
               << " nr_bandwidth_hz=" << bandwidth
               << " nr_central_frequency_hz=" << centralFrequency
@@ -3800,17 +3346,8 @@ main(int argc, char* argv[])
         }
     }
 
-    auto gnbToUpf = ParseIndexList(gnbUpfMapCsv, gNbNum, upfNames.size(), "gnbUpfMap");
-    if (gnbToUpf.empty())
-    {
-        for (uint32_t index = 0; index < gNbNum; ++index)
-        {
-            gnbToUpf.push_back((index % upfNames.size()) + 1);
-        }
-    }
+    const auto n3Links = ParseN3Links(gnbUpfLinksArg, gNbNum, upfNames.size());
 
-    const auto bridgeGnbTaps = ParseStringList(bridgeGnbTapsCsv, gNbNum, "bridgeGnbTaps");
-    const auto bridgeUpfTaps = ParseStringList(bridgeUpfTapsCsv, gNbNum, "bridgeUpfTaps");
 
     const auto gnbPositionOverrides = ParsePositionOverrides(gnbPositionsArg, gNbNum, "gnbPositions");
     const auto uePositionOverrides = ParsePositionOverrides(uePositionsArg, resolvedUeNum, "uePositions");
@@ -3857,8 +3394,6 @@ main(int argc, char* argv[])
 
     Time simTime = MilliSeconds(simTimeMs);
     Time appStartTime = MilliSeconds(400);
-    uint32_t udpPacketSize = 512;
-    uint32_t lambda = 1000;
 
     Config::SetDefault("ns3::NrRlcUm::MaxTxBufferSize", UintegerValue(999999999));
 
@@ -3920,64 +3455,6 @@ main(int argc, char* argv[])
         nrHelper->InstallGnbDevice(gridScenario.GetBaseStations(), allBwps);
     NetDeviceContainer ueNetDev =
         nrHelper->InstallUeDevice(gridScenario.GetUserTerminals(), allBwps);
-
-    if (!bridgeGnbTaps.empty() && !bridgeUpfTaps.empty())
-    {
-        CsmaHelper bridgeCsma;
-        bridgeCsma.SetChannelAttribute(
-            "DataRate",
-            DataRateValue(DataRate(static_cast<uint64_t>(std::max(1.0, bridgeLinkRateMbps) * 1e6))));
-        bridgeCsma.SetChannelAttribute("Delay",
-                                       TimeValue(Seconds(std::max(0.0, bridgeLinkDelayMs) / 1000.0)));
-        TapBridgeHelper tapBridge;
-        tapBridge.SetAttribute("Mode", StringValue("UseBridge"));
-        for (uint32_t gnbIndex = 0; gnbIndex < gNbNum; ++gnbIndex)
-        {
-            NodeContainer segment;
-            segment.Create(2);
-            NetDeviceContainer devices = bridgeCsma.Install(segment);
-            if (bridgeLinkLossRate > 0.0)
-            {
-                for (uint32_t deviceIndex = 0; deviceIndex < devices.GetN(); ++deviceIndex)
-                {
-                    Ptr<RateErrorModel> errorModel = CreateObject<RateErrorModel>();
-                    errorModel->SetUnit(RateErrorModel::ERROR_UNIT_PACKET);
-                    errorModel->SetRate(std::min(1.0, std::max(0.0, bridgeLinkLossRate)));
-                    devices.Get(deviceIndex)->SetAttribute("ReceiveErrorModel", PointerValue(errorModel));
-                }
-            }
-            const uint32_t upfIndex = gnbToUpf[gnbIndex];
-            const uint32_t gnbDeviceIndex = 0;
-            const uint32_t upfDeviceIndex = 1;
-            devices.Get(gnbDeviceIndex)->TraceConnectWithoutContext("MacTx",
-                                                                    MakeBoundCallback(&OnBridgeMacTx, &context, true));
-            devices.Get(gnbDeviceIndex)->TraceConnectWithoutContext(
-                "MacPromiscRx",
-                MakeBoundCallback(&OnBridgeMacRx, &context, true));
-            devices.Get(gnbDeviceIndex)->TraceConnectWithoutContext(
-                "PhyRxDrop",
-                MakeBoundCallback(&OnBridgeMacRxDrop, &context, true));
-            devices.Get(gnbDeviceIndex)->TraceConnectWithoutContext(
-                "PromiscSniffer",
-                MakeBoundCallback(&OnBridgePromiscSniffer, &context, true));
-            tapBridge.SetAttribute("DeviceName", StringValue(bridgeGnbTaps[gnbIndex]));
-            tapBridge.Install(segment.Get(gnbDeviceIndex), devices.Get(gnbDeviceIndex));
-
-            devices.Get(upfDeviceIndex)->TraceConnectWithoutContext("MacTx",
-                                                                    MakeBoundCallback(&OnBridgeMacTx, &context, false));
-            devices.Get(upfDeviceIndex)->TraceConnectWithoutContext(
-                "MacPromiscRx",
-                MakeBoundCallback(&OnBridgeMacRx, &context, false));
-            devices.Get(upfDeviceIndex)->TraceConnectWithoutContext(
-                "PhyRxDrop",
-                MakeBoundCallback(&OnBridgeMacRxDrop, &context, false));
-            devices.Get(upfDeviceIndex)->TraceConnectWithoutContext(
-                "PromiscSniffer",
-                MakeBoundCallback(&OnBridgePromiscSniffer, &context, false));
-            tapBridge.SetAttribute("DeviceName", StringValue(bridgeUpfTaps[gnbIndex]));
-            tapBridge.Install(segment.Get(upfDeviceIndex), devices.Get(upfDeviceIndex));
-        }
-    }
 
     double x = std::pow(10, totalTxPower / 10.0);
     for (uint32_t index = 0; index < gnbNetDev.GetN(); ++index)
@@ -4074,7 +3551,11 @@ main(int argc, char* argv[])
     ApplicationContainer clientApps;
     auto& flowRuntimeByPort = context.flowRuntimeByPort;
 
-    if (!flowProfiles.empty())
+    if (flowProfiles.empty())
+    {
+        NS_FATAL_ERROR("split-mode requires a non-empty flow profile file");
+    }
+    else
     {
         for (uint32_t index = 0; index < flowProfiles.size(); ++index)
         {
@@ -4089,59 +3570,23 @@ main(int argc, char* argv[])
             const uint16_t ulPort = static_cast<uint16_t>(6000 + index);
             const uint16_t dlSourcePort = static_cast<uint16_t>(15000 + index);
             const uint16_t ulSourcePort = static_cast<uint16_t>(25000 + index);
-            Ptr<UdpClient> installedUdpClient;
             Ptr<PacketSink> downlinkSink;
             Ptr<PacketSink> uplinkSink;
-            if (!externalTrafficOnly)
-            {
-                if (splitMode)
-                {
-                    PacketSinkHelper packetSinkHelper(
-                        "ns3::UdpSocketFactory",
-                        InetSocketAddress(Ipv4Address::GetAny(), dlPort));
-                    ApplicationContainer installedDownlinkSink =
-                        packetSinkHelper.Install(gridScenario.GetUserTerminals().Get(ueIndex));
-                    serverApps.Add(installedDownlinkSink);
-                    downlinkSink = DynamicCast<PacketSink>(installedDownlinkSink.Get(0));
-                    PacketSinkHelper remoteSinkHelper(
-                        "ns3::UdpSocketFactory",
-                        InetSocketAddress(Ipv4Address::GetAny(), ulPort));
-                    ApplicationContainer installedUplinkSink = remoteSinkHelper.Install(remoteHost);
-                    serverApps.Add(installedUplinkSink);
-                    uplinkSink = DynamicCast<PacketSink>(installedUplinkSink.Get(0));
-                }
-                else
-                {
-                    UdpServerHelper packetSink(dlPort);
-                    serverApps.Add(packetSink.Install(gridScenario.GetUserTerminals().Get(ueIndex)));
-                }
-
-                if (!splitMode)
-                {
-                    UdpClientHelper client;
-                    client.SetAttribute("MaxPackets", UintegerValue(0xFFFFFFFF));
-                    client.SetAttribute(
-                        "PacketSize",
-                        UintegerValue(static_cast<uint32_t>(std::max(64.0, ResolvePacketSizeBytes(profile, true)))));
-                    const double resolvedRatePps = ResolveArrivalRatePps(profile, true);
-                    const double intervalRate = resolvedRatePps > 0.0 ? resolvedRatePps : lambda;
-                    client.SetAttribute("Interval", TimeValue(Seconds(1.0 / intervalRate)));
-                    client.SetAttribute(
-                        "Remote",
-                        AddressValue(addressUtils::ConvertToSocketAddress(ueIpIfaces.GetAddress(ueIndex), dlPort)));
-                    ApplicationContainer installedClient = client.Install(remoteHost);
-                    clientApps.Add(installedClient);
-                    installedUdpClient = DynamicCast<UdpClient>(installedClient.Get(0));
-                }
-
-                // Split mode already enforces per-flow bandwidth at the traffic generator.
-                // Installing an additional dedicated EPS bearer per flow makes the ns-3
-                // user-plane state diverge from the split-mode control/runtime model and
-                // has been causing persistent UE-specific uplink stalls after startup.
-            }
+            PacketSinkHelper packetSinkHelper(
+                "ns3::UdpSocketFactory",
+                InetSocketAddress(Ipv4Address::GetAny(), dlPort));
+            ApplicationContainer installedDownlinkSink =
+                packetSinkHelper.Install(gridScenario.GetUserTerminals().Get(ueIndex));
+            serverApps.Add(installedDownlinkSink);
+            downlinkSink = DynamicCast<PacketSink>(installedDownlinkSink.Get(0));
+            PacketSinkHelper remoteSinkHelper(
+                "ns3::UdpSocketFactory",
+                InetSocketAddress(Ipv4Address::GetAny(), ulPort));
+            ApplicationContainer installedUplinkSink = remoteSinkHelper.Install(remoteHost);
+            serverApps.Add(installedUplinkSink);
+            uplinkSink = DynamicCast<PacketSink>(installedUplinkSink.Get(0));
             flowRuntimeByPort[dlPort] = SnapshotContext::FlowRuntimeState{
                 profile,
-                installedUdpClient,
                 downlinkSink,
                 uplinkSink,
                 dlPort,
@@ -4150,75 +3595,31 @@ main(int argc, char* argv[])
                 ulSourcePort,
                 ueIndex,
             };
-            if (!externalTrafficOnly && splitMode)
-            {
-                Ptr<SplitFlowUdpApp> downlinkClient = CreateObject<SplitFlowUdpApp>();
-                downlinkClient->Configure(
-                    addressUtils::ConvertToSocketAddress(ueIpIfaces.GetAddress(ueIndex), dlPort),
-                    &flowRuntimeByPort[dlPort],
-                    MilliSeconds(tickMs),
-                    dlSourcePort,
-                    true);
-                remoteHost->AddApplication(downlinkClient);
-                clientApps.Add(downlinkClient);
+            Ptr<SplitFlowUdpApp> downlinkClient = CreateObject<SplitFlowUdpApp>();
+            downlinkClient->Configure(
+                addressUtils::ConvertToSocketAddress(ueIpIfaces.GetAddress(ueIndex), dlPort),
+                &flowRuntimeByPort[dlPort],
+                MilliSeconds(tickMs),
+                dlSourcePort,
+                true);
+            remoteHost->AddApplication(downlinkClient);
+            clientApps.Add(downlinkClient);
 
-                Ptr<SplitFlowUdpApp> uplinkClient = CreateObject<SplitFlowUdpApp>();
-                uplinkClient->Configure(
-                    addressUtils::ConvertToSocketAddress(remoteHostAddress, ulPort),
-                    &flowRuntimeByPort[dlPort],
-                    MilliSeconds(tickMs),
-                    ulSourcePort,
-                    false);
-                gridScenario.GetUserTerminals().Get(ueIndex)->AddApplication(uplinkClient);
-                clientApps.Add(uplinkClient);
-            }
+            Ptr<SplitFlowUdpApp> uplinkClient = CreateObject<SplitFlowUdpApp>();
+            uplinkClient->Configure(
+                addressUtils::ConvertToSocketAddress(remoteHostAddress, ulPort),
+                &flowRuntimeByPort[dlPort],
+                MilliSeconds(tickMs),
+                ulSourcePort,
+                false);
+            gridScenario.GetUserTerminals().Get(ueIndex)->AddApplication(uplinkClient);
+            clientApps.Add(uplinkClient);
         }
     }
-    else if (!externalTrafficOnly)
-    {
-        for (uint32_t index = 0; index < resolvedUeNum; ++index)
-        {
-            const uint16_t dlPort = static_cast<uint16_t>(5000 + index);
-            if (splitMode)
-            {
-                PacketSinkHelper packetSinkHelper(
-                    "ns3::UdpSocketFactory",
-                    InetSocketAddress(Ipv4Address::GetAny(), dlPort));
-                serverApps.Add(packetSinkHelper.Install(gridScenario.GetUserTerminals().Get(index)));
-            }
-            else
-            {
-                UdpServerHelper packetSink(dlPort);
-                serverApps.Add(packetSink.Install(gridScenario.GetUserTerminals().Get(index)));
-            }
-
-            UdpClientHelper client;
-            client.SetAttribute("MaxPackets", UintegerValue(0xFFFFFFFF));
-            client.SetAttribute("PacketSize", UintegerValue(udpPacketSize));
-            client.SetAttribute("Interval", TimeValue(Seconds(1.0 / lambda)));
-            client.SetAttribute(
-                "Remote",
-                AddressValue(addressUtils::ConvertToSocketAddress(ueIpIfaces.GetAddress(index), dlPort)));
-            ApplicationContainer installedClient = client.Install(remoteHost);
-            clientApps.Add(installedClient);
-
-            NrEpsBearer bearer(NrEpsBearer::NGBR_LOW_LAT_EMBB);
-            Ptr<NrEpcTft> tft = Create<NrEpcTft>();
-            NrEpcTft::PacketFilter filter;
-            filter.localPortStart = dlPort;
-            filter.localPortEnd = dlPort;
-            tft->Add(filter);
-            nrHelper->ActivateDedicatedEpsBearer(ueNetDev.Get(index), bearer, tft);
-        }
-    }
-
-    if (!externalTrafficOnly)
-    {
-        serverApps.Start(appStartTime);
-        clientApps.Start(appStartTime);
-        serverApps.Stop(simTime);
-        clientApps.Stop(simTime);
-    }
+    serverApps.Start(appStartTime);
+    clientApps.Start(appStartTime);
+    serverApps.Stop(simTime);
+    clientApps.Stop(simTime);
 
     FlowMonitorHelper flowMonitorHelper;
     NodeContainer monitored;
@@ -4241,13 +3642,6 @@ main(int argc, char* argv[])
     context.policyReloadMs = policyReloadMs;
     context.gNbNum = gNbNum;
     context.ueNum = resolvedUeNum;
-    context.bridgeLinkRateMbps = bridgeLinkRateMbps;
-    context.bridgeLinkDelayMs = bridgeLinkDelayMs;
-    context.bridgeLinkLossRate = bridgeLinkLossRate;
-    context.externalTrafficOnly = externalTrafficOnly;
-    context.splitMode = splitMode;
-    context.externalTrafficTargetIp = externalTrafficTargetIp;
-    context.externalTrafficSourceBasePort = externalTrafficSourceBasePort;
     context.radioConfig.schedulerType = schedulerType;
     context.radioConfig.tddPattern = tddPattern;
     context.radioConfig.gnbTxPowerDbm = totalTxPower;
@@ -4264,11 +3658,7 @@ main(int argc, char* argv[])
     context.sliceResources = sliceResources;
     context.ueSliceIds = ueSliceIds;
     context.remoteHostAddress = remoteHostAddress;
-    context.gnbToUpf.reserve(gnbToUpf.size());
-    for (const auto value : gnbToUpf)
-    {
-        context.gnbToUpf.push_back(value - 1);
-    }
+    context.n3Links = n3Links;
     context.monitor = monitor;
     context.classifier = classifier;
     context.appStartTime = appStartTime;

@@ -4,20 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import ipaddress
-import ipaddress
 from pathlib import Path
 import re
 from typing import Any
 
 import yaml
 
-
-_NS3_SUPPORTED_FIVE_QI = frozenset(
-    {1, 2, 3, 4, 5, 6, 7, 8, 9, 65, 66, 67, 69, 70, 71, 72, 73, 74, 75, 76, 79, 80, 82, 83, 84, 85, 86, 87, 88, 89, 90}
-)
-_NS3_UM_FIVE_QI = frozenset(
-    {1, 2, 3, 7, 65, 66, 67, 72, 75, 76, 79, 82, 83, 86, 87, 88, 89, 90}
-)
 
 from bridge.common.graph_adapter import load_graph_snapshot_payload, merge_semantic_graph_payload
 from bridge.common.topology import merge_topology_graph_payload
@@ -150,16 +142,9 @@ class FlowConfig:
     policy_filter: str | None = None
     precedence: int | None = None
     qos_ref: int | None = None
-    qfi: int | None = None
-    ue_ip: str | None = None
-    inner_protocol: int | None = None
-    ue_port: int | None = None
-    remote_port: int | None = None
     charging_method: str | None = None
     quota: str | None = None
     unit_cost: str | None = None
-    rlc_mode: str = "UM"
-    virtual_expiry_ms: float = 1000.0
     sla_target: SlaTargetConfig = field(default_factory=SlaTargetConfig)
 
 
@@ -211,20 +196,12 @@ class Free5gcConfig:
 @dataclass(slots=True, frozen=True)
 class Ns3Config:
     ns3_root: str
-    scratch_name: str = "nr_multignb_multiupf"
+    scratch_name: str = "nr_multignb_multiupf_split"
     output_subdir: str = "ns3"
     simulator: str = "RealtimeSimulatorImpl"
     sim_time_ms: int = 30000
-    bridge_mode: str = "l2_inline"
-    bridge_link_rate_mbps: float = 1000.0
-    bridge_link_delay_ms: float = 1.0
-    bridge_link_loss_rate: float = 0.0
     policy_reload_ms: int = 1000
     slice_isolation: bool = False
-    rng_run: int = 1
-    virtual_epoch_us: int = 100_000
-    channel_update_ms: float = 10.0
-    shadowing_enabled: bool = True
 
 
 @dataclass(slots=True, frozen=True)
@@ -243,25 +220,9 @@ class TopologyConfig:
 
 
 @dataclass(slots=True, frozen=True)
-class UserPlaneGateConfig:
-    enabled: bool = False
-    max_pending_packets: int = 8192
-    max_pending_bytes: int = 64 * 1024 * 1024
-    socket_path: str = "/tmp/ns3-free5gc-gate.sock"
-
-
-@dataclass(slots=True, frozen=True)
-class BridgeHarnessConfig:
-    enable_inline_harness: bool = False
-    gnb_n3_ifname: str | None = None
-    upf_n3_ifname: str | None = None
-    n3_network_name: str = "n3net"
-    n3_network_cidr: str | None = None
-    gnb_prefix: str = "tap-gnb"
-    upf_prefix: str = "tap-upf"
-    bridge_prefix: str = "br-ran"
-    host_veth_prefix: str = "veth-ran"
-    user_plane_gate: UserPlaneGateConfig = field(default_factory=UserPlaneGateConfig)
+class N3NetworkConfig:
+    name: str = "n3net"
+    cidr: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -285,7 +246,7 @@ class ScenarioConfig:
     ns3: Ns3Config
     writer: WriterConfig = field(default_factory=WriterConfig)
     topology: TopologyConfig = field(default_factory=TopologyConfig)
-    bridge: BridgeHarnessConfig = field(default_factory=BridgeHarnessConfig)
+    n3_network: N3NetworkConfig = field(default_factory=N3NetworkConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     apps: tuple[AppConfig, ...] = ()
     flows: tuple[FlowConfig, ...] = ()
@@ -446,43 +407,17 @@ class ScenarioConfig:
             raise ValueError("graph snapshot input requires topology.graph_db_url or writer.graph_db_url")
         if (self.policy.ue_context_table or self.policy.ue_context_query) and not self.policy.db_url:
             raise ValueError("ue_context policy loading requires policy.db_url or writer.graph_db_url")
-        if self.ns3.bridge_mode not in {"l2_inline"}:
-            raise ValueError("ns3.bridge_mode must currently be 'l2_inline'")
-        if not 0.0 <= self.ns3.bridge_link_loss_rate <= 1.0:
-            raise ValueError("ns3.bridge_link_loss_rate must be within [0.0, 1.0]")
-        if self.ns3.rng_run <= 0:
-            raise ValueError("ns3.rng_run must be positive")
-        if self.ns3.virtual_epoch_us <= 0:
-            raise ValueError("ns3.virtual_epoch_us must be positive")
-        if self.ns3.channel_update_ms <= 0:
-            raise ValueError("ns3.channel_update_ms must be positive")
-        if self.bridge.user_plane_gate.max_pending_packets <= 0:
-            raise ValueError("bridge.user_plane_gate.max_pending_packets must be positive")
-        if self.bridge.user_plane_gate.max_pending_bytes <= 0:
-            raise ValueError("bridge.user_plane_gate.max_pending_bytes must be positive")
-        if not self.bridge.user_plane_gate.socket_path:
-            raise ValueError("bridge.user_plane_gate.socket_path must not be empty")
-        if self.bridge.enable_inline_harness:
-            if not self.bridge.n3_network_cidr:
-                raise ValueError("bridge.n3_network_cidr is required when inline harness is enabled")
-        if self.bridge.user_plane_gate.enabled:
-            if not self.bridge.enable_inline_harness:
-                raise ValueError("user-plane gate requires bridge.enable_inline_harness")
-            if "Realtime" in self.ns3.simulator:
-                raise ValueError(
-                    "user-plane gate requires an ns-3 virtual-time simulator, not RealtimeSimulatorImpl"
-                )
-        if self.bridge.n3_network_cidr:
+        if self.n3_network.cidr:
             try:
-                n3_network = ipaddress.ip_network(self.bridge.n3_network_cidr, strict=True)
+                n3_network = ipaddress.ip_network(self.n3_network.cidr, strict=True)
             except ValueError as exc:
-                raise ValueError(f"invalid bridge.n3_network_cidr: {self.bridge.n3_network_cidr}") from exc
+                raise ValueError(f"invalid n3_network.cidr: {self.n3_network.cidr}") from exc
             if n3_network.version != 4:
-                raise ValueError("bridge.n3_network_cidr must be an IPv4 CIDR")
+                raise ValueError("n3_network.cidr must be an IPv4 CIDR")
             required_hosts = len(self.gnbs) + len(self.upfs) + 1
             if len(list(n3_network.hosts())) < required_hosts:
                 raise ValueError(
-                    f"bridge.n3_network_cidr {self.bridge.n3_network_cidr} does not have enough host addresses "
+                    f"n3_network.cidr {self.n3_network.cidr} does not have enough host addresses "
                     "for Docker gateway plus all gNB/UPF endpoints"
                 )
 
@@ -538,46 +473,6 @@ class ScenarioConfig:
             if app.ue_name is not None and app.ue_name not in ue_by_name:
                 raise ValueError(f"app {app.app_id} references unknown UE {app.ue_name}")
         for flow in self.flows:
-            if flow.rlc_mode not in {"UM", "AM"}:
-                raise ValueError(f"flow {flow.flow_id} rlc_mode must be 'UM' or 'AM'")
-            if flow.virtual_expiry_ms <= 0:
-                raise ValueError(f"flow {flow.flow_id} virtual_expiry_ms must be positive")
-            if self.bridge.user_plane_gate.enabled:
-                if flow.five_qi not in _NS3_SUPPORTED_FIVE_QI:
-                    raise ValueError(
-                        f"flow {flow.flow_id} five_qi {flow.five_qi} is unsupported by 5G-LENA"
-                    )
-                resolved_rlc_mode = (
-                    "UM" if flow.five_qi in _NS3_UM_FIVE_QI else "AM"
-                )
-                if flow.rlc_mode != resolved_rlc_mode:
-                    raise ValueError(
-                        f"flow {flow.flow_id} rlc_mode {flow.rlc_mode} conflicts with "
-                        f"5G-LENA 5QI {flow.five_qi} mapping ({resolved_rlc_mode})"
-                    )
-                if flow.ue_ip is None:
-                    raise ValueError(f"flow {flow.flow_id} ue_ip is required for user-plane gate")
-                try:
-                    ue_ip = ipaddress.ip_address(flow.ue_ip)
-                except ValueError as exc:
-                    raise ValueError(f"flow {flow.flow_id} has invalid ue_ip {flow.ue_ip}") from exc
-                if ue_ip.version != 4:
-                    raise ValueError(f"flow {flow.flow_id} ue_ip must be IPv4")
-                if flow.qfi is None and not any(
-                    value is not None
-                    for value in (flow.inner_protocol, flow.ue_port, flow.remote_port)
-                ):
-                    raise ValueError(
-                        f"flow {flow.flow_id} requires qfi or inner tuple binding"
-                    )
-            if flow.qfi is not None and not 0 <= flow.qfi <= 63:
-                raise ValueError(f"flow {flow.flow_id} qfi must be within [0, 63]")
-            for port_name, port_value in (
-                ("ue_port", flow.ue_port),
-                ("remote_port", flow.remote_port),
-            ):
-                if port_value is not None and not 1 <= port_value <= 65535:
-                    raise ValueError(f"flow {flow.flow_id} {port_name} must be within [1, 65535]")
             if flow.supi not in ue_by_supi:
                 raise ValueError(f"flow {flow.flow_id} references unknown SUPI {flow.supi}")
             if flow.ue_name is not None and flow.ue_name not in ue_by_name:
@@ -646,6 +541,13 @@ class ScenarioConfig:
         *,
         base_dir: Path | None = None,
     ) -> "ScenarioConfig":
+        allowed_fields = {
+            "name", "scenario_id", "tick_ms", "seed", "slices", "upfs", "gnbs", "ues",
+            "free5gc", "ns3", "writer", "topology", "n3_network", "policy", "apps", "flows",
+        }
+        unknown_fields = sorted(set(payload) - allowed_fields)
+        if unknown_fields:
+            raise ValueError(f"scenario contains unknown fields: {', '.join(unknown_fields)}")
         writer_payload = payload.get("writer", {})
         topology_payload = dict(payload.get("topology", {}))
         policy_payload = dict(payload.get("policy", {}))
@@ -780,14 +682,16 @@ class ScenarioConfig:
 
         free5gc_payload = payload["free5gc"]
         ns3_payload = payload["ns3"]
-        bridge_payload = payload.get("bridge", {})
-        user_plane_gate_payload = bridge_payload.get("user_plane_gate", {})
-        if not isinstance(user_plane_gate_payload, dict):
-            raise ValueError("bridge.user_plane_gate must be an object")
-        if "fail_closed" in user_plane_gate_payload:
-            raise ValueError(
-                "bridge.user_plane_gate.fail_closed was removed; the gate is always fail-closed"
-            )
+        n3_network_payload = payload.get("n3_network", {})
+        unknown_ns3_fields = sorted(
+            set(ns3_payload)
+            - {"ns3_root", "scratch_name", "output_subdir", "simulator", "sim_time_ms", "policy_reload_ms", "slice_isolation"}
+        )
+        if unknown_ns3_fields:
+            raise ValueError(f"scenario ns3 contains unknown fields: {', '.join(unknown_ns3_fields)}")
+        unknown_n3_fields = sorted(set(n3_network_payload) - {"name", "cidr"})
+        if unknown_n3_fields:
+            raise ValueError(f"scenario n3_network contains unknown fields: {', '.join(unknown_n3_fields)}")
         apps = tuple(
             AppConfig(
                 app_id=item["app_id"],
@@ -838,16 +742,9 @@ class ScenarioConfig:
                     if item.get("qos_ref") is not None
                     else item.get("qosRef")
                 ),
-                qfi=_optional_int(item.get("qfi")),
-                ue_ip=(str(item["ue_ip"]) if item.get("ue_ip") is not None else None),
-                inner_protocol=_optional_int(item.get("inner_protocol")),
-                ue_port=_optional_int(item.get("ue_port")),
-                remote_port=_optional_int(item.get("remote_port")),
                 charging_method=item.get("charging_method") or item.get("chargingMethod"),
                 quota=item.get("quota"),
                 unit_cost=item.get("unit_cost") or item.get("unitCost"),
-                rlc_mode=str(item.get("rlc_mode", "UM")).upper(),
-                virtual_expiry_ms=float(item.get("virtual_expiry_ms", 1000.0)),
                 sla_target=SlaTargetConfig(
                     latency_ms=_optional_float(item.get("sla_target", {}).get("latency_ms"))
                     if isinstance(item.get("sla_target"), dict)
@@ -905,22 +802,12 @@ class ScenarioConfig:
             ),
             ns3=Ns3Config(
                 ns3_root=_resolve_path(ns3_payload["ns3_root"], base_dir),
-                scratch_name=ns3_payload.get("scratch_name", "nr_multignb_multiupf"),
+                scratch_name=ns3_payload.get("scratch_name", "nr_multignb_multiupf_split"),
                 output_subdir=ns3_payload.get("output_subdir", "ns3"),
                 simulator=ns3_payload.get("simulator", "RealtimeSimulatorImpl"),
                 sim_time_ms=int(ns3_payload.get("sim_time_ms", 30000)),
-                bridge_mode=str(ns3_payload.get("bridge_mode", "l2_inline")),
-                bridge_link_rate_mbps=float(ns3_payload.get("bridge_link_rate_mbps", 1000.0)),
-                bridge_link_delay_ms=float(ns3_payload.get("bridge_link_delay_ms", 1.0)),
-                bridge_link_loss_rate=float(ns3_payload.get("bridge_link_loss_rate", 0.0)),
                 policy_reload_ms=int(ns3_payload.get("policy_reload_ms", 1000)),
                 slice_isolation=bool(ns3_payload.get("slice_isolation", False)),
-                rng_run=int(ns3_payload.get("rng_run", 1)),
-                virtual_epoch_us=int(
-                    ns3_payload.get("virtual_epoch_us", int(payload.get("tick_ms", 1000)) * 1000)
-                ),
-                channel_update_ms=float(ns3_payload.get("channel_update_ms", 10.0)),
-                shadowing_enabled=bool(ns3_payload.get("shadowing_enabled", True)),
             ),
             writer=WriterConfig(
                 archive_dir=writer_payload.get("archive_dir", "artifacts/archive"),
@@ -933,30 +820,9 @@ class ScenarioConfig:
                 graph_snapshot_id=(str(resolved_graph_snapshot_id) if resolved_graph_snapshot_id is not None else None),
                 graph_db_url=resolved_graph_db_url,
             ),
-            bridge=BridgeHarnessConfig(
-                enable_inline_harness=bool(
-                    bridge_payload.get("enable_inline_harness", False)
-                ),
-                gnb_n3_ifname=bridge_payload.get("gnb_n3_ifname"),
-                upf_n3_ifname=bridge_payload.get("upf_n3_ifname"),
-                n3_network_name=bridge_payload.get("n3_network_name", "n3net"),
-                n3_network_cidr=bridge_payload.get("n3_network_cidr"),
-                gnb_prefix=bridge_payload.get("gnb_prefix", "tap-gnb"),
-                upf_prefix=bridge_payload.get("upf_prefix", "tap-upf"),
-                bridge_prefix=bridge_payload.get("bridge_prefix", "br-ran"),
-                host_veth_prefix=bridge_payload.get("host_veth_prefix", "veth-ran"),
-                user_plane_gate=UserPlaneGateConfig(
-                    enabled=bool(user_plane_gate_payload.get("enabled", False)),
-                    max_pending_packets=int(
-                        user_plane_gate_payload.get("max_pending_packets", 8192)
-                    ),
-                    max_pending_bytes=int(
-                        user_plane_gate_payload.get("max_pending_bytes", 64 * 1024 * 1024)
-                    ),
-                    socket_path=str(
-                        user_plane_gate_payload.get("socket_path", "/tmp/ns3-free5gc-gate.sock")
-                    ),
-                ),
+            n3_network=N3NetworkConfig(
+                name=str(n3_network_payload.get("name", "n3net")),
+                cidr=n3_network_payload.get("cidr"),
             ),
             policy=PolicyConfig(
                 db_url=resolved_policy_db_url,

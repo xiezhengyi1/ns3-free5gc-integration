@@ -12,9 +12,8 @@ import yaml
 
 from bridge.common.ids import generate_run_id
 from bridge.common.topology import resolve_scenario_topology
-from adapters.free5gc_ueransim.bridge_setup import build_bridge_plan, render_bridge_probe_script, render_bridge_script
-from adapters.free5gc_ueransim.compose_override import build_n3_network_plan, upf_service_ip
-from bridge.orchestrator.config_renderer import render_run_assets
+from adapters.free5gc_ueransim.compose_override import upf_service_ip
+from bridge.orchestrator.config_renderer import render_control_plane_assets
 
 from .config import SplitModeConfig
 from .manifest import SplitCommandSpec, SplitRunManifest
@@ -45,21 +44,6 @@ def _yaml_load(path: Path) -> dict[str, Any]:
 
 def _yaml_dump(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=True), encoding="utf-8")
-
-
-def _compose_inspect_targets(compose_payload: dict[str, Any]) -> dict[str, str]:
-    payload: dict[str, str] = {}
-    services = compose_payload.get("services")
-    if not isinstance(services, dict):
-        return payload
-    for service_name, service_payload in services.items():
-        target = str(service_name)
-        if isinstance(service_payload, dict):
-            container_name = service_payload.get("container_name")
-            if isinstance(container_name, str) and container_name:
-                target = container_name
-        payload[str(service_name)] = target
-    return payload
 
 
 def _rewrite_split_control_plane_configs(config: SplitModeConfig, config_dir: Path) -> None:
@@ -156,6 +140,7 @@ def _render_live_flow_profiles(config: SplitModeConfig, output_path: Path) -> No
         "slice_ref",
         "slice_snssai",
         "dnn",
+        "upf_ref",
         "service_type",
         "service_type_id",
         "five_qi",
@@ -200,6 +185,7 @@ def _render_live_flow_profiles(config: SplitModeConfig, output_path: Path) -> No
             flow.slice_ref,
             f"{slice_config.sst:02d}{slice_config.sd.lower()}",
             flow.dnn,
+            scenario.resolve_flow_upf(flow),
             flow.service_type,
             flow.service_type_id,
             flow.five_qi,
@@ -244,7 +230,7 @@ def render_split_run(
     run_dir = project_root / "artifacts" / "runs" / resolved_run_id
     if run_dir.exists():
         shutil.rmtree(run_dir)
-    rendered = render_run_assets(project_root, config.control_plane_scenario, resolved_run_id)
+    rendered = render_control_plane_assets(project_root, config.control_plane_scenario, resolved_run_id)
     _rewrite_split_control_plane_configs(config, rendered.config_dir)
     if config.control_plane_scenario.free5gc.mode == "ulcl":
         _rewrite_split_uerouting_pfds(config, rendered.config_dir)
@@ -262,24 +248,8 @@ def render_split_run(
     result_file = run_dir / "state" / "split-results.jsonl"
     _render_live_flow_profiles(config, flow_profile_file)
 
-    base_manifest = rendered.manifest
+    base_manifest = rendered
     scenario = config.control_plane_scenario
-    inline_harness_enabled = scenario.bridge.enable_inline_harness
-    bridge_plans = (
-        build_bridge_plan(
-            config.base_scenario,
-            base_manifest.service_map,
-            n3_network_plan=build_n3_network_plan(config.base_scenario),
-            resolved_topology=resolved_topology,
-            inspect_targets=_compose_inspect_targets(_yaml_load(rendered.compose_file)),
-        )
-        if inline_harness_enabled
-        else []
-    )
-    bridge_script = generated_dir / "setup-inline-bridge.sh"
-    render_bridge_script(bridge_plans, bridge_script)
-    bridge_probe_script = generated_dir / "probe-inline-bridge.sh"
-    render_bridge_probe_script(bridge_plans, bridge_probe_script)
     python_executable = project_root / ".venv" / "bin" / "python3"
     python_command = str(python_executable) if python_executable.exists() else "python3"
     compose_base_argv = [
@@ -302,9 +272,10 @@ def render_split_run(
     gnb_index_by_name = {gnb.name: index for index, gnb in enumerate(scenario.gnbs, start=1)}
     upf_index_by_name = {upf.name: index for index, upf in enumerate(scenario.upfs, start=1)}
     ue_gnb_map = ",".join(str(gnb_index_by_name[resolved_topology.ue_to_gnb[ue.name]]) for ue in scenario.ues)
-    gnb_upf_map = ",".join(
-        str(upf_index_by_name[resolved_topology.gnb_to_upfs[gnb.name][0]])
+    gnb_upf_links = ";".join(
+        f"{gnb_index_by_name[gnb.name]}:{upf_index_by_name[upf_name]}"
         for gnb in scenario.gnbs
+        for upf_name in resolved_topology.gnb_to_upfs[gnb.name]
     )
     gnb_positions = ";".join(
         (
@@ -626,8 +597,8 @@ def render_split_run(
                     ",".join(ue.supi for ue in scenario.ues),
                     "--ue-gnb-map",
                     ue_gnb_map,
-                    "--gnb-upf-map",
-                    gnb_upf_map,
+                    "--gnb-upf-links",
+                    gnb_upf_links,
                     "--gnb-positions",
                     gnb_positions,
                     "--ue-positions",
@@ -652,7 +623,6 @@ def render_split_run(
                     str(config.radio.ue_noise_figure_db),
                     "--enable-uplink-power-control",
                     "true" if config.radio.enable_uplink_power_control else "false",
-                    "--split-mode",
                 ],
                 env={"NS3_ROOT": scenario.ns3.ns3_root},
             ),
@@ -663,74 +633,6 @@ def render_split_run(
             ),
         ]
     )
-    if inline_harness_enabled and bridge_plans:
-        ns3_run = next(command for command in commands if command.name == "ns3-run")
-        ns3_run.argv.extend(
-            [
-                "--bridge-gnb-taps",
-                ",".join(plan.gnb_tap for plan in bridge_plans),
-                "--bridge-upf-taps",
-                ",".join(plan.upf_tap for plan in bridge_plans),
-                "--bridge-link-rate-mbps",
-                str(config.base_scenario.ns3.bridge_link_rate_mbps),
-                "--bridge-link-delay-ms",
-                str(config.base_scenario.ns3.bridge_link_delay_ms),
-                "--bridge-link-loss-rate",
-                str(config.base_scenario.ns3.bridge_link_loss_rate),
-            ]
-        )
-        compose_up_gnb_index = next(index for index, command in enumerate(commands) if command.name == "compose-up-gnb")
-        commands.insert(
-            compose_up_gnb_index + 1,
-            SplitCommandSpec(
-                name="bridge-setup",
-                cwd=str(project_root),
-                argv=[
-                    "docker",
-                    "run",
-                    "--rm",
-                    "--privileged",
-                    "--pid",
-                    "host",
-                    "--network",
-                    "host",
-                    "-v",
-                    "/:/host",
-                    "free5gc/base:latest",
-                    "chroot",
-                    "/host",
-                    "bash",
-                    str(bridge_script),
-                ],
-            ),
-        )
-        ns3_run_index = next(index for index, command in enumerate(commands) if command.name == "ns3-run")
-        commands.insert(
-            ns3_run_index,
-            SplitCommandSpec(
-                name="bridge-probe-post-ns3",
-                cwd=str(project_root),
-                argv=[
-                    "docker",
-                    "run",
-                    "--rm",
-                    "--privileged",
-                    "--pid",
-                    "host",
-                    "--network",
-                    "host",
-                    "-v",
-                    "/:/host",
-                    "free5gc/base:latest",
-                    "chroot",
-                    "/host",
-                    "bash",
-                    str(bridge_probe_script),
-                    "12",
-                ],
-                background=True,
-            ),
-        )
     if scenario.writer.graph_db_url:
         next(command for command in commands if command.name == "writer-follow-split-ns3").argv.extend(
             [
