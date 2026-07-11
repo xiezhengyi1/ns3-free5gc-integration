@@ -97,7 +97,7 @@ gnbs:
     slices:
       - slice-1-000001
       - slice-1-000002
-    backhaul_upf: i-upf-a
+    backhaul_upfs: [i-upf-a]
   - name: gNB-2
     alias: gnb2.free5gc.org
     tac: 1
@@ -105,7 +105,7 @@ gnbs:
     slices:
       - slice-1-000002
       - slice-2-000001
-    backhaul_upf: i-upf-a
+    backhaul_upfs: [i-upf-a]
   - name: gNB-3
     alias: gnb3.free5gc.org
     tac: 1
@@ -113,7 +113,7 @@ gnbs:
     slices:
       - slice-2-000002
       - slice-3-000001
-    backhaul_upf: i-upf-b
+    backhaul_upfs: [i-upf-b]
   - name: gNB-4
     alias: gnb4.free5gc.org
     tac: 1
@@ -122,7 +122,7 @@ gnbs:
       - slice-1-000001
       - slice-3-000001
       - slice-2-000002
-    backhaul_upf: i-upf-b
+    backhaul_upfs: [i-upf-b]
   - name: gNB-5
     alias: gnb5.free5gc.org
     tac: 1
@@ -132,7 +132,7 @@ gnbs:
       - slice-1-000002
       - slice-2-000001
       - slice-3-000001
-    backhaul_upf: i-upf-b
+    backhaul_upfs: [i-upf-b]
 
 ues:
   - name: ue1

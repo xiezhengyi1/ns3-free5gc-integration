@@ -31,7 +31,7 @@ gnbs:
     nci: "0x000000001"
     slices:
       - slice-2-000001
-    backhaul_upf: upf
+    backhaul_upfs: [upf]
 
 ues:
   - name: ue-telemed

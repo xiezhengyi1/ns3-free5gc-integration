@@ -1,0 +1,11 @@
+mcc: "208"
+mnc: "93"
+linkIp: gnb.free5gc.org
+ngapIp: gnb.free5gc.org
+gtpIp: gnb.free5gc.org
+tac: 1
+nci: "0x000000001"
+amfConfigs:
+  - address: amf.free5gc.org
+    port: 38412
+slices: []

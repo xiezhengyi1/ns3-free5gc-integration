@@ -1,0 +1,11 @@
+configuration:
+  supportedPlmnList:
+    - mcc: "208"
+      mnc: "93"
+  supportedNssaiInPlmnList: []
+  nrfUri: http://free5gc-nrf:8000
+  amfSetList:
+    - {}
+  amfList:
+    - {}
+  taList: []

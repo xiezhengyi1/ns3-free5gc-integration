@@ -619,8 +619,8 @@ def _build_semantic_graph_payload(graph_summary: dict[str, Any]) -> dict[str, An
             for upf_name in core_hosts_by_slice.get(str(slice_ref), []):
                 if upf_name not in candidate_upfs:
                     candidate_upfs.append(upf_name)
-        if candidate_upfs and gnb_payload.get("backhaul_upf") is None:
-            gnb_payload["backhaul_upf"] = candidate_upfs[0]
+        if candidate_upfs:
+            gnb_payload.setdefault("backhaul_upfs", candidate_upfs)
 
     return {
         "slices": slice_payloads,

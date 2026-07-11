@@ -37,7 +37,6 @@
    @dataclass(frozen=True)
    class UserPlaneGateConfig:
        enabled: bool = False
-       fail_closed: bool = True
        max_pending_packets: int = 8192
        max_pending_bytes: int = 64 * 1024 * 1024
        socket_path: str = "/tmp/ns3-free5gc-gate.sock"
@@ -198,7 +197,7 @@
    - Experiment header containing flow ID, epoch ID, application sequence, and payload length.
    - Duplicate authorization idempotence.
    - Downlink and uplink destination selection.
-2. Implement a socket-injected `ControlledUdpAgent` so tests use loopback/fakes. Add a `--controlled` mode to `run_real_ue_flows.py`; preserve the existing free-running mode for compatibility.
+2. Implement a socket-injected `ControlledUdpAgent` so tests use loopback/fakes. Make `run_real_ue_flows.py` authorization-only and remove the free-running compatibility path.
 3. Re-run tests and commit:
 
    ```powershell
@@ -271,7 +270,7 @@
 - Create: `sim/ns3/gtpu_shadow_peer.h`
 - Create: `sim/ns3/gtpu_shadow_peer.cc`
 - Create: `sim/ns3/gtpu_shadow_peer_test.cc`
-- Modify: `sim/ns3/nr_multignb_multiupf_split.cc`
+- Modify: `sim/ns3/nr_multignb_multiupf.cc`
 - Modify: `scripts/build_ns3_program.py`
 - Modify: `tests/test_ns3_program.py`
 
@@ -297,7 +296,7 @@
 ## Task 10: Remove synthetic KPI decisions and expose event logs
 
 **Files:**
-- Modify: `sim/ns3/nr_multignb_multiupf_split.cc`
+- Modify: `sim/ns3/nr_multignb_multiupf.cc`
 - Modify: `bridge/orchestrator/metrics.py`
 - Modify: `tests/test_metrics.py`
 - Modify: `tests/test_ns3_program.py`
@@ -312,7 +311,7 @@
 
    ```powershell
    python -m unittest tests.test_metrics tests.test_ns3_program
-   git add sim/ns3/nr_multignb_multiupf_split.cc bridge/orchestrator/metrics.py tests/test_metrics.py tests/test_ns3_program.py
+   git add sim/ns3/nr_multignb_multiupf.cc bridge/orchestrator/metrics.py tests/test_metrics.py tests/test_ns3_program.py
    git commit -m "fix: report only observed NR packet metrics"
    ```
 
@@ -362,8 +361,10 @@
 
    ```bash
    python3 scripts/build_ns3_program.py --scenario scenarios/free5gc_ueransim_gtpu_nr.yaml
-   ./ns3 run "scratch/gtpu_shadow_peer_test"
-   ./ns3 run "scratch/nr_multignb_multiupf_split --duration=2 --rngSeed=1 --rngRun=1"
+   ./ns3 run "scratch/gtpu_shadow_peer_test/gtpu_shadow_peer_test"
+   python3 scripts/run_native_gate_smoke.py --ns3-root /path/to/ns-3.46.1
+   python3 scripts/run_native_multi_n3_smoke.py --ns3-root /path/to/ns-3.46.1
+   ./ns3 run "scratch/nr_multignb_multiupf --simTimeMs=2000 --rngSeed=1 --rngRun=1"
    ```
 
 4. Verify artifacts:

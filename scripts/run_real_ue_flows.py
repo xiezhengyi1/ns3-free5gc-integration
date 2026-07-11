@@ -5,28 +5,23 @@ from __future__ import annotations
 import argparse
 import csv
 import ipaddress
-import json
 import os
 from pathlib import Path
 import shlex
 import signal
+import socket
 import subprocess
 import time
+from typing import Callable
 
-
-def _rate_pps_from_bandwidth(target_mbps: float, packet_size: float) -> float:
-    if target_mbps <= 0.0 or packet_size <= 0.0:
-        return 0.0
-    return target_mbps * 1e6 / 8.0 / packet_size
+from bridge.user_plane.protocol import MessageType, StreamDecoder
 
 
 def _select_interface_for_session(rows: list[list[str]], session_index: int) -> list[str] | None:
     if not rows:
         raise ValueError("rows must not be empty")
     selected_index = max(0, int(session_index))
-    if selected_index >= len(rows):
-        return None
-    return rows[selected_index]
+    return rows[selected_index] if selected_index < len(rows) else None
 
 
 def _list_ue_interfaces(container: str) -> list[list[str]]:
@@ -37,10 +32,10 @@ def _list_ue_interfaces(container: str) -> list[list[str]]:
             container,
             "bash",
             "-lc",
-            """
+            r"""
 find /sys/class/net -maxdepth 1 -name 'uesimtun*' -printf '%f\n' | sort -V | while read -r iface; do
-    cidr=$(ip -4 -o addr show dev "$iface" | sed -n 's/.* inet \\([^ ]*\\).*/\\1/p' | head -n 1)
-  [ -n "$cidr" ] && echo "$iface ${cidr%%/*}"
+    cidr=$(ip -4 -o addr show dev "$iface" | sed -n 's/.* inet \([^ ]*\).*/\1/p' | head -n 1)
+    [ -n "$cidr" ] && echo "$iface ${cidr%%/*}"
 done
 """,
         ],
@@ -60,54 +55,195 @@ done
 
 
 def _resolve_ue_interface(container: str, session_index: int) -> dict[str, str] | None:
-    rows = _list_ue_interfaces(container)
+    try:
+        rows = _list_ue_interfaces(container)
+    except (OSError, subprocess.CalledProcessError):
+        return None
     if not rows:
         return None
-    selected_row = _select_interface_for_session(rows, session_index)
-    if selected_row is None:
+    selected = _select_interface_for_session(rows, session_index)
+    if selected is None:
         return None
-    return {
-        "iface": selected_row[0],
-        "ip": selected_row[1],
-    }
+    return {"iface": selected[0], "ip": selected[1]}
 
 
-def _effective_tick_window_ms(
+def _controlled_sender_argv(
     *,
-    last_tick: int | None,
-    last_sim_time_ms: int | None,
-    tick_index: int,
-    sim_time_ms: int,
-    nominal_tick_ms: int,
-) -> tuple[int, int]:
-    nominal = max(1, int(nominal_tick_ms))
-    if last_tick is None or last_sim_time_ms is None:
-        return nominal, 0
+    sender: str,
+    target_ip: str,
+    destination_port: int,
+    source_port: int,
+    interface: str,
+    packet_size: int,
+    flow_id: str,
+    epoch_id: int,
+    application_sequence: int,
+) -> list[str]:
+    return [
+        sender,
+        target_ip,
+        str(destination_port),
+        str(source_port),
+        interface,
+        str(packet_size),
+        "1",
+        flow_id,
+        str(epoch_id),
+        str(application_sequence),
+    ]
 
-    tick_gap = max(0, int(tick_index) - int(last_tick) - 1)
-    sim_gap = max(0, int(sim_time_ms) - int(last_sim_time_ms))
-    if sim_gap <= 0:
-        return 0, tick_gap
-    if sim_gap > nominal:
-        return nominal, tick_gap
-    return sim_gap, tick_gap
+
+class _AuthorizationLedger:
+    def __init__(self) -> None:
+        self._completed: set[int] = set()
+
+    def should_dispatch(self, authorization_id: int) -> bool:
+        return authorization_id not in self._completed
+
+    def complete(self, authorization_id: int) -> None:
+        self._completed.add(authorization_id)
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Generate real UE UDP traffic from ns-3 flow profiles")
+def _resolve_downlink_route(upf_containers: list[str], ue_ip: str) -> dict[str, str] | None:
+    for container in upf_containers:
+        try:
+            route = subprocess.check_output(
+                [
+                    "docker",
+                    "exec",
+                    container,
+                    "sh",
+                    "-lc",
+                    f"ip route get {shlex.quote(ue_ip)} | head -n 1",
+                ],
+                text=True,
+            ).split()
+        except (OSError, subprocess.CalledProcessError):
+            continue
+        if "dev" in route and route[route.index("dev") + 1] == "upfgtp":
+            return {"container": container, "iface": "upfgtp"}
+    return None
+
+
+def _run_controlled(
+    *,
+    args: argparse.Namespace,
+    flows: list[dict[str, object]],
+    container_sender: str,
+    upf_containers: list[str],
+    should_stop: Callable[[], bool],
+) -> int:
+    flows_by_id = {str(flow["flow_id"]): flow for flow in flows}
+    decoder = StreamDecoder()
+    ledger = _AuthorizationLedger()
+    connection: socket.socket | None = None
+    while not should_stop():
+        if connection is None:
+            try:
+                connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                connection.connect(args.authorization_socket)
+            except OSError:
+                if connection is not None:
+                    connection.close()
+                connection = None
+                time.sleep(0.2)
+                continue
+        try:
+            data = connection.recv(65536)
+        except OSError:
+            connection.close()
+            connection = None
+            decoder = StreamDecoder()
+            continue
+        if not data:
+            connection.close()
+            connection = None
+            decoder = StreamDecoder()
+            continue
+        for message in decoder.feed(data):
+            if message.message_type is not MessageType.AUTHORIZE_SEND:
+                continue
+            authorization_id = int(message.payload["authorization_id"])
+            if not ledger.should_dispatch(authorization_id):
+                continue
+            flow_id = str(message.payload["flow_id"])
+            flow = flows_by_id.get(flow_id)
+            if flow is None:
+                raise ValueError(f"authorization references unknown flow {flow_id}")
+            direction = str(message.payload["direction"])
+            packet_size = int(message.payload.get("payload_size", flow["packet_size"]))
+            epoch_id = int(message.payload["epoch_id"])
+            sequence = int(message.payload.get("application_sequence", message.sequence))
+            while not should_stop():
+                selected = _resolve_ue_interface(
+                    str(flow["container"]), int(flow["session_index"])
+                )
+                if selected is None:
+                    time.sleep(0.2)
+                    continue
+                if direction == "uplink":
+                    container = str(flow["container"])
+                    interface = selected["iface"]
+                    target_ip = args.target_ip
+                    destination_port = int(flow["port"])
+                    source_port = int(flow["source_port"])
+                    break
+                if direction == "downlink":
+                    route = _resolve_downlink_route(upf_containers, selected["ip"])
+                    if route is None:
+                        time.sleep(0.2)
+                        continue
+                    container = route["container"]
+                    interface = route["iface"]
+                    target_ip = selected["ip"]
+                    destination_port = int(flow["source_port"])
+                    source_port = int(flow["port"])
+                    break
+                raise ValueError(f"unsupported authorization direction {direction}")
+            else:
+                break
+            subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    container,
+                    *_controlled_sender_argv(
+                        sender=container_sender,
+                        target_ip=target_ip,
+                        destination_port=destination_port,
+                        source_port=source_port,
+                        interface=interface,
+                        packet_size=packet_size,
+                        flow_id=flow_id,
+                        epoch_id=epoch_id,
+                        application_sequence=sequence,
+                    ),
+                ],
+                check=True,
+            )
+            ledger.complete(authorization_id)
+    if connection is not None:
+        connection.close()
+    return 0
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Generate gate-authorized real UE UDP traffic"
+    )
     parser.add_argument("--flow-profile-file", required=True)
-    parser.add_argument("--clock-file", required=True)
     parser.add_argument("--state-file", required=True)
-    parser.add_argument("--run-id", required=True)
-    parser.add_argument("--scenario-id", required=True)
     parser.add_argument("--target-ip", required=True)
     parser.add_argument("--base-port", type=int, default=5000)
     parser.add_argument("--source-base-port", type=int, default=15000)
-    parser.add_argument("--tick-ms", type=int, default=1000)
     parser.add_argument("--upf-container", action="append", required=True)
-    parser.add_argument("ue_mappings", nargs="+", help="UE-to-container mapping, for example ue1=nrint-ue1")
-    args = parser.parse_args(argv)
+    parser.add_argument("--authorization-socket", required=True)
+    parser.add_argument("ue_mappings", nargs="+", help="for example ue1=nrint-ue1")
+    return parser
 
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
     ue_containers = dict(item.split("=", 1) for item in args.ue_mappings)
     upf_containers = list(dict.fromkeys(args.upf_container))
     sessions_by_ue: dict[str, list[str]] = {}
@@ -116,7 +252,9 @@ def main(argv: list[str] | None = None) -> int:
         for index, row in enumerate(csv.DictReader(handle, delimiter="\t")):
             ue_name = (row.get("ue_name") or "").strip()
             if ue_name not in ue_containers:
-                raise ValueError(f"flow {row.get('flow_id')} references unknown UE mapping {ue_name}")
+                raise ValueError(
+                    f"flow {row.get('flow_id')} references unknown UE mapping {ue_name}"
+                )
             session_ref = (row.get("session_ref") or "").strip()
             if not session_ref:
                 raise ValueError(f"flow {row.get('flow_id')} must define session_ref")
@@ -124,10 +262,11 @@ def main(argv: list[str] | None = None) -> int:
             if session_ref not in ue_sessions:
                 ue_sessions.append(session_ref)
             packet_size = int(float(row["packet_size_bytes"]))
-            rate_pps = float(row["arrival_rate_pps"])
-            if packet_size < 1 or packet_size > 65507:
-                raise ValueError(f"flow {row.get('flow_id')} packet_size_bytes must be 1..65507 for UDP")
-            if rate_pps <= 0:
+            if not 1 <= packet_size <= 65507:
+                raise ValueError(
+                    f"flow {row.get('flow_id')} packet_size_bytes must be 1..65507 for UDP"
+                )
+            if float(row["arrival_rate_pps"]) <= 0:
                 raise ValueError(f"flow {row.get('flow_id')} arrival_rate_pps must be positive")
             source_port = args.source_base_port + index
             if source_port > 65535:
@@ -135,18 +274,11 @@ def main(argv: list[str] | None = None) -> int:
             flows.append(
                 {
                     "flow_id": row["flow_id"],
-                    "ue_name": ue_name,
-                    "session_ref": session_ref,
                     "session_index": ue_sessions.index(session_ref),
                     "container": ue_containers[ue_name],
                     "port": args.base_port + index,
                     "source_port": source_port,
                     "packet_size": packet_size,
-                    "requested_rate_pps": rate_pps,
-                    "target_ul_mbps": float(row.get("bandwidth_ul_mbps") or 0.0),
-                    "target_dl_mbps": float(row.get("bandwidth_dl_mbps") or 0.0),
-                    "carry_ul": 0.0,
-                    "carry_dl": 0.0,
                 }
             )
 
@@ -166,23 +298,23 @@ def main(argv: list[str] | None = None) -> int:
         check=True,
     )
     container_sender = f"/tmp/ue_udp_sender-{marker}"
-    for container in sorted(set(ue_containers.values()) | set(upf_containers)):
-        subprocess.run(["docker", "cp", str(sender_binary), f"{container}:{container_sender}"], check=True)
-        subprocess.run(["docker", "exec", container, "chmod", "+x", container_sender], check=True)
+    containers = sorted(set(ue_containers.values()) | set(upf_containers))
+    for container in containers:
+        subprocess.run(
+            ["docker", "cp", str(sender_binary), f"{container}:{container_sender}"],
+            check=True,
+        )
+        subprocess.run(
+            ["docker", "exec", container, "chmod", "+x", container_sender],
+            check=True,
+        )
 
-    active_processes: list[subprocess.Popen[str]] = []
     stopping = False
 
     def stop(_signum: int | None = None, _frame: object | None = None) -> None:
         nonlocal stopping
         stopping = True
-        for process in active_processes:
-            if process.poll() is None:
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-        for container in sorted(set(ue_containers.values()) | set(upf_containers)):
+        for container in containers:
             subprocess.run(
                 ["docker", "exec", container, "pkill", "-f", f"[{marker[0]}]{marker[1:]}"],
                 stdout=subprocess.DEVNULL,
@@ -192,296 +324,16 @@ def main(argv: list[str] | None = None) -> int:
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-
-    last_tick: int | None = None
-    last_sim_time_ms: int | None = None
-    dl_routes: dict[str, dict[str, str]] = {}
-    missing_interface_keys: set[tuple[str, int]] = set()
-    missing_route_ips: set[str] = set()
     try:
-        while not stopping:
-            try:
-                clock = json.loads(Path(args.clock_file).read_text(encoding="utf-8"))
-                if clock.get("run_id") != args.run_id or clock.get("scenario_id") != args.scenario_id:
-                    time.sleep(0.2)
-                    continue
-                tick_index = int(clock["tick_index"])
-                sim_time_ms = int(clock["sim_time_ms"])
-                allocation_by_flow = {
-                    str(item["flow_id"]): item
-                    for item in clock.get("flows", [])
-                    if isinstance(item, dict) and "flow_id" in item
-                }
-            except (FileNotFoundError, json.JSONDecodeError, KeyError, ValueError):
-                time.sleep(0.2)
-                continue
-
-            if tick_index == last_tick:
-                time.sleep(0.05)
-                continue
-
-            elapsed_ms, skipped_ticks = _effective_tick_window_ms(
-                last_tick=last_tick,
-                last_sim_time_ms=last_sim_time_ms,
-                tick_index=tick_index,
-                sim_time_ms=sim_time_ms,
-                nominal_tick_ms=args.tick_ms,
-            )
-            if elapsed_ms <= 0:
-                last_tick = tick_index
-                last_sim_time_ms = sim_time_ms
-                continue
-            if skipped_ticks > 0:
-                print(
-                    f"warning: skipped {skipped_ticks} real-traffic tick(s) before tick {tick_index}; "
-                    f"dropping backlog and using a single {elapsed_ms}ms send window",
-                    flush=True,
-                )
-
-            scheduled: list[dict[str, object]] = []
-            tick_flow_state: list[dict[str, object]] = []
-            ue_interfaces: dict[tuple[str, int], dict[str, str] | None] = {}
-            for flow in flows:
-                allocation = allocation_by_flow.get(str(flow["flow_id"]), {})
-                packet_size = float(flow["packet_size"])
-                allocated_ul = float(allocation.get("allocated_bandwidth_ul_mbps", 0.0) or 0.0)
-                allocated_dl = float(allocation.get("allocated_bandwidth_dl_mbps", 0.0) or 0.0)
-                target_ul_mbps = allocated_ul if allocated_ul > 0.0 else float(flow["target_ul_mbps"])
-                target_dl_mbps = allocated_dl if allocated_dl > 0.0 else float(flow["target_dl_mbps"])
-
-                # Drive external traffic from the current target bandwidth rather than
-                # the original arrival_rate_pps hint. This keeps measured throughput
-                # aligned with the policy-adjusted bandwidth in each direction.
-                ul_rate_pps = _rate_pps_from_bandwidth(target_ul_mbps, packet_size)
-                dl_rate_pps = _rate_pps_from_bandwidth(target_dl_mbps, packet_size)
-                if ul_rate_pps <= 0.0 and dl_rate_pps <= 0.0:
-                    fallback_rate_pps = float(flow["requested_rate_pps"])
-                    ul_rate_pps = fallback_rate_pps
-                    dl_rate_pps = fallback_rate_pps
-                exact_ul_packets = ul_rate_pps * elapsed_ms / 1000.0 + float(flow["carry_ul"])
-                exact_dl_packets = dl_rate_pps * elapsed_ms / 1000.0 + float(flow["carry_dl"])
-                ul_packets = int(exact_ul_packets)
-                dl_packets = int(exact_dl_packets)
-                flow["carry_ul"] = exact_ul_packets - ul_packets
-                flow["carry_dl"] = exact_dl_packets - dl_packets
-                if ul_packets <= 0 and dl_packets <= 0:
-                    tick_flow_state.append(
-                        {
-                            "flow_id": str(flow["flow_id"]),
-                            "ue_name": str(flow["ue_name"]),
-                            "session_ref": str(flow["session_ref"]),
-                            "container": str(flow["container"]),
-                            "interface": "",
-                            "ue_ip": "",
-                            "dl_container": "",
-                            "source_port": int(flow["source_port"]),
-                            "destination_port": int(flow["port"]),
-                            "packet_size_bytes": int(flow["packet_size"]),
-                            "ul_packets_sent": 0,
-                            "dl_packets_sent": 0,
-                        }
-                    )
-                    continue
-                key = (str(flow["container"]), int(flow["session_index"]))
-                if key not in ue_interfaces:
-                    ue_interfaces[key] = _resolve_ue_interface(
-                        str(flow["container"]), int(flow["session_index"])
-                    )
-                    if ue_interfaces[key] is None:
-                        if key not in missing_interface_keys:
-                            print(
-                                f"waiting: {flow['container']} has no usable uesimtun interface for session index {flow['session_index']}",
-                                flush=True,
-                            )
-                            missing_interface_keys.add(key)
-                selected_interface = ue_interfaces[key]
-                if selected_interface is None:
-                    tick_flow_state.append(
-                        {
-                            "flow_id": str(flow["flow_id"]),
-                            "ue_name": str(flow["ue_name"]),
-                            "session_ref": str(flow["session_ref"]),
-                            "container": str(flow["container"]),
-                            "interface": "",
-                            "ue_ip": "",
-                            "dl_container": "",
-                            "source_port": int(flow["source_port"]),
-                            "destination_port": int(flow["port"]),
-                            "packet_size_bytes": int(flow["packet_size"]),
-                            "ul_packets_sent": 0,
-                            "dl_packets_sent": 0,
-                        }
-                    )
-                    continue
-                missing_interface_keys.discard(key)
-                flow["iface"] = selected_interface["iface"]
-                flow["ue_ip"] = selected_interface["ip"]
-                if str(flow["ue_ip"]) not in dl_routes:
-                    for upf_container in upf_containers:
-                        route = subprocess.check_output(
-                            [
-                                "docker",
-                                "exec",
-                                upf_container,
-                                "sh",
-                                "-lc",
-                                f"ip route get {shlex.quote(str(flow['ue_ip']))} | head -n 1",
-                            ],
-                            text=True,
-                        ).split()
-                        if "dev" in route and route[route.index("dev") + 1] == "upfgtp":
-                            dl_routes[str(flow["ue_ip"])] = {
-                                "container": upf_container,
-                                "iface": "upfgtp",
-                            }
-                            break
-                    if str(flow["ue_ip"]) not in dl_routes:
-                        if str(flow["ue_ip"]) not in missing_route_ips:
-                            print(
-                                f"waiting: no UPF upfgtp route found for UE IP {flow['ue_ip']}",
-                                flush=True,
-                            )
-                            missing_route_ips.add(str(flow["ue_ip"]))
-                        flow_without_dl = {**flow, "ul_packets": ul_packets, "dl_packets": 0}
-                        scheduled.append(flow_without_dl)
-                        tick_flow_state.append(
-                            {
-                                "flow_id": str(flow["flow_id"]),
-                                "ue_name": str(flow["ue_name"]),
-                                "session_ref": str(flow["session_ref"]),
-                                "container": str(flow["container"]),
-                                "interface": str(flow["iface"]),
-                                "ue_ip": str(flow["ue_ip"]),
-                                "dl_container": "",
-                                "source_port": int(flow["source_port"]),
-                                "destination_port": int(flow["port"]),
-                                "packet_size_bytes": int(flow["packet_size"]),
-                                "ul_packets_sent": int(ul_packets),
-                                "dl_packets_sent": 0,
-                            }
-                        )
-                        continue
-                missing_route_ips.discard(str(flow["ue_ip"]))
-                flow["dl_container"] = dl_routes[str(flow["ue_ip"])]["container"]
-                flow["dl_iface"] = dl_routes[str(flow["ue_ip"])]["iface"]
-                scheduled.append({**flow, "ul_packets": ul_packets, "dl_packets": dl_packets})
-                tick_flow_state.append(
-                    {
-                        "flow_id": str(flow["flow_id"]),
-                        "ue_name": str(flow["ue_name"]),
-                        "session_ref": str(flow["session_ref"]),
-                        "container": str(flow["container"]),
-                        "interface": str(flow["iface"]),
-                        "ue_ip": str(flow["ue_ip"]),
-                        "dl_container": str(flow["dl_container"]),
-                        "source_port": int(flow["source_port"]),
-                        "destination_port": int(flow["port"]),
-                        "packet_size_bytes": int(flow["packet_size"]),
-                        "ul_packets_sent": int(ul_packets),
-                        "dl_packets_sent": int(dl_packets),
-                    }
-                )
-
-            grouped_ul: dict[tuple[str, str], list[dict[str, object]]] = {}
-            grouped_dl: dict[tuple[str, str], list[dict[str, object]]] = {}
-            for flow in scheduled:
-                if int(flow["ul_packets"]) > 0:
-                    grouped_ul.setdefault((str(flow["container"]), str(flow["iface"])), []).append(flow)
-                if int(flow["dl_packets"]) > 0:
-                    grouped_dl.setdefault((str(flow["dl_container"]), str(flow["dl_iface"])), []).append(flow)
-
-            active_processes.clear()
-            for (container, iface), container_flows in grouped_ul.items():
-                ports = " ".join(str(flow["port"]) for flow in container_flows)
-                source_ports = " ".join(str(flow["source_port"]) for flow in container_flows)
-                sizes = " ".join(str(flow["packet_size"]) for flow in container_flows)
-                counts = " ".join(str(flow["ul_packets"]) for flow in container_flows)
-                flow_ids = " ".join(shlex.quote(str(flow["flow_id"])) for flow in container_flows)
-                script = f"""
-REAL_FLOW_MARKER={shlex.quote(marker)}
-target_ip={shlex.quote(args.target_ip)}
-tick_index={tick_index}
-sim_time_ms={sim_time_ms}
-iface={shlex.quote(iface)}
-ports=({ports})
-source_ports=({source_ports})
-sizes=({sizes})
-                counts=({counts})
-                flow_ids=({flow_ids})
-set -euo pipefail
-source_cidr=$(ip -4 -o addr show dev "$iface" | sed -n 's/.* inet \\([^ ]*\\).*/\\1/p' | head -n 1)
-source_ip=${{source_cidr%%/*}}
-for i in "${{!ports[@]}}"; do
-  {shlex.quote(container_sender)} "$target_ip" "${{ports[$i]}}" "${{source_ports[$i]}}" "$iface" "${{sizes[$i]}}" "${{counts[$i]}}"
-  echo "direction=ul tick=$tick_index sim_ms=$sim_time_ms flow=${{flow_ids[$i]}} src=$source_ip:${{source_ports[$i]}} dst=$target_ip:${{ports[$i]}} iface=$iface size=${{sizes[$i]}} packets=${{counts[$i]}}"
-done
-"""
-                active_processes.append(
-                    subprocess.Popen(
-                        ["docker", "exec", container, "bash", "-lc", script],
-                        text=True,
-                        start_new_session=True,
-                    )
-                )
-            for (container, iface), container_flows in grouped_dl.items():
-                ports = " ".join(str(flow["source_port"]) for flow in container_flows)
-                source_ports = " ".join(str(flow["port"]) for flow in container_flows)
-                target_ips = " ".join(shlex.quote(str(flow["ue_ip"])) for flow in container_flows)
-                sizes = " ".join(str(flow["packet_size"]) for flow in container_flows)
-                counts = " ".join(str(flow["dl_packets"]) for flow in container_flows)
-                flow_ids = " ".join(shlex.quote(str(flow["flow_id"])) for flow in container_flows)
-                script = f"""
-REAL_FLOW_MARKER={shlex.quote(marker)}
-tick_index={tick_index}
-sim_time_ms={sim_time_ms}
-iface={shlex.quote(iface)}
-ports=({ports})
-source_ports=({source_ports})
-target_ips=({target_ips})
-                sizes=({sizes})
-                counts=({counts})
-                flow_ids=({flow_ids})
-set -euo pipefail
-for i in "${{!ports[@]}}"; do
-  {shlex.quote(container_sender)} "${{target_ips[$i]}}" "${{ports[$i]}}" "${{source_ports[$i]}}" "$iface" "${{sizes[$i]}}" "${{counts[$i]}}"
-  echo "direction=dl tick=$tick_index sim_ms=$sim_time_ms flow=${{flow_ids[$i]}} src=$HOSTNAME:${{source_ports[$i]}} dst=${{target_ips[$i]}}:${{ports[$i]}} iface=$iface size=${{sizes[$i]}} packets=${{counts[$i]}}"
-done
-"""
-                active_processes.append(
-                    subprocess.Popen(
-                        ["docker", "exec", container, "bash", "-lc", script],
-                        text=True,
-                        start_new_session=True,
-                    )
-                )
-
-            return_code = 0
-            for process in active_processes:
-                return_code = max(return_code, process.wait())
-            if return_code != 0:
-                return return_code
-
-            with state_path.open("a", encoding="utf-8") as handle:
-                handle.write(
-                    json.dumps(
-                        {
-                            "tick_index": tick_index,
-                            "sim_time_ms": sim_time_ms,
-                            "effective_tick_ms": elapsed_ms,
-                            "skipped_ticks": skipped_ticks,
-                            "target_ip": args.target_ip,
-                            "flows": tick_flow_state,
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
-
-            last_tick = tick_index
-            last_sim_time_ms = sim_time_ms
+        return _run_controlled(
+            args=args,
+            flows=flows,
+            container_sender=container_sender,
+            upf_containers=upf_containers,
+            should_stop=lambda: stopping,
+        )
     finally:
         stop()
-    return 0
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ ensure_tap_creator_permissions() {
 }
 
 cp "$PROJECT_ROOT/sim/ns3/nr_multignb_multiupf.cc" "$NS3_ROOT/scratch/nr_multignb_multiupf.cc"
+cp "$PROJECT_ROOT/sim/ns3/gtpu_shadow_peer.h" "$NS3_ROOT/scratch/gtpu_shadow_peer.h"
 cd "$NS3_ROOT"
 ./ns3 configure --enable-examples >/dev/null
 ./ns3 build >/dev/null

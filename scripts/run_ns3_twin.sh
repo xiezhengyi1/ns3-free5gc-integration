@@ -59,6 +59,13 @@ BRIDGE_LINK_LOSS_RATE="0"
 EXTERNAL_TRAFFIC_ONLY="false"
 EXTERNAL_TRAFFIC_TARGET_IP="8.8.8.8"
 EXTERNAL_TRAFFIC_SOURCE_BASE_PORT="15000"
+USER_PLANE_GATE_SOCKET=""
+BEARER_MAP_FILE=""
+RNG_SEED="1"
+RNG_RUN="1"
+VIRTUAL_EPOCH_US="100000"
+CHANNEL_UPDATE_MS="10"
+SHADOWING_ENABLED="true"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -174,6 +181,34 @@ while [[ $# -gt 0 ]]; do
       EXTERNAL_TRAFFIC_SOURCE_BASE_PORT="$2"
       shift 2
       ;;
+    --user-plane-gate-socket)
+      USER_PLANE_GATE_SOCKET="$2"
+      shift 2
+      ;;
+    --bearer-map-file)
+      BEARER_MAP_FILE="$2"
+      shift 2
+      ;;
+    --rng-seed)
+      RNG_SEED="$2"
+      shift 2
+      ;;
+    --rng-run)
+      RNG_RUN="$2"
+      shift 2
+      ;;
+    --virtual-epoch-us)
+      VIRTUAL_EPOCH_US="$2"
+      shift 2
+      ;;
+    --channel-update-ms)
+      CHANNEL_UPDATE_MS="$2"
+      shift 2
+      ;;
+    --shadowing-enabled)
+      SHADOWING_ENABLED="$2"
+      shift 2
+      ;;
     *)
       echo "Unknown argument: $1" >&2
       exit 1
@@ -196,6 +231,9 @@ fi
 if [[ -n "$SLICE_RESOURCE_FILE" && "$SLICE_RESOURCE_FILE" != /* ]]; then
   SLICE_RESOURCE_FILE="$PROJECT_ROOT/$SLICE_RESOURCE_FILE"
 fi
+if [[ -n "$BEARER_MAP_FILE" && "$BEARER_MAP_FILE" != /* ]]; then
+  BEARER_MAP_FILE="$PROJECT_ROOT/$BEARER_MAP_FILE"
+fi
 
 if [[ -n "$CLOCK_FILE" && "$CLOCK_FILE" != /* ]]; then
   CLOCK_FILE="$PROJECT_ROOT/$CLOCK_FILE"
@@ -206,6 +244,7 @@ if [[ -n "$CLOCK_FILE" ]]; then
   mkdir -p "$(dirname "$CLOCK_FILE")"
 fi
 cp "$PROJECT_ROOT/sim/ns3/nr_multignb_multiupf.cc" "$NS3_ROOT/scratch/nr_multignb_multiupf.cc"
+cp "$PROJECT_ROOT/sim/ns3/gtpu_shadow_peer.h" "$NS3_ROOT/scratch/gtpu_shadow_peer.h"
 ensure_tap_creator_permissions
 
 NS3_ARGS=(
@@ -223,7 +262,18 @@ NS3_ARGS=(
   "--bridgeLinkRateMbps=$BRIDGE_LINK_RATE_MBPS"
   "--bridgeLinkDelayMs=$BRIDGE_LINK_DELAY_MS"
   "--bridgeLinkLossRate=$BRIDGE_LINK_LOSS_RATE"
+  "--rngSeed=$RNG_SEED"
+  "--rngRun=$RNG_RUN"
+  "--virtualEpochUs=$VIRTUAL_EPOCH_US"
+  "--channelUpdateMs=$CHANNEL_UPDATE_MS"
+  "--shadowingEnabled=$SHADOWING_ENABLED"
 )
+if [[ -n "$USER_PLANE_GATE_SOCKET" ]]; then
+  NS3_ARGS+=("--userPlaneGateSocket=$USER_PLANE_GATE_SOCKET")
+fi
+if [[ -n "$BEARER_MAP_FILE" ]]; then
+  NS3_ARGS+=("--bearerMapFile=$BEARER_MAP_FILE")
+fi
 if [[ -n "$CLOCK_FILE" ]]; then
   NS3_ARGS+=("--clockFile=$CLOCK_FILE")
 fi

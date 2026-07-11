@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import shutil
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ import yaml
 from bridge.split_mode.config import load_split_mode_config
 from bridge.split_mode.renderer import render_split_run
 from bridge.split_mode.session_gate import _apply_event, _build_state_maps, _rewrite_flow_profile
+from tests.free5gc_fixture import with_free5gc_fixture
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +20,11 @@ SPLIT_SCENARIOS = (
     PROJECT_ROOT / "scenarios" / "split_mode" / "s2_medium_complexity.yaml",
     PROJECT_ROOT / "scenarios" / "split_mode" / "s3_high_complexity.yaml",
 )
+
+
+def _load_split_mode_config_with_fixture(path: Path):
+    config = load_split_mode_config(path)
+    return replace(config, base_scenario=with_free5gc_fixture(config.base_scenario))
 
 
 class SplitModeConfigTest(unittest.TestCase):
@@ -37,7 +44,7 @@ class SplitModeConfigTest(unittest.TestCase):
     def test_manifest_excludes_inline_bridge_commands(self) -> None:
         for scenario_path in SPLIT_SCENARIOS:
             with self.subTest(scenario=scenario_path.name):
-                config = load_split_mode_config(scenario_path)
+                config = _load_split_mode_config_with_fixture(scenario_path)
                 rendered = render_split_run(PROJECT_ROOT, config, run_id=f"split-render-{scenario_path.stem}")
                 try:
                     manifest = rendered.manifest.to_dict()
@@ -57,7 +64,7 @@ class SplitModeConfigTest(unittest.TestCase):
                     shutil.rmtree(rendered.run_dir, ignore_errors=True)
 
     def test_rendered_smf_uses_upf_control_ip_for_pfcp(self) -> None:
-        config = load_split_mode_config(PROJECT_ROOT / "scenarios" / "split_mode" / "s1_basic_single_slice.yaml")
+        config = _load_split_mode_config_with_fixture(PROJECT_ROOT / "scenarios" / "split_mode" / "s1_basic_single_slice.yaml")
         rendered = render_split_run(PROJECT_ROOT, config, run_id="split-render-smf-control-ip")
         try:
             smf_payload = yaml.safe_load(
@@ -79,7 +86,7 @@ class SplitModeConfigTest(unittest.TestCase):
     def test_loads_all_split_scenarios(self) -> None:
         for scenario_path in SPLIT_SCENARIOS:
             with self.subTest(scenario=scenario_path.name):
-                config = load_split_mode_config(scenario_path)
+                config = _load_split_mode_config_with_fixture(scenario_path)
                 self.assertTrue(config.scenario_id.endswith("-split"))
                 self.assertEqual(config.ns3.scratch_name, "nr_multignb_multiupf_split")
                 self.assertEqual(config.radio.scheduler_type, "pf")
@@ -91,7 +98,7 @@ class SplitModeConfigTest(unittest.TestCase):
                 )
 
     def test_renderer_passes_explicit_radio_arguments(self) -> None:
-        config = load_split_mode_config(PROJECT_ROOT / "scenarios" / "split_mode" / "s1_basic_single_slice.yaml")
+        config = _load_split_mode_config_with_fixture(PROJECT_ROOT / "scenarios" / "split_mode" / "s1_basic_single_slice.yaml")
         rendered = render_split_run(PROJECT_ROOT, config, run_id="split-render-radio-args")
         try:
             ns3_run = next(item for item in rendered.manifest.commands if item.name == "ns3-run")
@@ -107,7 +114,7 @@ class SplitModeConfigTest(unittest.TestCase):
 
 class SplitModeGateTest(unittest.TestCase):
     def test_gate_activates_and_deactivates_sessions(self) -> None:
-        config = load_split_mode_config(PROJECT_ROOT / "scenarios" / "split_mode" / "s2_medium_complexity.yaml")
+        config = _load_split_mode_config_with_fixture(PROJECT_ROOT / "scenarios" / "split_mode" / "s2_medium_complexity.yaml")
         scenario = config.control_plane_scenario
         session_by_ref, supi_to_ue, psi_map = _build_state_maps(scenario)
         first_ue = scenario.ues[0]
@@ -153,7 +160,7 @@ class SplitModeGateTest(unittest.TestCase):
     def test_rewrites_enabled_column(self) -> None:
         temp_dir = Path(tempfile.mkdtemp(prefix="splitgate"))
         try:
-            config = load_split_mode_config(PROJECT_ROOT / "scenarios" / "split_mode" / "s2_medium_complexity.yaml")
+            config = _load_split_mode_config_with_fixture(PROJECT_ROOT / "scenarios" / "split_mode" / "s2_medium_complexity.yaml")
             rendered = render_split_run(PROJECT_ROOT, config, run_id="split-gate-test")
             session_by_ref, _, _ = _build_state_maps(config.control_plane_scenario)
             first_session = config.control_plane_scenario.ues[0].sessions[0].session_ref

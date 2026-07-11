@@ -34,6 +34,7 @@ class SplitRunManifest:
     core_services: list[str]
     ran_services: list[str]
     service_map: dict[str, dict[str, str]]
+    fast_reset: dict[str, object]
     commands: list[SplitCommandSpec]
 
     def to_dict(self) -> dict[str, object]:

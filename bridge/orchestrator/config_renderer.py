@@ -518,10 +518,8 @@ def _render_ulcl_smf_config(
         rendered_links.append({"A": left, "B": right})
 
     for gnb in scenario.gnbs:
-        add_link(
-            gnb_node_names[gnb.name],
-            upf_node_names[resolved_topology.gnb_to_upf[gnb.name]],
-        )
+        for upf_name in resolved_topology.gnb_to_upfs[gnb.name]:
+            add_link(gnb_node_names[gnb.name], upf_node_names[upf_name])
 
     for branch_node_name in branching_upf_node_names:
         for anchor_node_name in anchor_upf_node_names:
@@ -1061,6 +1059,7 @@ def _render_ns3_flow_profiles(scenario: ScenarioConfig, output_path: Path) -> No
         "slice_ref",
         "slice_snssai",
         "dnn",
+        "upf_ref",
         "service_type",
         "service_type_id",
         "five_qi",
@@ -1084,9 +1083,16 @@ def _render_ns3_flow_profiles(scenario: ScenarioConfig, output_path: Path) -> No
         "policy_filter",
         "precedence",
         "qos_ref",
+        "qfi",
+        "ue_ip",
+        "inner_protocol",
+        "ue_port",
+        "remote_port",
         "charging_method",
         "quota",
         "unit_cost",
+        "rlc_mode",
+        "virtual_expiry_ms",
     ]
     lines = ["\t".join(header)]
     for flow in scenario.flows:
@@ -1104,6 +1110,7 @@ def _render_ns3_flow_profiles(scenario: ScenarioConfig, output_path: Path) -> No
             flow.slice_ref,
             f"{slice_config.sst:02d}{slice_config.sd.lower()}",
             flow.dnn,
+            scenario.resolve_flow_upf(flow),
             flow.service_type,
             flow.service_type_id,
             flow.five_qi,
@@ -1127,9 +1134,16 @@ def _render_ns3_flow_profiles(scenario: ScenarioConfig, output_path: Path) -> No
             flow.policy_filter,
             flow.precedence,
             flow.qos_ref,
+            flow.qfi,
+            flow.ue_ip,
+            flow.inner_protocol,
+            flow.ue_port,
+            flow.remote_port,
             flow.charging_method,
             flow.quota,
             flow.unit_cost,
+            flow.rlc_mode,
+            flow.virtual_expiry_ms,
         ]
         lines.append("\t".join(_format_tsv_value(value) for value in values))
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1169,6 +1183,86 @@ def _render_ns3_slice_resources(scenario: ScenarioConfig, output_path: Path) -> 
         ]
         lines.append("\t".join(_format_tsv_value(value) for value in values))
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _render_user_plane_assets(
+    scenario: ScenarioConfig,
+    bridge_plans: list[Any],
+    generated_dir: Path,
+) -> tuple[Path, Path]:
+    if not bridge_plans:
+        raise ValueError("user-plane gate requires at least one bridge plan")
+    gate = scenario.bridge.user_plane_gate
+    bridge_plan_by_pair = {
+        (plan.gnb_name, plan.upf_name): plan for plan in bridge_plans
+    }
+    flow_rows = [
+        {
+            "flow_id": flow.flow_id,
+            "upf_ref": scenario.resolve_flow_upf(flow),
+            "gnb_ip": bridge_plan_by_pair[
+                (scenario.resolve_flow_gnb(flow), scenario.resolve_flow_upf(flow))
+            ].gnb_n3_ip,
+            "upf_ip": bridge_plan_by_pair[
+                (scenario.resolve_flow_gnb(flow), scenario.resolve_flow_upf(flow))
+            ].upf_n3_ip,
+            "ue_ip": flow.ue_ip,
+            "qfi": flow.qfi,
+            "inner_protocol": flow.inner_protocol,
+            "ue_port": flow.ue_port,
+            "remote_port": flow.remote_port,
+            "virtual_expiry_us": round(flow.virtual_expiry_ms * 1000.0),
+        }
+        for flow in scenario.flows
+    ]
+    link_rows = [
+        {
+            "link_id": f"n3-{plan.link_index}",
+            "gnb_name": plan.gnb_name,
+            "upf_name": plan.upf_name,
+            "gnb_tap": plan.gnb_tap,
+            "upf_tap": plan.upf_tap,
+            "gnb_ip": plan.gnb_n3_ip,
+            "upf_ip": plan.upf_n3_ip,
+        }
+        for plan in bridge_plans
+    ]
+    gate_payload = {
+        "links": link_rows,
+        "socket_path": gate.socket_path,
+        "authorization_socket": f"{gate.socket_path}.agents",
+        "max_pending_packets": gate.max_pending_packets,
+        "max_pending_bytes": gate.max_pending_bytes,
+        "event_log": str(generated_dir / scenario.ns3.output_subdir / "packet-events.jsonl"),
+        "kpi_log": str(generated_dir / scenario.ns3.output_subdir / "packet-kpis.jsonl"),
+        "flows": flow_rows,
+    }
+    bearer_payload = {
+        "rng_seed": scenario.seed,
+        "rng_run": scenario.ns3.rng_run,
+        "virtual_epoch_us": scenario.ns3.virtual_epoch_us,
+        "channel_update_ms": scenario.ns3.channel_update_ms,
+        "shadowing_enabled": scenario.ns3.shadowing_enabled,
+        "flows": [
+            {
+                **row,
+                "rlc_mode": flow.rlc_mode,
+                "five_qi": flow.five_qi,
+            }
+            for row, flow in zip(flow_rows, scenario.flows, strict=True)
+        ],
+    }
+    gate_file = generated_dir / "user-plane-gate.json"
+    bearer_file = generated_dir / "bearer-map.json"
+    gate_file.write_text(
+        json.dumps(gate_payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    bearer_file.write_text(
+        json.dumps(bearer_payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return gate_file, bearer_file
 
 
 def render_run_assets(
@@ -1218,6 +1312,12 @@ def render_run_assets(
     _render_ue_configs(scenario, config_dir, resolved_topology)
     _render_ns3_flow_profiles(scenario, flow_profile_file)
     _render_ns3_slice_resources(scenario, slice_resource_file)
+    user_plane_gate_file: Path | None = None
+    bearer_map_file: Path | None = None
+    if scenario.bridge.user_plane_gate.enabled:
+        user_plane_gate_file, bearer_map_file = _render_user_plane_assets(
+            scenario, bridge_plans, generated_dir
+        )
 
     compose_file = generated_dir / "free5gc-compose.generated.yaml"
     _yaml_dump(compose_file, compose_render.compose_payload)
@@ -1249,6 +1349,8 @@ def render_run_assets(
         clock_file=clock_file,
         flow_profile_file=flow_profile_file,
         slice_resource_file=slice_resource_file,
+        user_plane_gate_file=user_plane_gate_file,
+        bearer_map_file=bearer_map_file,
         state_db=state_db,
         archive_dir=archive_dir,
         service_map=compose_render.service_map,

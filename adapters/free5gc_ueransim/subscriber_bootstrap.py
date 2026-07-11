@@ -203,7 +203,7 @@ def _format_bandwidth_string(value_mbps: float | None) -> str | None:
 def _flow_qos_ref(flow: FlowConfig, fallback_index: int) -> int:
     if flow.qos_ref is not None:
         return flow.qos_ref
-    return fallback_index
+    return 0
 
 
 def _flow_precedence(flow: FlowConfig, fallback_index: int) -> int:

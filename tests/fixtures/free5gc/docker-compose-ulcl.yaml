@@ -1,0 +1,72 @@
+services:
+  free5gc-nrf:
+    image: free5gc/nrf:test
+    volumes:
+      - ./config/nrfcfg.yaml:/free5gc/config/nrfcfg.yaml
+    networks:
+      privnet: {}
+  free5gc-amf:
+    image: free5gc/amf:test
+    volumes:
+      - ./config/amfcfg.yaml:/free5gc/config/amfcfg.yaml
+    networks:
+      privnet: {}
+    depends_on:
+      - free5gc-nrf
+  free5gc-nssf:
+    image: free5gc/nssf:test
+    volumes:
+      - ./config/nssfcfg.yaml:/free5gc/config/nssfcfg.yaml
+    networks:
+      privnet: {}
+    depends_on:
+      - free5gc-nrf
+  free5gc-pcf:
+    image: free5gc/pcf:test
+    networks:
+      privnet: {}
+    depends_on:
+      - free5gc-nrf
+  free5gc-smf:
+    image: free5gc/smf:test
+    volumes:
+      - ./config/ULCL/smfcfg.yaml:/free5gc/config/smfcfg.yaml
+      - ./config/ULCL/uerouting.yaml:/free5gc/config/uerouting.yaml
+    networks:
+      privnet: {}
+    depends_on:
+      - free5gc-nrf
+      - free5gc-i-upf
+      - free5gc-psa-upf
+  free5gc-i-upf:
+    image: free5gc/upf:test
+    volumes:
+      - ./config/ULCL/upfcfg-i-upf.yaml:/free5gc/config/upfcfg.yaml
+    networks:
+      privnet: {}
+  free5gc-psa-upf:
+    image: free5gc/upf:test
+    volumes:
+      - ./config/ULCL/upfcfg-psa-upf.yaml:/free5gc/config/upfcfg.yaml
+    networks:
+      privnet: {}
+  free5gc-webui:
+    image: free5gc/webui:test
+    ports:
+      - "5000:5000"
+    networks:
+      privnet: {}
+  ueransim:
+    image: free5gc/ueransim:test
+    command: ./nr-gnb -c ./config/gnbcfg.yaml
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    networks:
+      privnet: {}
+    depends_on:
+      - free5gc-amf
+networks:
+  privnet:
+    driver: bridge

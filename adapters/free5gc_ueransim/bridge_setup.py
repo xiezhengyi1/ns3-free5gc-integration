@@ -46,24 +46,26 @@ def build_bridge_plan(
     plans: list[BridgeInterfacePlan] = []
     inspect_targets = inspect_targets or {}
     upf_segment_indices = {upf.name: index for index, upf in enumerate(scenario.upfs, start=1)}
-    for index, gnb in enumerate(scenario.gnbs, start=1):
-        target_upf = resolved_topology.gnb_to_upf[gnb.name]
-        gnb_service_name = service_map["gnb"][gnb.name]
-        upf_service_name = service_map["upf"][target_upf]
-        plans.append(
-            BridgeInterfacePlan(
-                link_index=index,
-                segment_index=upf_segment_indices[target_upf],
-                gnb_name=gnb.name,
-                gnb_service=inspect_targets.get(gnb_service_name, gnb_service_name),
-                upf_name=target_upf,
-                upf_service=inspect_targets.get(upf_service_name, upf_service_name),
-                gnb_tap=_short_ifname("tgnb", index),
-                upf_tap=_short_ifname("tupf", index),
-                gnb_n3_ip=n3_network_plan.gnb_ips[gnb.name],
-                upf_n3_ip=n3_network_plan.upf_ips[target_upf],
+    link_index = 0
+    for gnb_index, gnb in enumerate(scenario.gnbs, start=1):
+        for target_upf in resolved_topology.gnb_to_upfs[gnb.name]:
+            link_index += 1
+            gnb_service_name = service_map["gnb"][gnb.name]
+            upf_service_name = service_map["upf"][target_upf]
+            plans.append(
+                BridgeInterfacePlan(
+                    link_index=link_index,
+                    segment_index=upf_segment_indices[target_upf],
+                    gnb_name=gnb.name,
+                    gnb_service=inspect_targets.get(gnb_service_name, gnb_service_name),
+                    upf_name=target_upf,
+                    upf_service=inspect_targets.get(upf_service_name, upf_service_name),
+                    gnb_tap=_short_ifname("tgnb", gnb_index),
+                    upf_tap=_short_ifname("tupf", upf_segment_indices[target_upf]),
+                    gnb_n3_ip=n3_network_plan.gnb_ips[gnb.name],
+                    upf_n3_ip=n3_network_plan.upf_ips[target_upf],
+                )
             )
-        )
     return plans
 
 
@@ -169,44 +171,67 @@ def render_bridge_script(plans: list[BridgeInterfacePlan], output_path: Path) ->
             ]
         )
 
+    endpoints: list[tuple[str, int, str, str, str, str]] = []
+    seen_gnbs: set[str] = set()
+    seen_upfs: set[str] = set()
     for plan in plans:
+        if plan.gnb_name not in seen_gnbs:
+            endpoints.append(
+                (
+                    "gnb",
+                    len(seen_gnbs) + 1,
+                    plan.gnb_name,
+                    plan.gnb_service,
+                    plan.gnb_tap,
+                    plan.gnb_n3_ip,
+                )
+            )
+            seen_gnbs.add(plan.gnb_name)
+        if plan.upf_name not in seen_upfs:
+            endpoints.append(
+                (
+                    "upf",
+                    plan.segment_index,
+                    plan.upf_name,
+                    plan.upf_service,
+                    plan.upf_tap,
+                    plan.upf_n3_ip,
+                )
+            )
+            seen_upfs.add(plan.upf_name)
+
+    for role, endpoint_index, name, service, tap, n3_ip in endpoints:
+        pid_variable = f"{role}_pid_{endpoint_index}"
+        n3_if_variable = f"{role}_n3_if_{endpoint_index}"
+        host_if_variable = f"{role}_host_if_{endpoint_index}"
         lines.extend(
             [
-                f"gnb_pid_{plan.link_index}=$(wait_for_container_pid {plan.gnb_service})",
-                f"upf_pid_{plan.link_index}=$(wait_for_container_pid {plan.upf_service})",
-                f"gnb_n3_if_{plan.link_index}=$(resolve_ns_ifname_by_ipv4 $gnb_pid_{plan.link_index} {plan.gnb_n3_ip})",
-                f"upf_n3_if_{plan.link_index}=$(resolve_ns_ifname_by_ipv4 $upf_pid_{plan.link_index} {plan.upf_n3_ip})",
-                f"gnb_host_if_{plan.link_index}=$(resolve_host_peer_ifname $gnb_pid_{plan.link_index} \"$gnb_n3_if_{plan.link_index}\")",
-                f"upf_host_if_{plan.link_index}=$(resolve_host_peer_ifname $upf_pid_{plan.link_index} \"$upf_n3_if_{plan.link_index}\")",
-                f"delete_tc_qdisc \"$gnb_host_if_{plan.link_index}\"",
-                f"delete_tc_qdisc \"$upf_host_if_{plan.link_index}\"",
-                f"ip tuntap add mode tap {plan.gnb_tap}",
-                f"ip tuntap add mode tap {plan.upf_tap}",
-                f"set_promisc {plan.gnb_tap}",
-                f"set_promisc {plan.upf_tap}",
-                f"set_promisc \"$gnb_host_if_{plan.link_index}\"",
-                f"set_promisc \"$upf_host_if_{plan.link_index}\"",
-                f"disable_ipv6 {plan.gnb_tap}",
-                f"disable_ipv6 {plan.upf_tap}",
-                f"disable_ipv6 \"$gnb_host_if_{plan.link_index}\"",
-                f"disable_ipv6 \"$upf_host_if_{plan.link_index}\"",
-                f"disable_offload {plan.gnb_tap}",
-                f"disable_offload {plan.upf_tap}",
-                f"disable_offload \"$gnb_host_if_{plan.link_index}\"",
-                f"disable_offload \"$upf_host_if_{plan.link_index}\"",
-                f"ip link set \"$gnb_host_if_{plan.link_index}\" nomaster || true",
-                f"ip link set \"$upf_host_if_{plan.link_index}\" nomaster || true",
-                f"attach_redirect_pair \"$gnb_host_if_{plan.link_index}\" {plan.gnb_tap}",
-                f"attach_redirect_pair \"$upf_host_if_{plan.link_index}\" {plan.upf_tap}",
-                (
-                    f"echo 'bridge-inline link={plan.link_index} segment={plan.segment_index} "
-                    f"gnb={plan.gnb_name} gnb_ip={plan.gnb_n3_ip} upf={plan.upf_name} upf_ip={plan.upf_n3_ip}'"
-                ),
-                f"nsenter -t $gnb_pid_{plan.link_index} -n ip -4 addr show dev \"$gnb_n3_if_{plan.link_index}\"",
-                f"nsenter -t $upf_pid_{plan.link_index} -n ip -4 addr show dev \"$upf_n3_if_{plan.link_index}\"",
+                f"{pid_variable}=$(wait_for_container_pid {service})",
+                f"{n3_if_variable}=$(resolve_ns_ifname_by_ipv4 ${pid_variable} {n3_ip})",
+                f"{host_if_variable}=$(resolve_host_peer_ifname ${pid_variable} \"${n3_if_variable}\")",
+                f"delete_tc_qdisc \"${host_if_variable}\"",
+                f"ip tuntap add mode tap {tap}",
+                f"set_promisc {tap}",
+                f"set_promisc \"${host_if_variable}\"",
+                f"disable_ipv6 {tap}",
+                f"disable_ipv6 \"${host_if_variable}\"",
+                f"disable_offload {tap}",
+                f"disable_offload \"${host_if_variable}\"",
+                f"ip link set \"${host_if_variable}\" nomaster || true",
+                f"attach_redirect_pair \"${host_if_variable}\" {tap}",
+                f"echo 'bridge-inline endpoint={role} name={name} ip={n3_ip} tap={tap}'",
+                f"nsenter -t ${pid_variable} -n ip -4 addr show dev \"${n3_if_variable}\"",
                 "",
             ]
         )
+
+    for plan in plans:
+        lines.append(
+            f"echo 'bridge-inline link={plan.link_index} segment={plan.segment_index} "
+            f"gnb={plan.gnb_name} gnb_ip={plan.gnb_n3_ip} upf={plan.upf_name} upf_ip={plan.upf_n3_ip}'"
+        )
+    if plans:
+        lines.append("")
 
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     output_path.chmod(0o755)
