@@ -84,7 +84,8 @@ def run_manifest(manifest_path: Path, *, wait_background: bool = False) -> int:
                 start_new_session=True,
             )
             processes.append(process)
-            print(f"started {name} pid={process.pid} log={log_path}")
+            if not wait_background:
+                print(f"started {name} pid={process.pid} log={log_path}")
             if not command.get("background"):
                 rc = process.wait()
                 if rc != 0:

@@ -18,6 +18,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("scenario", help="split-mode scenario YAML")
     parser.add_argument("--run-id", help="explicit run identifier")
     parser.add_argument("--live-graph-snapshot-id", help="explicit live graph snapshot id for graph delta writes")
+    parser.add_argument(
+        "--wait-background",
+        dest="wait_background",
+        action="store_true",
+        help="wait for background commands before exiting without printing startup logs",
+    )
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     scenario_path = Path(args.scenario).expanduser().resolve()
     run_id = args.run_id
@@ -30,12 +36,13 @@ def main(argv: list[str] | None = None) -> int:
         run_id=run_id,
         live_graph_snapshot_id=args.live_graph_snapshot_id,
     )
-    print(f"run_id={rendered.run_id}")
-    print(f"manifest={rendered.manifest_path}")
-    print(f"run_dir={rendered.run_dir}")
-    if rendered.manifest.live_graph_snapshot_id:
-        print(f"live_graph_snapshot_id={rendered.manifest.live_graph_snapshot_id}")
-    return run_manifest(rendered.manifest_path)
+    if not args.wait_background:
+        print(f"run_id={rendered.run_id}")
+        print(f"manifest={rendered.manifest_path}")
+        print(f"run_dir={rendered.run_dir}")
+        if rendered.manifest.live_graph_snapshot_id:
+            print(f"live_graph_snapshot_id={rendered.manifest.live_graph_snapshot_id}")
+    return run_manifest(rendered.manifest_path, wait_background=bool(args.wait_background))
 
 
 if __name__ == "__main__":

@@ -25,6 +25,17 @@ python scripts/start_split_mode.py \
   --run-id demo
 ```
 
+需要持续等待后台组件、但不希望启动状态和日志输出到当前终端时，加上 `--wait-background`：
+
+```bash
+python scripts/start_split_mode.py \
+  scenarios/split_mode/s1_basic_single_slice.yaml \
+  --run-id demo \
+  --wait-background
+```
+
+组件日志仍会写入 `artifacts/runs/demo/logs/`。
+
 默认 ns-3 路径在基础场景的 `ns3.ns3_root` 中配置，也可以通过运行清单的 `NS3_ROOT` 环境覆盖。
 
 ## 场景结构
