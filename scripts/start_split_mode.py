@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from bridge.split_mode.config import load_split_mode_config
 from bridge.split_mode.renderer import render_split_run
-from bridge.split_mode.runner import run_manifest
+from bridge.split_mode.runner import run_fast_reset_server, run_manifest
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -42,7 +42,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"run_dir={rendered.run_dir}")
         if rendered.manifest.live_graph_snapshot_id:
             print(f"live_graph_snapshot_id={rendered.manifest.live_graph_snapshot_id}")
-    return run_manifest(rendered.manifest_path, wait_background=bool(args.wait_background))
+    if args.wait_background:
+        return run_fast_reset_server(rendered.manifest_path)
+    return run_manifest(rendered.manifest_path, wait_background=False)
 
 
 if __name__ == "__main__":

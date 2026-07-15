@@ -113,6 +113,33 @@ def run_manifest(manifest_path: Path, *, wait_background: bool = False) -> int:
             handle.close()
 
 
+def run_fast_reset_server(manifest_path: Path) -> int:
+    """Run the manifest-owned reset supervisor for a long-lived episode.
+
+    The supervisor, rather than this one-shot runner, owns the Compose and
+    runtime process lifecycles.  It performs the initial cold reset before
+    serving `/v1/reset`, so the advertised endpoint is live as soon as the
+    split-mode launcher reports readiness.
+    """
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    fast_reset = manifest.get("fast_reset") if isinstance(manifest, dict) else None
+    argv = fast_reset.get("serve_argv") if isinstance(fast_reset, dict) else None
+    if not isinstance(argv, list) or not argv or not all(str(item).strip() for item in argv):
+        raise ValueError("split-mode manifest does not define fast_reset.serve_argv")
+
+    env = os.environ.copy()
+    if _is_python_command([str(item) for item in argv]):
+        env["PYTHONUNBUFFERED"] = "1"
+    completed = subprocess.run(
+        [str(item) for item in argv],
+        cwd=str(manifest_path.parent),
+        env=env,
+        text=True,
+        check=False,
+    )
+    return int(completed.returncode)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Execute a split-mode manifest")
     parser.add_argument("manifest", help="path to run-manifest.split.json")
