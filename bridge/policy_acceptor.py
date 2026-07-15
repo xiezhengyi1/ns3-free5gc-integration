@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -171,305 +172,6 @@ class RequestsUpstreamPcfDispatcher:
             return f"{self.callback_base_url}/callbacks/{policy_scope}/{policy_id}"
         return f"http://127.0.0.1/callbacks/{policy_scope}/{policy_id}"
 
-
-@dataclass(slots=True)
-class PolicyRuntime:
-    flow_profile_file: Path
-    latest_snapshot_file: Path | None = None
-    state_file: Path | None = None
-    upstream_dispatcher: UpstreamPcfDispatcher | None = None
-    default_timeout_ms: int = 10000
-    poll_interval_ms: int = 200
-    _lock: threading.RLock = field(init=False, repr=False)
-    _execution_cache: dict[str, dict[str, Any]] = field(init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        self.flow_profile_file = Path(self.flow_profile_file).expanduser().resolve()
-        self.latest_snapshot_file = (
-            Path(self.latest_snapshot_file).expanduser().resolve()
-            if self.latest_snapshot_file is not None
-            else None
-        )
-        self.state_file = Path(self.state_file).expanduser().resolve() if self.state_file is not None else None
-        self._lock = threading.RLock()
-        self._execution_cache = self._load_state()
-
-    def execute_policy(self, raw_payload: dict[str, Any]) -> dict[str, Any]:
-        payload = _validate_execution_payload(raw_payload, default_timeout_ms=self.default_timeout_ms)
-        _emit_policy_event(
-            "accepted",
-            policy_id=payload["policy_id"],
-            policy_type=payload["policy_type"],
-            detail=f"request_id={payload['request_id']}",
-        )
-        try:
-            with self._lock:
-                rows, fieldnames = _read_flow_profiles(self.flow_profile_file)
-                if not rows:
-                    raise PolicyError("flow profile file is empty", status_code=409, phase="ns3_apply")
-                baseline_snapshot = self._load_latest_snapshot()
-                baseline_tick = int(baseline_snapshot.get("tick_index", -1)) if baseline_snapshot else -1
-                mutation = _build_mutation(payload, rows)
-                record = self._new_record(payload, mutation, baseline_tick)
-                self._execution_cache[payload["policy_id"]] = record
-                self._save_state()
-        except PolicyError as exc:
-            return _failure_response(payload, phase=exc.phase, error=str(exc), status_code=exc.status_code)
-
-        try:
-            _emit_policy_event(
-                "dispatching",
-                policy_id=payload["policy_id"],
-                policy_type=payload["policy_type"],
-                detail="sending policy to upstream PCF",
-            )
-            upstream_result = self._dispatch_upstream(payload)
-        except PolicyError as exc:
-            with self._lock:
-                failed = self._mark_failed(record, phase=exc.phase, error=str(exc), status_code=exc.status_code)
-                self._save_state()
-            _emit_policy_event(
-                "result",
-                policy_id=payload["policy_id"],
-                policy_type=payload["policy_type"],
-                detail=f"status=failed phase={failed['phase']} status_code={failed['status_code']}",
-            )
-            return _record_to_response(failed)
-        except Exception as exc:
-            with self._lock:
-                failed = self._mark_failed(record, phase="upstream_pcf", error=str(exc), status_code=502)
-                self._save_state()
-            _emit_policy_event(
-                "result",
-                policy_id=payload["policy_id"],
-                policy_type=payload["policy_type"],
-                detail=f"status=failed phase={failed['phase']} status_code={failed['status_code']}",
-            )
-            return _record_to_response(failed)
-
-        try:
-            with self._lock:
-                updated_rows = _apply_mutation(rows, mutation)
-                _write_flow_profiles(self.flow_profile_file, fieldnames, updated_rows)
-                record["upstream"] = upstream_result
-                record["mutation_summary"] = {
-                    "policy_scope": mutation["policy_scope"],
-                    "target_flow_ids": mutation["target_flow_ids"],
-                    "requested_state": mutation["requested_state"],
-                }
-                record["phase"] = "waiting_for_ns3"
-                self._execution_cache[payload["policy_id"]] = record
-                self._save_state()
-        except PolicyError as exc:
-            with self._lock:
-                failed = self._mark_failed(record, phase=exc.phase, error=str(exc), status_code=exc.status_code)
-                failed["upstream"] = upstream_result
-                self._save_state()
-            return _record_to_response(failed)
-
-        final_record = self._wait_for_ns3(record)
-        _emit_policy_event(
-            "result",
-            policy_id=payload["policy_id"],
-            policy_type=payload["policy_type"],
-            detail=(
-                f"status={final_record['status']} phase={final_record['phase']} "
-                f"status_code={final_record['status_code']}"
-            ),
-        )
-        with self._lock:
-            self._execution_cache[payload["policy_id"]] = final_record
-            self._save_state()
-        return _record_to_response(final_record)
-
-    def get_execution(self, policy_id: str) -> dict[str, Any]:
-        normalized_policy_id = str(policy_id or "").strip()
-        if not normalized_policy_id:
-            return _failure_response({}, phase="validation", error="policy_id is required", status_code=400)
-        with self._lock:
-            record = self._execution_cache.get(normalized_policy_id)
-        if record is None:
-            return _failure_response(
-                {"policy_id": normalized_policy_id},
-                phase="query",
-                error="policy_id not found",
-                status_code=404,
-            )
-        return _record_to_response(record)
-
-    def launch_healthcheck(self) -> dict[str, Any]:
-        flow_profile_exists = self.flow_profile_file.exists()
-        snapshot_exists = self.latest_snapshot_file.exists() if self.latest_snapshot_file is not None else True
-        upstream_ok = True
-        upstream_detail = "not configured"
-        if self.upstream_dispatcher is not None and hasattr(self.upstream_dispatcher, "healthcheck"):
-            upstream_ok, upstream_detail = self.upstream_dispatcher.healthcheck()
-        healthy = flow_profile_exists and snapshot_exists and upstream_ok
-        return {
-            "status": "ok" if healthy else "failed",
-            "healthy": healthy,
-            "flow_profile_exists": flow_profile_exists,
-            "latest_snapshot_exists": snapshot_exists,
-            "upstream_ok": upstream_ok,
-            "upstream_detail": upstream_detail,
-        }
-
-    def _dispatch_upstream(self, payload: dict[str, Any]) -> dict[str, Any]:
-        if self.upstream_dispatcher is None:
-            raise PolicyError("upstream dispatcher is not configured", status_code=500, phase="upstream_pcf")
-        return self.upstream_dispatcher.dispatch(payload)
-
-    def _wait_for_ns3(self, record: dict[str, Any]) -> dict[str, Any]:
-        deadline = time.time() + float(record["timeout_ms"]) / 1000.0
-        latest_snapshot: dict[str, Any] | None = None
-        saw_newer_snapshot = False
-        last_observation: dict[str, Any] | None = None
-        while time.time() < deadline:
-            try:
-                latest_snapshot = self._load_latest_snapshot()
-            except PolicyError as exc:
-                return self._mark_failed(record, phase=exc.phase, error=str(exc), status_code=exc.status_code)
-
-            if latest_snapshot is None:
-                time.sleep(self.poll_interval_ms / 1000.0)
-                continue
-
-            latest_tick = int(latest_snapshot.get("tick_index", -1))
-            if latest_tick <= int(record.get("baseline_tick", -1)):
-                time.sleep(self.poll_interval_ms / 1000.0)
-                continue
-
-            saw_newer_snapshot = True
-
-            execution_status, compliance_status, monitoring_data = _evaluate_record(record, latest_snapshot)
-            record["applied_tick"] = latest_tick
-            record["execution_status"] = execution_status
-            record["compliance_status"] = compliance_status
-            record["monitoring_data"] = _monitoring_payload(record, latest_snapshot, monitoring_data)
-            if execution_status == "APPLIED" and compliance_status == "COMPLIANT":
-                record["status"] = "success"
-                record["phase"] = "completed"
-                record["message"] = "Policy dispatched to the upstream PCF and applied by ns-3."
-                record["status_code"] = 201
-                return record
-
-            last_observation = {
-                "execution_status": execution_status,
-                "compliance_status": compliance_status,
-                "monitoring_data": dict(record.get("monitoring_data") or {}),
-                "phase": "ns3_compliance"
-                if execution_status == "APPLIED" and compliance_status == "VIOLATED"
-                else "ns3_execution",
-                "phase": "ns3_compliance"
-                if execution_status == "APPLIED" and compliance_status == "VIOLATED"
-                else "ns3_execution",
-            }
-            time.sleep(self.poll_interval_ms / 1000.0)
-
-        if saw_newer_snapshot and last_observation is not None:
-            record["execution_status"] = str(last_observation.get("execution_status") or "FAILED")
-            record["compliance_status"] = str(last_observation.get("compliance_status") or "VIOLATED")
-            record["monitoring_data"] = dict(last_observation.get("monitoring_data") or {})
-            return self._mark_failed(
-                record,
-                phase=str(last_observation.get("phase") or "ns3_apply"),
-                error="ns-3 observed state did not converge to the requested policy before timeout",
-                status_code=409,
-            )
-
-        latest_tick = int(latest_snapshot.get("tick_index", -1)) if isinstance(latest_snapshot, dict) else None
-        record["monitoring_data"] = _monitoring_payload(record, latest_snapshot, {"latest_tick": latest_tick})
-        return self._mark_failed(
-            record,
-            phase="ns3_apply_timeout",
-            error=f"ns-3 did not apply the policy within {record['timeout_ms']} ms",
-            status_code=504,
-        )
-
-    def _new_record(self, payload: dict[str, Any], mutation: dict[str, Any], baseline_tick: int) -> dict[str, Any]:
-        return {
-            "status": "pending",
-            "status_code": 202,
-            "phase": "validated",
-            "request_id": payload["request_id"],
-            "session_id": payload["session_id"],
-            "snapshot_id": payload["snapshot_id"],
-            "policy_id": payload["policy_id"],
-            "policy_type": payload["policy_type"],
-            "target_type": payload["target_type"],
-            "flow_id": payload.get("flow_id", ""),
-            "supi": payload.get("supi", ""),
-            "timeout_ms": payload["timeout_ms"],
-            "policy_details": payload["policy_details"],
-            "baseline_tick": baseline_tick,
-            "applied_tick": None,
-            "execution_status": "PENDING",
-            "compliance_status": "PENDING",
-            "monitoring_data": {"baseline_tick": baseline_tick},
-            "error": "",
-            "mutation": mutation,
-            "mutation_summary": {},
-            "upstream": {},
-            "message": "Policy execution is pending.",
-            "updated_at": time.time(),
-        }
-
-    def _mark_failed(
-        self,
-        record: dict[str, Any],
-        *,
-        phase: str,
-        error: str,
-        status_code: int,
-    ) -> dict[str, Any]:
-        record["status"] = "failed"
-        record["status_code"] = status_code
-        record["phase"] = phase
-        record["error"] = str(error or "").strip() or "policy execution failed"
-        record["message"] = record["error"]
-        record["updated_at"] = time.time()
-        if record.get("execution_status") == "PENDING" and phase != "upstream_pcf":
-            record["execution_status"] = "FAILED"
-        if record.get("compliance_status") == "PENDING" and phase.startswith("ns3"):
-            record["compliance_status"] = "VIOLATED"
-        return record
-
-    def _load_latest_snapshot(self) -> dict[str, Any] | None:
-        if self.latest_snapshot_file is None or not self.latest_snapshot_file.exists():
-            return None
-        try:
-            payload = json.loads(self.latest_snapshot_file.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise PolicyError(f"latest snapshot is not valid JSON: {exc}", status_code=500, phase="snapshot") from exc
-        if not isinstance(payload, dict):
-            raise PolicyError("latest snapshot payload must be a JSON object", status_code=500, phase="snapshot")
-        return payload
-
-    def _load_state(self) -> dict[str, dict[str, Any]]:
-        if self.state_file is None or not self.state_file.exists():
-            return {}
-        try:
-            payload = json.loads(self.state_file.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            return {}
-        if not isinstance(payload, dict):
-            return {}
-        executions = payload.get("executions")
-        if not isinstance(executions, dict):
-            return {}
-        return {str(key): value for key, value in executions.items() if isinstance(value, dict)}
-
-    def _save_state(self) -> None:
-        if self.state_file is None:
-            return
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "updated_at": time.time(),
-            "flow_profile_file": str(self.flow_profile_file),
-            "latest_snapshot_file": str(self.latest_snapshot_file) if self.latest_snapshot_file is not None else "",
-            "executions": self._execution_cache,
-        }
-        _atomic_write_json(self.state_file, payload)
 
 
 def _coerce_non_empty(value: Any, field_name: str) -> str:
@@ -807,12 +509,12 @@ def _build_am_mutation(payload: dict[str, Any], rows: list[dict[str, str]]) -> d
     supi = _coerce_non_empty(request.get("supi"), "request.supi")
     candidate_snssais = [
         _normalize_snssai(item)
-        for item in (request.get("allowedSnssais") or [])
+        for item in (request.get("targetSnssais") or [])
         if _normalize_snssai(item)
     ]
     candidate_snssais.extend(
         _normalize_snssai(item)
-        for item in (request.get("targetSnssais") or [])
+        for item in (request.get("allowedSnssais") or [])
         if _normalize_snssai(item)
     )
     target_snssai = next((item for item in candidate_snssais if item), "")
@@ -1088,6 +790,7 @@ def _record_to_response(record: dict[str, Any]) -> dict[str, Any]:
         "status": record.get("status", "failed"),
         "status_code": int(record.get("status_code", 500) or 500),
         "phase": record.get("phase", ""),
+        "operation_id": record.get("operation_id", ""),
         "request_id": record.get("request_id", ""),
         "session_id": record.get("session_id", ""),
         "snapshot_id": record.get("snapshot_id", ""),
@@ -1104,6 +807,411 @@ def _record_to_response(record: dict[str, Any]) -> dict[str, Any]:
         "message": record.get("message", ""),
         "error": record.get("error", ""),
     }
+
+
+def _operation_id(session_id: str, policy_id: str) -> str:
+    identity = f"{str(session_id or '').strip()}\x00{str(policy_id or '').strip()}"
+    return f"op-{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:32]}"
+
+
+@dataclass(slots=True)
+class PolicyRuntime:
+    flow_profile_file: Path
+    latest_snapshot_file: Path | None = None
+    state_file: Path | None = None
+    upstream_dispatcher: UpstreamPcfDispatcher | None = None
+    default_timeout_ms: int = 10000
+    poll_interval_ms: int = 200
+    _lock: threading.RLock = field(init=False, repr=False)
+    _execution_cache: dict[str, dict[str, Any]] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.flow_profile_file = Path(self.flow_profile_file).expanduser().resolve()
+        self.latest_snapshot_file = (
+            Path(self.latest_snapshot_file).expanduser().resolve()
+            if self.latest_snapshot_file is not None
+            else None
+        )
+        self.state_file = Path(self.state_file).expanduser().resolve() if self.state_file is not None else None
+        self._lock = threading.RLock()
+        self._execution_cache = self._load_state()
+        self._resume_pending_executions()
+
+    def execute_policy(self, raw_payload: dict[str, Any]) -> dict[str, Any]:
+        payload = _validate_execution_payload(raw_payload, default_timeout_ms=self.default_timeout_ms)
+        operation_id = _operation_id(payload["session_id"], payload["policy_id"])
+        _emit_policy_event(
+            "accepted",
+            policy_id=payload["policy_id"],
+            policy_type=payload["policy_type"],
+            detail=f"request_id={payload['request_id']} operation_id={operation_id}",
+        )
+        try:
+            with self._lock:
+                existing_record = self._execution_cache.get(operation_id)
+                if existing_record is not None:
+                    return _record_to_response(existing_record)
+                rows, _ = _read_flow_profiles(self.flow_profile_file)
+                if not rows:
+                    raise PolicyError("flow profile file is empty", status_code=409, phase="ns3_apply")
+                baseline_snapshot = self._load_latest_snapshot()
+                baseline_tick = int(baseline_snapshot.get("tick_index", -1)) if baseline_snapshot else -1
+                mutation = _build_mutation(payload, rows)
+                record = self._new_record(payload, mutation, baseline_tick, operation_id)
+                self._execution_cache[operation_id] = record
+                self._save_state()
+        except PolicyError as exc:
+            return _failure_response(payload, phase=exc.phase, error=str(exc), status_code=exc.status_code)
+
+        self._start_execution_worker(operation_id, payload, mutation)
+        return _record_to_response(record)
+
+    def get_execution(self, execution_id: str) -> dict[str, Any]:
+        normalized_execution_id = str(execution_id or "").strip()
+        if not normalized_execution_id:
+            return _failure_response({}, phase="validation", error="operation_id is required", status_code=400)
+        with self._lock:
+            record = self._execution_cache.get(normalized_execution_id)
+            if record is None:
+                matches = [
+                    candidate
+                    for candidate in self._execution_cache.values()
+                    if _coerce_optional(candidate.get("policy_id")) == normalized_execution_id
+                ]
+                if len(matches) == 1:
+                    record = matches[0]
+                elif len(matches) > 1:
+                    return _failure_response(
+                        {"policy_id": normalized_execution_id},
+                        phase="query",
+                        error="policy_id is ambiguous; query with operation_id",
+                        status_code=409,
+                    )
+            if record is None:
+                return _failure_response(
+                    {"policy_id": normalized_execution_id},
+                    phase="query",
+                    error="operation_id not found",
+                    status_code=404,
+                )
+            self._refresh_pending_execution(record)
+            return _record_to_response(record)
+
+    def launch_healthcheck(self) -> dict[str, Any]:
+        flow_profile_exists = self.flow_profile_file.exists()
+        snapshot_exists = self.latest_snapshot_file.exists() if self.latest_snapshot_file is not None else True
+        upstream_ok = True
+        upstream_detail = "not configured"
+        if self.upstream_dispatcher is not None and hasattr(self.upstream_dispatcher, "healthcheck"):
+            upstream_ok, upstream_detail = self.upstream_dispatcher.healthcheck()
+        healthy = flow_profile_exists and snapshot_exists and upstream_ok
+        return {
+            "status": "ok" if healthy else "failed",
+            "healthy": healthy,
+            "flow_profile_exists": flow_profile_exists,
+            "latest_snapshot_exists": snapshot_exists,
+            "upstream_ok": upstream_ok,
+            "upstream_detail": upstream_detail,
+        }
+
+    def _start_execution_worker(
+        self,
+        operation_id: str,
+        payload: dict[str, Any],
+        mutation: dict[str, Any],
+    ) -> None:
+        worker = threading.Thread(
+            target=self._run_execution_worker,
+            args=(operation_id, payload, mutation),
+            name=f"policy-execution-{operation_id[-12:]}",
+            daemon=True,
+        )
+        worker.start()
+
+    def _resume_pending_executions(self) -> None:
+        for operation_id, record in list(self._execution_cache.items()):
+            if record.get("status") != "pending" or record.get("phase") == "waiting_for_ns3":
+                continue
+            mutation = record.get("mutation")
+            if not isinstance(mutation, dict):
+                continue
+            payload = {
+                "request_id": record.get("request_id", ""),
+                "session_id": record.get("session_id", ""),
+                "snapshot_id": record.get("snapshot_id", ""),
+                "policy_id": record.get("policy_id", ""),
+                "policy_type": record.get("policy_type", ""),
+                "policy_details": record.get("policy_details", {}),
+                "target_type": record.get("target_type", ""),
+                "flow_id": record.get("flow_id", ""),
+                "supi": record.get("supi", ""),
+                "timeout_ms": record.get("timeout_ms", self.default_timeout_ms),
+            }
+            self._start_execution_worker(operation_id, payload, mutation)
+
+    def _run_execution_worker(
+        self,
+        operation_id: str,
+        payload: dict[str, Any],
+        mutation: dict[str, Any],
+    ) -> None:
+        try:
+            with self._lock:
+                record = self._execution_cache.get(operation_id)
+                if record is None or record.get("status") != "pending":
+                    return
+                upstream_result = record.get("upstream") if isinstance(record.get("upstream"), dict) else {}
+                if not upstream_result:
+                    record["phase"] = "dispatching"
+                    record["updated_at"] = time.time()
+                    self._save_state()
+            if not upstream_result:
+                _emit_policy_event(
+                    "dispatching",
+                    policy_id=payload["policy_id"],
+                    policy_type=payload["policy_type"],
+                    detail="sending policy to upstream PCF",
+                )
+                upstream_result = self._dispatch_upstream(payload)
+        except PolicyError as exc:
+            self._fail_operation(operation_id, payload, exc.phase, str(exc), exc.status_code)
+            return
+        except Exception as exc:
+            self._fail_operation(operation_id, payload, "upstream_pcf", str(exc), 502)
+            return
+
+        try:
+            with self._lock:
+                record = self._execution_cache.get(operation_id)
+                if record is None or record.get("status") != "pending":
+                    return
+                rows, fieldnames = _read_flow_profiles(self.flow_profile_file)
+                _write_flow_profiles(self.flow_profile_file, fieldnames, _apply_mutation(rows, mutation))
+                record["upstream"] = upstream_result
+                record["mutation_summary"] = {
+                    "policy_scope": mutation["policy_scope"],
+                    "target_flow_ids": mutation["target_flow_ids"],
+                    "requested_state": mutation["requested_state"],
+                }
+                record["phase"] = "waiting_for_ns3"
+                record["updated_at"] = time.time()
+                self._save_state()
+        except PolicyError as exc:
+            self._fail_operation(operation_id, payload, exc.phase, str(exc), exc.status_code, upstream_result)
+            return
+
+        final_record = self._wait_for_ns3(operation_id)
+        _emit_policy_event(
+            "result",
+            policy_id=payload["policy_id"],
+            policy_type=payload["policy_type"],
+            detail=(
+                f"status={final_record['status']} phase={final_record['phase']} "
+                f"status_code={final_record['status_code']}"
+            ),
+        )
+
+    def _fail_operation(
+        self,
+        operation_id: str,
+        payload: dict[str, Any],
+        phase: str,
+        error: str,
+        status_code: int,
+        upstream_result: dict[str, Any] | None = None,
+    ) -> None:
+        with self._lock:
+            record = self._execution_cache.get(operation_id)
+            if record is None:
+                return
+            if upstream_result is not None:
+                record["upstream"] = upstream_result
+            failed = self._mark_failed(record, phase=phase, error=error, status_code=status_code)
+            self._save_state()
+        _emit_policy_event(
+            "result",
+            policy_id=payload["policy_id"],
+            policy_type=payload["policy_type"],
+            detail=f"status=failed phase={failed['phase']} status_code={failed['status_code']}",
+        )
+
+    def _dispatch_upstream(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.upstream_dispatcher is None:
+            raise PolicyError("upstream dispatcher is not configured", status_code=500, phase="upstream_pcf")
+        return self.upstream_dispatcher.dispatch(payload)
+
+    def _wait_for_ns3(self, operation_id: str) -> dict[str, Any]:
+        deadline = time.monotonic() + float(self.default_timeout_ms) / 1000.0
+        with self._lock:
+            record = self._execution_cache[operation_id]
+            deadline = time.monotonic() + float(record["timeout_ms"]) / 1000.0
+        while time.monotonic() < deadline:
+            with self._lock:
+                record = self._execution_cache.get(operation_id)
+                if record is None or record.get("status") != "pending":
+                    return record or {"status": "failed", "status_code": 500, "phase": "query"}
+                self._refresh_pending_execution(record)
+                if record.get("status") != "pending":
+                    return record
+            time.sleep(self.poll_interval_ms / 1000.0)
+
+        with self._lock:
+            record = self._execution_cache.get(operation_id)
+            if record is None:
+                return {"status": "failed", "status_code": 500, "phase": "query"}
+            if record.get("status") == "pending":
+                record["phase"] = "waiting_for_ns3"
+                record["status_code"] = 202
+                record["message"] = "ns-3 has not converged yet; continue polling with operation_id."
+                record["error"] = ""
+                record["updated_at"] = time.time()
+                self._save_state()
+            return record
+
+    def _refresh_pending_execution(self, record: dict[str, Any]) -> None:
+        if record.get("status") != "pending" or record.get("phase") != "waiting_for_ns3":
+            return
+        try:
+            latest_snapshot = self._load_latest_snapshot()
+        except PolicyError as exc:
+            self._mark_failed(record, phase=exc.phase, error=str(exc), status_code=exc.status_code)
+            self._save_state()
+            return
+        if latest_snapshot is None:
+            return
+        latest_tick = int(latest_snapshot.get("tick_index", -1))
+        if latest_tick <= int(record.get("baseline_tick", -1)):
+            return
+        execution_status, compliance_status, monitoring_data = _evaluate_record(record, latest_snapshot)
+        record["applied_tick"] = latest_tick
+        record["execution_status"] = execution_status
+        record["compliance_status"] = compliance_status
+        record["monitoring_data"] = _monitoring_payload(record, latest_snapshot, monitoring_data)
+        if execution_status == "APPLIED" and compliance_status == "COMPLIANT":
+            self._mark_applied(record)
+        elif execution_status == "APPLIED" and compliance_status == "VIOLATED":
+            self._mark_failed(
+                record,
+                phase="ns3_compliance",
+                error="ns-3 applied the policy but QoS compliance was violated",
+                status_code=409,
+            )
+        else:
+            record["updated_at"] = time.time()
+        self._save_state()
+
+    def _new_record(
+        self,
+        payload: dict[str, Any],
+        mutation: dict[str, Any],
+        baseline_tick: int,
+        operation_id: str,
+    ) -> dict[str, Any]:
+        return {
+            "status": "pending",
+            "status_code": 202,
+            "phase": "pending",
+            "operation_id": operation_id,
+            "request_id": payload["request_id"],
+            "session_id": payload["session_id"],
+            "snapshot_id": payload["snapshot_id"],
+            "policy_id": payload["policy_id"],
+            "policy_type": payload["policy_type"],
+            "target_type": payload["target_type"],
+            "flow_id": payload.get("flow_id", ""),
+            "supi": payload.get("supi", ""),
+            "timeout_ms": payload["timeout_ms"],
+            "policy_details": payload["policy_details"],
+            "baseline_tick": baseline_tick,
+            "applied_tick": None,
+            "execution_status": "PENDING",
+            "compliance_status": "PENDING",
+            "monitoring_data": {"baseline_tick": baseline_tick},
+            "error": "",
+            "mutation": mutation,
+            "mutation_summary": {},
+            "upstream": {},
+            "message": "Policy execution is pending.",
+            "updated_at": time.time(),
+        }
+
+    def _mark_applied(self, record: dict[str, Any]) -> None:
+        record["status"] = "applied"
+        record["status_code"] = 201
+        record["phase"] = "completed"
+        record["message"] = "Policy dispatched to the upstream PCF and applied by ns-3."
+        record["error"] = ""
+        record["updated_at"] = time.time()
+
+    def _mark_failed(
+        self,
+        record: dict[str, Any],
+        *,
+        phase: str,
+        error: str,
+        status_code: int,
+    ) -> dict[str, Any]:
+        record["status"] = "failed"
+        record["status_code"] = status_code
+        record["phase"] = phase
+        record["error"] = str(error or "").strip() or "policy execution failed"
+        record["message"] = record["error"]
+        record["updated_at"] = time.time()
+        if record.get("execution_status") == "PENDING" and phase != "upstream_pcf":
+            record["execution_status"] = "FAILED"
+        if record.get("compliance_status") == "PENDING" and phase.startswith("ns3"):
+            record["compliance_status"] = "VIOLATED"
+        return record
+
+    def _load_latest_snapshot(self) -> dict[str, Any] | None:
+        if self.latest_snapshot_file is None or not self.latest_snapshot_file.exists():
+            return None
+        try:
+            payload = json.loads(self.latest_snapshot_file.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise PolicyError(f"latest snapshot is not valid JSON: {exc}", status_code=500, phase="snapshot") from exc
+        if not isinstance(payload, dict):
+            raise PolicyError("latest snapshot payload must be a JSON object", status_code=500, phase="snapshot")
+        return payload
+
+    def _load_state(self) -> dict[str, dict[str, Any]]:
+        if self.state_file is None or not self.state_file.exists():
+            return {}
+        try:
+            payload = json.loads(self.state_file.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {}
+        executions = payload.get("executions") if isinstance(payload, dict) else None
+        if not isinstance(executions, dict):
+            return {}
+        records: dict[str, dict[str, Any]] = {}
+        for record in executions.values():
+            if not isinstance(record, dict):
+                continue
+            loaded_record = dict(record)
+            operation_id = _coerce_optional(loaded_record.get("operation_id")) or _operation_id(
+                _coerce_optional(loaded_record.get("session_id")),
+                _coerce_optional(loaded_record.get("policy_id")),
+            )
+            loaded_record["operation_id"] = operation_id
+            if loaded_record.get("status") == "success":
+                loaded_record["status"] = "applied"
+            records[operation_id] = loaded_record
+        return records
+
+    def _save_state(self) -> None:
+        if self.state_file is None:
+            return
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(
+            self.state_file,
+            {
+                "updated_at": time.time(),
+                "flow_profile_file": str(self.flow_profile_file),
+                "latest_snapshot_file": str(self.latest_snapshot_file) if self.latest_snapshot_file is not None else "",
+                "executions": self._execution_cache,
+            },
+        )
 
 
 class PolicyAcceptorHandler(BaseHTTPRequestHandler):

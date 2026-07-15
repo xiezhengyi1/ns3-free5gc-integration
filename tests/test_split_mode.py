@@ -135,6 +135,10 @@ class SplitModeConfigTest(unittest.TestCase):
                     self.assertLess(names.index("wait-for-pfcp-ready"), names.index("compose-up-ue"))
                     compose_up_ue = next(item for item in manifest["commands"] if item["name"] == "compose-up-ue")
                     self.assertIn("bridge.split_mode.ue_startup", compose_up_ue["argv"])
+                    rendered_config = load_split_mode_config(
+                        rendered.generated_dir / "split-mode" / "split-mode.yaml"
+                    )
+                    self.assertEqual(rendered_config.radio.tdd_pattern, config.radio.tdd_pattern)
                 finally:
                     shutil.rmtree(rendered.run_dir, ignore_errors=True)
 

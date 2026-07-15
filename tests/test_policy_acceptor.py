@@ -4,6 +4,7 @@ import csv
 import json
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -144,6 +145,16 @@ class PolicyGatewayTest(unittest.TestCase):
         timer.daemon = True
         timer.start()
 
+    def _wait_for_terminal(self, runtime: PolicyRuntime, response: dict[str, object]) -> dict[str, object]:
+        deadline = time.monotonic() + 1.0
+        latest = dict(response)
+        while time.monotonic() < deadline:
+            latest = runtime.get_execution(str(response["operation_id"]))
+            if latest["status"] in {"applied", "failed"}:
+                return latest
+            time.sleep(0.01)
+        return latest
+
     def test_sm_policy_dispatches_and_waits_for_ns3_success(self) -> None:
         _write_profiles(
             self.flow_profile_file,
@@ -208,7 +219,10 @@ class PolicyGatewayTest(unittest.TestCase):
             }
         )
 
-        self.assertEqual(response["status"], "success")
+        self.assertEqual(response["status"], "pending")
+        self.assertTrue(response["operation_id"])
+        response = self._wait_for_terminal(runtime, response)
+        self.assertEqual(response["status"], "applied")
         self.assertEqual(response["execution_status"], "APPLIED")
         self.assertEqual(response["compliance_status"], "COMPLIANT")
         self.assertEqual(response["baseline_tick"], 3)
@@ -221,8 +235,8 @@ class PolicyGatewayTest(unittest.TestCase):
         self.assertEqual(rows[0]["policy_filter"], "video-priority")
         self.assertEqual(rows[0]["qos_ref"], "0")
 
-        status = runtime.get_execution("smp-app-1-flow-1")
-        self.assertEqual(status["status"], "success")
+        status = runtime.get_execution(str(response["operation_id"]))
+        self.assertEqual(status["status"], "applied")
         self.assertEqual(status["monitoring_data"]["latest_tick"], 4)
 
     def test_clear_port_binding_terminates_existing_listener(self) -> None:
@@ -237,6 +251,38 @@ class PolicyGatewayTest(unittest.TestCase):
             _clear_port_binding("0.0.0.0", 18080, grace_period_sec=0.0)
 
         self.assertEqual(signals, [(1001, 15), (1001, 9)])
+
+    def test_operation_id_is_idempotent_per_session_and_policy(self) -> None:
+        _write_profiles(
+            self.flow_profile_file,
+            [_base_row(flow_id="flow-1", supi="imsi-208930000000001", slice_ref="slice-1-000001", slice_snssai="01000001")],
+        )
+        self._write_snapshot({"run_id": "run-idempotency", "tick_index": 1, "flows": [], "ues": [], "slices": []})
+        dispatcher = StubDispatcher()
+        runtime = self._build_runtime(dispatcher)
+        payload = {
+            "request_id": "req-idempotency-1",
+            "session_id": "session-idempotency-1",
+            "snapshot_id": "snapshot-idempotency",
+            "policy_id": "smp-idempotency",
+            "policy_type": "SmPolicyDecision",
+            "timeout_ms": 1,
+            "policy_details": {
+                "policy_id": "smp-idempotency",
+                "target_type": "flow",
+                "flow_id": "flow-1",
+                "qosDecs": {"qos-flow-1": {"qosId": "qos-flow-1", "maxbrDl": "20", "maxbrUl": "10"}},
+            },
+        }
+
+        initial = runtime.execute_policy(payload)
+        replay = runtime.execute_policy(payload)
+        different_session = runtime.execute_policy({**payload, "request_id": "req-idempotency-2", "session_id": "session-idempotency-2"})
+
+        self.assertEqual(initial["operation_id"], replay["operation_id"])
+        self.assertNotEqual(initial["operation_id"], different_session["operation_id"])
+        threading.Event().wait(0.1)
+        self.assertEqual(len(dispatcher.calls), 2)
 
     def test_am_policy_dispatches_and_waits_for_ns3_success(self) -> None:
         _write_profiles(
@@ -270,13 +316,16 @@ class PolicyGatewayTest(unittest.TestCase):
                     "policy_id": "amp-imsi-208930000000009",
                     "request": {
                         "supi": "imsi-208930000000009",
-                        "allowedSnssais": [{"sst": 2, "sd": "000001"}],
+                        "allowedSnssais": [{"sst": 1, "sd": "000001"}],
+                        "targetSnssais": [{"sst": 2, "sd": "000001"}],
                     },
                 },
             }
         )
 
-        self.assertEqual(response["status"], "success")
+        self.assertEqual(response["status"], "pending")
+        response = self._wait_for_terminal(runtime, response)
+        self.assertEqual(response["status"], "applied")
         self.assertEqual(response["execution_status"], "APPLIED")
         self.assertEqual(response["compliance_status"], "COMPLIANT")
         self.assertEqual(response["monitoring_data"]["observed_supi"], "imsi-208930000000009")
@@ -331,6 +380,7 @@ class PolicyGatewayTest(unittest.TestCase):
             }
         )
 
+        response = self._wait_for_terminal(runtime, response)
         self.assertEqual(response["status"], "failed")
         self.assertEqual(response["phase"], "upstream_pcf")
         self.assertEqual(response["execution_status"], "PENDING")
@@ -368,6 +418,7 @@ class PolicyGatewayTest(unittest.TestCase):
             }
         )
 
+        response = self._wait_for_terminal(runtime, response)
         self.assertEqual(response["status"], "failed")
         self.assertEqual(response["phase"], "upstream_pcf")
         self.assertEqual(len(dispatcher.calls), 1)
@@ -400,7 +451,7 @@ class PolicyGatewayTest(unittest.TestCase):
 
         self.assertIn("upstreamSmPolicyContextData", str(raised.exception))
 
-    def test_timeout_returns_failed(self) -> None:
+    def test_timeout_remains_pending_and_queryable(self) -> None:
         _write_profiles(
             self.flow_profile_file,
             [_base_row(flow_id="flow-1", supi="imsi-208930000000001", slice_ref="slice-1-000001", slice_snssai="01000001")],
@@ -425,11 +476,15 @@ class PolicyGatewayTest(unittest.TestCase):
             }
         )
 
-        self.assertEqual(response["status"], "failed")
-        self.assertEqual(response["phase"], "ns3_apply_timeout")
-        self.assertIn("did not apply", response["error"])
+        self.assertEqual(response["status"], "pending")
+        threading.Event().wait(0.2)
+        response = runtime.get_execution(str(response["operation_id"]))
+        self.assertEqual(response["status"], "pending")
+        self.assertEqual(response["phase"], "waiting_for_ns3")
+        self.assertEqual(response["status_code"], 202)
+        self.assertEqual(response["error"], "")
 
-    def test_failed_snapshot_observation_returns_failed(self) -> None:
+    def test_nonconverged_snapshot_remains_pending(self) -> None:
         _write_profiles(
             self.flow_profile_file,
             [_base_row(flow_id="flow-1", supi="imsi-208930000000001", slice_ref="slice-1-000001", slice_snssai="01000001")],
@@ -473,11 +528,13 @@ class PolicyGatewayTest(unittest.TestCase):
             }
         )
 
-        self.assertEqual(response["status"], "failed")
-        self.assertEqual(response["phase"], "ns3_execution")
+        threading.Event().wait(0.2)
+        response = runtime.get_execution(str(response["operation_id"]))
+        self.assertEqual(response["status"], "pending")
+        self.assertEqual(response["phase"], "waiting_for_ns3")
         self.assertEqual(response["execution_status"], "FAILED")
         self.assertEqual(response["compliance_status"], "VIOLATED")
-        self.assertIn("did not converge", response["error"])
+        self.assertEqual(response["error"], "")
 
     def test_applied_but_qos_violated_is_reported_separately(self) -> None:
         _write_profiles(
@@ -543,6 +600,7 @@ class PolicyGatewayTest(unittest.TestCase):
             }
         )
 
+        response = self._wait_for_terminal(runtime, response)
         self.assertEqual(response["status"], "failed")
         self.assertEqual(response["phase"], "ns3_compliance")
         self.assertEqual(response["execution_status"], "APPLIED")

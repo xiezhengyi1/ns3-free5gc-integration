@@ -663,7 +663,6 @@ def render_split_run(
                 "radio": {
                     "scheduler_type": config.radio.scheduler_type,
                     "tdd_pattern": config.radio.tdd_pattern,
-                    "resolved_tdd_pattern": config.radio.resolved_tdd_pattern(),
                     "gnb_tx_power_dbm": config.radio.gnb_tx_power_dbm,
                     "ue_tx_power_dbm": config.radio.ue_tx_power_dbm,
                     "enable_uplink_power_control": config.radio.enable_uplink_power_control,
