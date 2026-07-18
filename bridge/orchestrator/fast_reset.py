@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, dataclass
+import hashlib
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -34,6 +35,7 @@ _BASELINE_RESTORE_COMMANDS = (
     "bootstrap-app-data",
 )
 _RUNTIME_ORDER = (
+    "writer-owner",
     "writer-follow-free5gc",
     "writer-follow-ueransim",
     "writer-follow-split-ns3",
@@ -43,7 +45,7 @@ _RUNTIME_ORDER = (
     "ns3-run",
 )
 _EARLY_RUNTIME_START_AFTER = {
-    "compose-up-smf": ("writer-follow-free5gc",),
+    "compose-up-smf": ("writer-owner", "writer-follow-free5gc"),
 }
 
 
@@ -226,6 +228,7 @@ class FastResetController:
         self._lock = threading.Lock()
         self._progress_lock = threading.Lock()
         self._reset_progress: dict[str, Any] = {"active": False}
+        self._flow_profile_baseline: dict[str, Any] = {}
         self._event_logger = event_logger or (lambda message: print(message, flush=True))
         self.supervisor = supervisor or ProcessSupervisor(
             self.registry_file,
@@ -253,6 +256,7 @@ class FastResetController:
                 # before recreating the topology.
                 self._run_reset_phase("reclaim_compose", self.reclaim_compose)
             self._run_reset_phase("reset_artifacts", self._reset_artifacts)
+            self._run_reset_phase("restore_flow_profile_baseline", self._restore_flow_profile_baseline)
             restarted_services: tuple[str, ...] = ()
             if cold_start:
                 early_processes = self._run_reset_phase(
@@ -346,6 +350,7 @@ class FastResetController:
         )
         with self._progress_lock:
             state["reset_progress"] = dict(self._reset_progress)
+        state["flow_profile_baseline"] = self._flow_profile_baseline_status()
         return state
 
     def shutdown(self) -> None:
@@ -572,6 +577,75 @@ class FastResetController:
             raise ValueError(f"invalid run archive path: {archive_run}")
         if archive_run.exists():
             shutil.rmtree(archive_run)
+
+    def _restore_flow_profile_baseline(self) -> None:
+        """Restore the immutable per-run flow/SLA source before each episode.
+
+        The policy acceptor updates ``flow_profile_file`` in place after it has
+        dispatched a policy.  This happens even when the later assurance check
+        marks that policy non-compliant.  The file is deliberately outside the
+        ephemeral writer state, so deleting the writer database alone leaves
+        the next episode with the previous episode's SLA targets.
+        """
+        raw_flow_profile = str(self.manifest.get("flow_profile_file") or "").strip()
+        if not raw_flow_profile:
+            self._flow_profile_baseline = {"status": "not_configured"}
+            return
+
+        flow_profile = Path(raw_flow_profile).expanduser().resolve()
+        self._assert_run_owned(flow_profile)
+        raw_baseline = str(self.manifest.get("flow_profile_baseline_file") or "").strip()
+        if raw_baseline:
+            baseline = Path(raw_baseline).expanduser().resolve()
+        else:
+            # Compatibility for manifests rendered before the explicit baseline
+            # artifact existed.  The reset server starts before the first case,
+            # so its first read is the pre-policy profile.
+            baseline = self.state_dir / "flow-profiles-baseline.tsv"
+        baseline = baseline.resolve()
+        self._assert_run_owned(baseline)
+
+        if not baseline.exists():
+            if raw_baseline:
+                raise FileNotFoundError(f"flow profile baseline is missing: {baseline}")
+            if not flow_profile.exists():
+                raise FileNotFoundError(f"flow profile is missing: {flow_profile}")
+            self._copy_file_atomically(flow_profile, baseline)
+
+        if not flow_profile.exists():
+            raise FileNotFoundError(f"flow profile is missing: {flow_profile}")
+        baseline_digest = self._sha256_file(baseline)
+        self._copy_file_atomically(baseline, flow_profile)
+        restored_digest = self._sha256_file(flow_profile)
+        if restored_digest != baseline_digest:
+            raise RuntimeError("restored flow profile does not match its immutable baseline")
+        self._flow_profile_baseline = {
+            "status": "restored",
+            "baseline_file": str(baseline),
+            "flow_profile_file": str(flow_profile),
+            "sha256": baseline_digest,
+        }
+
+    @staticmethod
+    def _copy_file_atomically(source: Path, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_suffix(destination.suffix + ".reset.tmp")
+        shutil.copyfile(source, temporary)
+        temporary.replace(destination)
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _flow_profile_baseline_status(self) -> dict[str, Any]:
+        if self._flow_profile_baseline:
+            return dict(self._flow_profile_baseline)
+        raw_flow_profile = str(self.manifest.get("flow_profile_file") or "").strip()
+        return {"status": "pending" if raw_flow_profile else "not_configured"}
 
     def _assert_run_owned(self, path: Path) -> None:
         if path == self.state_file or path == self.registry_file:

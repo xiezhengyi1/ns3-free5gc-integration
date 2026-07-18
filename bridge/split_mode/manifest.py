@@ -36,6 +36,7 @@ class SplitRunManifest:
     service_map: dict[str, dict[str, str]]
     fast_reset: dict[str, object]
     commands: list[SplitCommandSpec]
+    flow_profile_baseline_file: str = ""
 
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)

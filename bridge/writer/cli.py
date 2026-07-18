@@ -18,12 +18,14 @@ from bridge.writer.log_parser import (
     parse_ueransim_compose_line,
 )
 from bridge.writer.local_store import SnapshotStore
+from bridge.writer.owner import SnapshotStoreClient, serve_forever
 from bridge.writer.postgres_graph_store import PostgresGraphStore
 
 
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--state-db", required=True, help="sqlite path for local state")
     parser.add_argument("--archive-dir", required=True, help="directory for archived ticks")
+    parser.add_argument("--writer-socket", help="single-writer owner Unix socket; followers never open SQLite directly")
     parser.add_argument("--ingestion-url", help="optional HTTP ingestion endpoint")
     parser.add_argument("--graph-db-url", help="optional PostgreSQL graph database URL")
     parser.add_argument(
@@ -50,8 +52,8 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
 
 def _build_writer(
     args: argparse.Namespace,
-) -> tuple[SnapshotStore, HttpIngestionClient | None, PostgresGraphStore | None]:
-    store = SnapshotStore(args.state_db, args.archive_dir)
+) -> tuple[SnapshotStore | SnapshotStoreClient, HttpIngestionClient | None, PostgresGraphStore | None]:
+    store = SnapshotStoreClient(args.writer_socket) if args.writer_socket else SnapshotStore(args.state_db, args.archive_dir)
     client = HttpIngestionClient(args.ingestion_url) if args.ingestion_url else None
     graph_store = (
         PostgresGraphStore(args.graph_db_url, ensure_schema=args.ensure_graph_schema)
@@ -63,7 +65,7 @@ def _build_writer(
 
 def _ingest_line(
     line: str,
-    store: SnapshotStore,
+    store: SnapshotStore | SnapshotStoreClient,
     client: HttpIngestionClient | None,
     graph_store: PostgresGraphStore | None,
     args: argparse.Namespace,
@@ -96,16 +98,16 @@ def _ingest_line(
     return "ingested"
 
 
-def _append_event(store: SnapshotStore, event_payload: dict[str, object]) -> None:
+def _append_event(store: SnapshotStore | SnapshotStoreClient, event_payload: dict[str, object]) -> None:
     print(json.dumps(event_payload, ensure_ascii=False))
 
 
-def _current_event_tick(store: SnapshotStore, run_id: str) -> int:
+def _current_event_tick(store: SnapshotStore | SnapshotStoreClient, run_id: str) -> int:
     latest_tick = store.latest_snapshot_tick(run_id)
     return max(0, latest_tick)
 
 
-def _resolve_event_tick(store: SnapshotStore, run_id: str, raw_line: str) -> int:
+def _resolve_event_tick(store: SnapshotStore | SnapshotStoreClient, run_id: str, raw_line: str) -> int:
     observed_at = extract_compose_timestamp(raw_line)
     if observed_at is None:
         return _current_event_tick(store, run_id)
@@ -257,6 +259,11 @@ def _graph_snapshot_exists(args: argparse.Namespace) -> int:
     return 0
 
 
+def _serve_owner(args: argparse.Namespace) -> int:
+    serve_forever(socket_path=args.writer_socket, state_db=args.state_db, archive_dir=args.archive_dir)
+    return 0
+
+
 def _delete_graph_snapshot(args: argparse.Namespace) -> int:
     store = PostgresGraphStore(args.graph_db_url, ensure_schema=args.ensure_graph_schema)
     print(json.dumps(store.delete_snapshot(args.snapshot_id), ensure_ascii=False))
@@ -282,6 +289,10 @@ def _prune_graph_snapshots(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Ingest ns-3 snapshots and core/RAN observations")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    serve = subparsers.add_parser("serve-owner", help="run the sole local SQLite writer owner")
+    _add_common_arguments(serve)
+    serve.set_defaults(handler=_serve_owner)
 
     ingest_file = subparsers.add_parser("ingest-file", help="ingest a full JSONL file")
     ingest_file.add_argument("path", help="JSONL file path")

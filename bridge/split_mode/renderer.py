@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import hashlib
 import ipaddress
 import json
 from pathlib import Path
 import shutil
+import tempfile
 from typing import Any
 
 import yaml
@@ -443,11 +445,22 @@ def render_split_run(
     )
 
     flow_profile_file = generated_dir / config.control_plane_scenario.ns3.output_subdir / "flow-profiles-live.tsv"
+    flow_profile_baseline_file = (
+        generated_dir / config.control_plane_scenario.ns3.output_subdir / "flow-profiles-baseline.tsv"
+    )
     runtime_state_file = run_dir / "state" / "split-runtime-state.json"
     result_file = run_dir / "state" / "split-results.jsonl"
     _render_live_flow_profiles(config, flow_profile_file)
+    shutil.copyfile(flow_profile_file, flow_profile_baseline_file)
 
     base_manifest = rendered
+    # Linux AF_UNIX addresses are limited to roughly 108 bytes. Run artifact
+    # paths are intentionally descriptive and can exceed that limit, so use a
+    # short deterministic socket name outside the run tree. The hash keeps
+    # concurrent experiment workers isolated without embedding a long run ID.
+    writer_socket = Path(tempfile.gettempdir()) / (
+        "ns3w-" + hashlib.sha256(str(run_dir).encode("utf-8")).hexdigest()[:16] + ".sock"
+    )
     scenario = config.control_plane_scenario
     python_executable = project_root / ".venv" / "bin" / "python3"
     python_command = str(python_executable) if python_executable.exists() else "python3"
@@ -552,6 +565,23 @@ def render_split_run(
                 argv=[*compose_base_argv, "up", "-d", "--force-recreate", "--remove-orphans", *smf_services],
             ),
             SplitCommandSpec(
+                name="writer-owner",
+                cwd=str(project_root),
+                argv=[
+                    python_command,
+                    "-m",
+                    "bridge.writer.cli",
+                    "serve-owner",
+                    "--writer-socket",
+                    str(writer_socket),
+                    "--state-db",
+                    str(base_manifest.state_db),
+                    "--archive-dir",
+                    str(base_manifest.archive_dir),
+                ],
+                background=True,
+            ),
+            SplitCommandSpec(
                 name="writer-follow-free5gc",
                 cwd=str(project_root),
                 argv=[
@@ -579,6 +609,8 @@ def render_split_run(
                     str(base_manifest.state_db),
                     "--archive-dir",
                     str(base_manifest.archive_dir),
+                    "--writer-socket",
+                    str(writer_socket),
                     *[item for service in [*infra_core_services, *upf_services, *smf_services] for item in ("--service", service)],
                 ],
                 background=True,
@@ -661,6 +693,8 @@ def render_split_run(
                     str(base_manifest.state_db),
                     "--archive-dir",
                     str(base_manifest.archive_dir),
+                    "--writer-socket",
+                    str(writer_socket),
                     *[item for service in [*gnb_services, *ue_services] for item in ("--service", service)],
                 ],
                 background=True,
@@ -703,6 +737,8 @@ def render_split_run(
                 str(base_manifest.state_db),
                 "--archive-dir",
                 str(base_manifest.archive_dir),
+                "--writer-socket",
+                str(writer_socket),
                 "--tick-ms",
                 str(scenario.tick_ms),
                 "--from-end",
@@ -921,6 +957,7 @@ def render_split_run(
             ],
         },
         commands=commands,
+        flow_profile_baseline_file=str(flow_profile_baseline_file),
     )
     manifest_path = run_dir / "run-manifest.split.json"
     manifest_path.write_text(json.dumps(manifest.to_dict(), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
