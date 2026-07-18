@@ -18,6 +18,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("scenario", help="split-mode scenario YAML")
     parser.add_argument("--run-id", help="explicit run identifier")
     parser.add_argument("--live-graph-snapshot-id", help="explicit live graph snapshot id for graph delta writes")
+    parser.add_argument("--instance-slot", type=int, default=0, help="non-zero worker slot for isolated Docker resources")
+    parser.add_argument("--gateway-port", type=int, help="policy gateway TCP port (auto-scoped by worker slot by default)")
+    parser.add_argument("--reset-port", type=int, help="fast-reset TCP port (auto-scoped by worker slot by default)")
+    parser.add_argument("--graph-db-url", help="worker-scoped graph database URL")
     parser.add_argument(
         "--wait-background",
         dest="wait_background",
@@ -29,12 +33,18 @@ def main(argv: list[str] | None = None) -> int:
     run_id = args.run_id
     if run_id is not None and run_id.startswith("-"):
         raise ValueError(f"invalid run id: {run_id}")
+    gateway_port = args.gateway_port if args.gateway_port is not None else 18080 + (args.instance_slot * 2)
+    reset_port = args.reset_port if args.reset_port is not None else 18081 + (args.instance_slot * 2)
     config = load_split_mode_config(scenario_path)
     rendered = render_split_run(
         Path(__file__).resolve().parents[1],
         config,
         run_id=run_id,
         live_graph_snapshot_id=args.live_graph_snapshot_id,
+        instance_slot=args.instance_slot,
+        gateway_port=gateway_port,
+        reset_port=reset_port,
+        graph_db_url=args.graph_db_url,
     )
     if not args.wait_background:
         print(f"run_id={rendered.run_id}")

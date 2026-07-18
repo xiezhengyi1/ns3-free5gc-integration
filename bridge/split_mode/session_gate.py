@@ -82,6 +82,24 @@ def _parse_entity_session(entity_id: str) -> tuple[str, int] | None:
     return ue_name, int(psi_text)
 
 
+def _resolve_ueransim_ue_name(entity_id: str, ue_names: set[str]) -> str | None:
+    """Map either a Compose service name or a prefixed container name to a UE.
+
+    Compose prefixes `container_name` with the project name for isolated worker
+    instances (for example, `nrint-w1-ue-ue1`).  The event schema intentionally
+    preserves that source identity, so readiness and session activation must
+    normalize it at the consumer boundary.
+    """
+    if entity_id in ue_names:
+        return entity_id
+    matches = [
+        ue_name
+        for ue_name in ue_names
+        if entity_id == f"ue-{ue_name}" or entity_id.endswith(f"-ue-{ue_name}")
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _resolve_session_ref_from_payload(
     payload: dict[str, Any],
     supi_to_ue: dict[str, str],
@@ -175,8 +193,13 @@ def _apply_event(
     psi_map: dict[tuple[str, int], str],
 ) -> bool:
     changed = False
+    ue_names = set(supi_to_ue.values())
     if event_type in {"ueransim.registration_success", "free5gc.registration_complete"}:
-        ue_name = entity_id if event_type.startswith("ueransim.") else supi_to_ue.get(str(payload.get("supi", "")))
+        ue_name = (
+            _resolve_ueransim_ue_name(entity_id, ue_names)
+            if event_type.startswith("ueransim.")
+            else supi_to_ue.get(str(payload.get("supi", "")))
+        )
         if not ue_name:
             raise ValueError(f"unable to resolve UE for event {event_type}")
         for state in session_by_ref.values():
@@ -196,7 +219,11 @@ def _apply_event(
         "ueransim.error",
         "free5gc.error",
     }:
-        ue_name = entity_id if event_type.startswith("ueransim.") else supi_to_ue.get(str(payload.get("supi", "")))
+        ue_name = (
+            _resolve_ueransim_ue_name(entity_id, ue_names)
+            if event_type.startswith("ueransim.")
+            else supi_to_ue.get(str(payload.get("supi", "")))
+        )
         if not ue_name:
             return False
         for state in session_by_ref.values():
@@ -219,7 +246,9 @@ def _apply_event(
         parsed = _parse_entity_session(entity_id)
         if parsed is not None:
             ue_name, psi = parsed
-            session_ref = psi_map.get((ue_name, psi))
+            resolved_ue_name = _resolve_ueransim_ue_name(ue_name, ue_names)
+            if resolved_ue_name is not None:
+                session_ref = psi_map.get((resolved_ue_name, psi))
         if session_ref is None:
             session_ref = _resolve_session_ref_from_payload(payload, supi_to_ue, psi_map)
         if session_ref is None:

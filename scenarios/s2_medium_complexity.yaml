@@ -65,6 +65,7 @@ gnbs:
     slices:
       - slice-2-000001
       - slice-1-000001
+      - slice-3-000001
     backhaul_upfs: [i-upf-1]
   - name: gNB-2
     alias: gnb2.free5gc.org
@@ -105,6 +106,17 @@ ues:
         type: IPv4
         five_qi: 9
         app_id: app-remote-drive
+      # Pre-provision alternative S-NSSAIs for migration; no flow starts on them.
+      - slice_ref: slice-2-000001
+        session_ref: imsi-208930000000001:subscription:slice-2-000001:internet
+        apn: internet
+        type: IPv4
+        five_qi: 7
+      - slice_ref: slice-3-000001
+        session_ref: imsi-208930000000001:subscription:slice-3-000001:internet
+        apn: internet
+        type: IPv4
+        five_qi: 6
   - name: ue2
     supi: imsi-208930000000006
     gnb: gNB-3
@@ -130,6 +142,11 @@ ues:
         type: IPv4
         five_qi: 6
         app_id: app-iot-sensor
+      - slice_ref: slice-2-000001
+        session_ref: imsi-208930000000006:subscription:slice-2-000001:internet
+        apn: internet
+        type: IPv4
+        five_qi: 7
   - name: ue3
     supi: imsi-208930000000005
     gnb: gNB-3
@@ -180,6 +197,11 @@ ues:
         type: IPv4
         five_qi: 6
         app_id: app-web-browse
+      - slice_ref: slice-1-000001
+        session_ref: imsi-208930000000008:subscription:slice-1-000001:internet
+        apn: internet
+        type: IPv4
+        five_qi: 9
   - name: ue5
     supi: imsi-208930000000009
     gnb: gNB-2
@@ -205,6 +227,11 @@ ues:
         type: IPv4
         five_qi: 7
         app_id: app-4k-video
+      - slice_ref: slice-3-000001
+        session_ref: imsi-208930000000009:subscription:slice-3-000001:internet
+        apn: internet
+        type: IPv4
+        five_qi: 6
   - name: ue6
     supi: imsi-208930000000010
     gnb: gNB-1
@@ -230,6 +257,11 @@ ues:
         type: IPv4
         five_qi: 9
         app_id: app-cloud-render
+      - slice_ref: slice-3-000001
+        session_ref: imsi-208930000000010:subscription:slice-3-000001:internet
+        apn: internet
+        type: IPv4
+        five_qi: 6
 
 apps:
   - app_id: app-remote-drive

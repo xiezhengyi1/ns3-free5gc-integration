@@ -18,6 +18,7 @@ DEFAULT_TIMEOUT_MS="10000"
 FLOW_PROFILE_FILE=""
 LATEST_SNAPSHOT_FILE=""
 STATE_FILE=""
+INSTANCE_ID=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -39,6 +40,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --state-file)
       STATE_FILE="$2"
+      shift 2
+      ;;
+    --instance-id)
+      INSTANCE_ID="$2"
       shift 2
       ;;
     --upstream-pcf-container)
@@ -82,6 +87,7 @@ fi
 exec "${PYTHON_BIN}" -m bridge.policy_acceptor \
   --host "${HOST}" \
   --port "${PORT}" \
+  --instance-id "${INSTANCE_ID}" \
   --flow-profile-file "${FLOW_PROFILE_FILE}" \
   --latest-snapshot-file "${LATEST_SNAPSHOT_FILE}" \
   --state-file "${STATE_FILE}" \

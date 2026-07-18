@@ -639,6 +639,139 @@ def _infer_violation_reason(
     return "telemetry_unmet"
 
 
+def _allocation_parameter_check(
+    parameter: str,
+    *,
+    requested: Any,
+    effective_target: Any,
+    observed: Any,
+    capacity_limited: bool,
+) -> dict[str, Any]:
+    target_value = _to_float(effective_target)
+    observed_value = _to_float(observed)
+    tolerance = max(0.0, float(QOS_TOLERANCE_RATIO))
+    allowed_deviation = abs(target_value) * tolerance if target_value is not None else None
+    lower_bound = target_value - allowed_deviation if target_value is not None else None
+    upper_bound = target_value + allowed_deviation if target_value is not None else None
+    satisfied = _within_ratio_tolerance(observed, effective_target)
+    check: dict[str, Any] = {
+        "parameter": parameter,
+        "comparison": "target_within_tolerance",
+        "requested": requested,
+        "effective_target": effective_target,
+        "observed": observed,
+        "tolerance_ratio": tolerance,
+        "allowed_min": lower_bound,
+        "allowed_max": upper_bound,
+        "capacity_limited": capacity_limited,
+        "satisfied": satisfied,
+    }
+    if observed_value is not None and target_value is not None:
+        check["delta_from_target"] = observed_value - target_value
+        if observed_value < lower_bound:
+            check["shortfall"] = lower_bound - observed_value
+        elif observed_value > upper_bound:
+            check["excess"] = observed_value - upper_bound
+    return check
+
+
+def _upper_bound_parameter_check(
+    parameter: str,
+    *,
+    requested: Any,
+    observed: Any,
+) -> dict[str, Any]:
+    requested_value = _to_float(requested)
+    observed_value = _to_float(observed)
+    tolerance = max(0.0, float(QOS_TOLERANCE_RATIO))
+    allowed_max = requested_value * (1.0 + tolerance) if requested_value is not None else None
+    satisfied = _within_upper_bound(observed, requested)
+    check: dict[str, Any] = {
+        "parameter": parameter,
+        "comparison": "at_most",
+        "requested_max": requested,
+        "observed": observed,
+        "tolerance_ratio": tolerance,
+        "allowed_max": allowed_max,
+        "satisfied": satisfied,
+    }
+    if observed_value is not None and allowed_max is not None and observed_value > allowed_max:
+        check["excess"] = observed_value - allowed_max
+    return check
+
+
+def _sm_qos_parameter_checks(
+    allocation: dict[str, Any],
+    telemetry: dict[str, Any],
+    requested_state: dict[str, Any],
+) -> list[dict[str, Any]]:
+    checks: list[dict[str, Any]] = []
+    for direction in ("dl", "ul"):
+        parameter = f"allocated_bandwidth_{direction}_mbps"
+        if parameter not in requested_state:
+            continue
+        checks.append(
+            _allocation_parameter_check(
+                parameter,
+                requested=requested_state[parameter],
+                effective_target=_resolve_bandwidth_target(
+                    allocation,
+                    requested_state[parameter],
+                    direction=direction,
+                ),
+                observed=allocation.get(f"allocated_bandwidth_{direction}"),
+                capacity_limited=bool(allocation.get(f"capacity_limited_{direction}")),
+            )
+        )
+    for parameter, observed_key in (
+        ("latency_ms", "latency"),
+        ("jitter_ms", "jitter"),
+        ("loss_rate", "loss_rate"),
+    ):
+        if parameter in requested_state:
+            checks.append(
+                _upper_bound_parameter_check(
+                    parameter,
+                    requested=requested_state[parameter],
+                    observed=telemetry.get(observed_key),
+                )
+            )
+    return checks
+
+
+def _format_qos_compliance_error(monitoring_data: dict[str, Any]) -> str:
+    violations = monitoring_data.get("qos_violations")
+    if not isinstance(violations, list) or not violations:
+        return "ns-3 applied the policy but QoS compliance was violated"
+
+    summaries: list[str] = []
+    for violation in violations:
+        if not isinstance(violation, dict):
+            continue
+        parameter = _coerce_optional(violation.get("parameter")) or "unknown_parameter"
+        observed = _format_qos_value(violation.get("observed"))
+        if violation.get("comparison") == "at_most":
+            summaries.append(
+                f"{parameter} observed={observed} exceeds allowed_max={_format_qos_value(violation.get('allowed_max'))}"
+            )
+        else:
+            summaries.append(
+                f"{parameter} observed={observed} outside [{_format_qos_value(violation.get('allowed_min'))}, {_format_qos_value(violation.get('allowed_max'))}]"
+            )
+    detail = "; ".join(summaries)
+    return (
+        "ns-3 applied the policy but QoS compliance was violated"
+        + (f": {detail}" if detail else "")
+    )
+
+
+def _format_qos_value(value: Any) -> str:
+    numeric_value = _to_float(value)
+    if numeric_value is None:
+        return str(value)
+    return f"{numeric_value:.12g}"
+
+
 def _evaluate_record(record: dict[str, Any], snapshot: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
     mutation = record.get("mutation") or {}
     requested_state = mutation.get("requested_state") or {}
@@ -680,35 +813,36 @@ def _evaluate_sm_record(
 
     allocation = flow.get("allocation") if isinstance(flow.get("allocation"), dict) else {}
     telemetry = flow.get("telemetry") if isinstance(flow.get("telemetry"), dict) else {}
-    applied = True
-    if "allocated_bandwidth_dl_mbps" in requested_state:
-        target_dl = _resolve_bandwidth_target(
-            allocation,
-            requested_state["allocated_bandwidth_dl_mbps"],
-            direction="dl",
+    baseline_tick = _to_int(record.get("baseline_tick"))
+    sla_epoch_start_tick = _to_int(telemetry.get("sla_epoch_start_tick"))
+    if (
+        baseline_tick is not None
+        and sla_epoch_start_tick is not None
+        and sla_epoch_start_tick <= baseline_tick
+    ):
+        return (
+            "PENDING",
+            "PENDING",
+            {
+                "observed_flow_id": flow.get("flow_id"),
+                "observed_allocation": allocation,
+                "observed_telemetry": telemetry,
+                "reason": "awaiting_ns3_sla_epoch_after_policy",
+                "baseline_tick": baseline_tick,
+                "observed_sla_epoch_start_tick": sla_epoch_start_tick,
+                "qos_parameter_checks": [],
+                "qos_violations": [],
+            },
         )
-        applied = applied and _within_ratio_tolerance(
-            allocation.get("allocated_bandwidth_dl"),
-            target_dl,
-        )
-    if "allocated_bandwidth_ul_mbps" in requested_state:
-        target_ul = _resolve_bandwidth_target(
-            allocation,
-            requested_state["allocated_bandwidth_ul_mbps"],
-            direction="ul",
-        )
-        applied = applied and _within_ratio_tolerance(
-            allocation.get("allocated_bandwidth_ul"),
-            target_ul,
-        )
-
-    compliant = True
-    if "latency_ms" in requested_state:
-        compliant = compliant and _within_upper_bound(telemetry.get("latency"), requested_state["latency_ms"])
-    if "jitter_ms" in requested_state:
-        compliant = compliant and _within_upper_bound(telemetry.get("jitter"), requested_state["jitter_ms"])
-    if "loss_rate" in requested_state:
-        compliant = compliant and _within_upper_bound(telemetry.get("loss_rate"), requested_state["loss_rate"])
+    parameter_checks = _sm_qos_parameter_checks(allocation, telemetry, requested_state)
+    allocation_checks = [
+        check
+        for check in parameter_checks
+        if str(check.get("parameter", "")).startswith("allocated_bandwidth_")
+    ]
+    telemetry_checks = [check for check in parameter_checks if check not in allocation_checks]
+    applied = all(bool(check.get("satisfied")) for check in allocation_checks)
+    compliant = all(bool(check.get("satisfied")) for check in telemetry_checks)
 
     if not applied:
         compliant = False
@@ -724,6 +858,8 @@ def _evaluate_sm_record(
             "observed_allocation": allocation,
             "observed_telemetry": telemetry,
             "violation_reason": violation_reason,
+            "qos_parameter_checks": parameter_checks,
+            "qos_violations": [check for check in parameter_checks if not check.get("satisfied")],
         },
     )
 
@@ -786,6 +922,9 @@ def _failure_response(
 
 
 def _record_to_response(record: dict[str, Any]) -> dict[str, Any]:
+    monitoring_data = record.get("monitoring_data", {})
+    if not isinstance(monitoring_data, dict):
+        monitoring_data = {}
     return {
         "status": record.get("status", "failed"),
         "status_code": int(record.get("status_code", 500) or 500),
@@ -803,7 +942,8 @@ def _record_to_response(record: dict[str, Any]) -> dict[str, Any]:
         "applied_tick": record.get("applied_tick"),
         "upstream": record.get("upstream", {}),
         "mutation_summary": record.get("mutation_summary", {}),
-        "monitoring_data": record.get("monitoring_data", {}),
+        "monitoring_data": monitoring_data,
+        "qos_violations": monitoring_data.get("qos_violations", []),
         "message": record.get("message", ""),
         "error": record.get("error", ""),
     }
@@ -817,6 +957,7 @@ def _operation_id(session_id: str, policy_id: str) -> str:
 @dataclass(slots=True)
 class PolicyRuntime:
     flow_profile_file: Path
+    instance_id: str = ""
     latest_snapshot_file: Path | None = None
     state_file: Path | None = None
     upstream_dispatcher: UpstreamPcfDispatcher | None = None
@@ -906,6 +1047,8 @@ class PolicyRuntime:
             upstream_ok, upstream_detail = self.upstream_dispatcher.healthcheck()
         healthy = flow_profile_exists and snapshot_exists and upstream_ok
         return {
+            "service": "ns3-free5gc-policy-acceptor",
+            "instance_id": self.instance_id,
             "status": "ok" if healthy else "failed",
             "healthy": healthy,
             "flow_profile_exists": flow_profile_exists,
@@ -1060,11 +1203,15 @@ class PolicyRuntime:
             if record is None:
                 return {"status": "failed", "status_code": 500, "phase": "query"}
             if record.get("status") == "pending":
-                record["phase"] = "waiting_for_ns3"
-                record["status_code"] = 202
-                record["message"] = "ns-3 has not converged yet; continue polling with operation_id."
-                record["error"] = ""
-                record["updated_at"] = time.time()
+                self._mark_failed(
+                    record,
+                    phase="ns3_timeout",
+                    error=(
+                        "ns-3 did not produce a newer convergence snapshot before "
+                        f"the execution timeout ({int(record.get('timeout_ms') or 0)}ms)"
+                    ),
+                    status_code=504,
+                )
                 self._save_state()
             return record
 
@@ -1093,7 +1240,7 @@ class PolicyRuntime:
             self._mark_failed(
                 record,
                 phase="ns3_compliance",
-                error="ns-3 applied the policy but QoS compliance was violated",
+                error=_format_qos_compliance_error(record["monitoring_data"]),
                 status_code=409,
             )
         else:
@@ -1281,6 +1428,10 @@ class PolicyAcceptorHandler(BaseHTTPRequestHandler):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json")
+        self.send_header("X-Policy-Acceptor", "ns3-free5gc-policy-acceptor")
+        runtime = self.runtime
+        if runtime is not None and runtime.instance_id:
+            self.send_header("X-Policy-Acceptor-Instance", runtime.instance_id)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         try:
@@ -1293,6 +1444,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Unified policy execution gateway for the ns-3/free5GC integration bed.")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=18080)
+    parser.add_argument("--instance-id", default="", help="worker instance identity required by parallel launchers")
     parser.add_argument("--flow-profile-file", required=True)
     parser.add_argument("--latest-snapshot-file")
     parser.add_argument("--state-file")
@@ -1420,6 +1572,7 @@ def _clear_port_binding(host: str, port: int, *, grace_period_sec: float = 2.0) 
 def run_server(args: argparse.Namespace) -> None:
     runtime = PolicyRuntime(
         flow_profile_file=Path(args.flow_profile_file),
+        instance_id=str(args.instance_id or "").strip(),
         latest_snapshot_file=Path(args.latest_snapshot_file) if args.latest_snapshot_file else None,
         state_file=Path(args.state_file) if args.state_file else None,
         upstream_dispatcher=RequestsUpstreamPcfDispatcher(

@@ -812,6 +812,10 @@ struct SnapshotContext
         uint64_t lastSnapshotPacketSentUl = 0;
         uint64_t lastSnapshotPacketReceivedDl = 0;
         uint64_t lastSnapshotPacketReceivedUl = 0;
+        uint64_t lossEpochBaselineTxPackets = 0;
+        uint64_t lossEpochBaselineLostPackets = 0;
+        uint32_t lossEpochStartTick = 0;
+        bool resetLossEpoch = true;
     };
 
     struct RadioConfig
@@ -864,6 +868,8 @@ struct SnapshotContext
     std::string outputFile;
     std::string clockFile;
     std::string flowProfileFile;
+    std::filesystem::file_time_type lastFlowProfileWriteTime;
+    bool hasFlowProfileWriteTime = false;
     std::string sliceResourceFile;
     uint32_t tickMs;
     uint32_t policyReloadMs = 1000;
@@ -2133,6 +2139,18 @@ ReloadFlowProfiles(SnapshotContext* context)
         return;
     }
 
+    std::error_code profileWriteTimeError;
+    const auto profileWriteTime =
+        std::filesystem::last_write_time(context->flowProfileFile, profileWriteTimeError);
+    const bool profileFileReplaced =
+        !profileWriteTimeError &&
+        (!context->hasFlowProfileWriteTime || profileWriteTime != context->lastFlowProfileWriteTime);
+    if (!profileWriteTimeError)
+    {
+        context->lastFlowProfileWriteTime = profileWriteTime;
+        context->hasFlowProfileWriteTime = true;
+    }
+
     const auto profiles = LoadFlowProfiles(context->flowProfileFile);
     std::map<std::string, FlowProfile> byId;
     for (const auto& profile : profiles)
@@ -2147,11 +2165,31 @@ ReloadFlowProfiles(SnapshotContext* context)
         {
             continue;
         }
+        const FlowProfile previousProfile = runtime.profile;
         const double currentAllocatedDl = runtime.profile.allocatedBandwidthDlMbps;
         const double currentAllocatedUl = runtime.profile.allocatedBandwidthUlMbps;
         runtime.profile = it->second;
         runtime.profile.allocatedBandwidthDlMbps = currentAllocatedDl;
         runtime.profile.allocatedBandwidthUlMbps = currentAllocatedUl;
+        const bool qosPolicyChanged =
+            previousProfile.enabled != runtime.profile.enabled ||
+            previousProfile.sliceRef != runtime.profile.sliceRef ||
+            previousProfile.sliceSnssai != runtime.profile.sliceSnssai ||
+            previousProfile.upfName != runtime.profile.upfName ||
+            previousProfile.latencyMs != runtime.profile.latencyMs ||
+            previousProfile.jitterMs != runtime.profile.jitterMs ||
+            previousProfile.lossRate != runtime.profile.lossRate ||
+            previousProfile.bandwidthDlMbps != runtime.profile.bandwidthDlMbps ||
+            previousProfile.bandwidthUlMbps != runtime.profile.bandwidthUlMbps ||
+            previousProfile.guaranteedBandwidthDlMbps != runtime.profile.guaranteedBandwidthDlMbps ||
+            previousProfile.guaranteedBandwidthUlMbps != runtime.profile.guaranteedBandwidthUlMbps ||
+            previousProfile.priority != runtime.profile.priority ||
+            previousProfile.precedence != runtime.profile.precedence ||
+            previousProfile.qosRef != runtime.profile.qosRef ||
+            previousProfile.policyFilter != runtime.profile.policyFilter;
+        // policy_acceptor replaces the TSV atomically even for a semantic no-op.
+        // A replacement therefore starts a new post-dispatch SLA measurement epoch.
+        runtime.resetLossEpoch = runtime.resetLossEpoch || qosPolicyChanged || profileFileReplaced;
     }
 
     // Rebuild UE slice membership from the latest live flow profiles so AM policies
@@ -2750,6 +2788,7 @@ EmitSnapshot(SnapshotContext* context)
                           double throughputDl,
                           uint64_t txPackets,
                           uint64_t rxPackets,
+                          uint64_t lostPackets,
                           const std::string& direction,
                           const std::string& sourceEntity,
                           const std::string& destinationEntity,
@@ -2846,11 +2885,41 @@ EmitSnapshot(SnapshotContext* context)
             runtimeState->lastSnapshotPacketReceivedDl = ranDlRxPkts;
             runtimeState->lastSnapshotPacketReceivedUl = ranUlRxPkts;
         }
+        const uint64_t confirmedLostPackets = std::min(lostPackets, txPackets);
+        const uint64_t terminalPackets = std::min(txPackets, rxPackets + confirmedLostPackets);
+        const uint64_t inFlightPackets = txPackets - terminalPackets;
+        uint64_t lossEpochTxPackets = txPackets;
+        uint64_t lossEpochLostPackets = confirmedLostPackets;
+        uint32_t lossEpochStartTick = 0;
+        if (runtimeState != nullptr)
+        {
+            if (runtimeState->resetLossEpoch)
+            {
+                runtimeState->lossEpochBaselineTxPackets = txPackets;
+                runtimeState->lossEpochBaselineLostPackets = confirmedLostPackets;
+                runtimeState->lossEpochStartTick = context->tickIndex;
+                runtimeState->resetLossEpoch = false;
+            }
+            lossEpochTxPackets =
+                txPackets >= runtimeState->lossEpochBaselineTxPackets
+                    ? (txPackets - runtimeState->lossEpochBaselineTxPackets)
+                    : txPackets;
+            lossEpochLostPackets =
+                confirmedLostPackets >= runtimeState->lossEpochBaselineLostPackets
+                    ? (confirmedLostPackets - runtimeState->lossEpochBaselineLostPackets)
+                    : confirmedLostPackets;
+            lossEpochStartTick = runtimeState->lossEpochStartTick;
+        }
+        const double lossRateCumulative = lossRate;
+        const double lossRateSincePolicy = lossEpochTxPackets > 0
+                                               ? static_cast<double>(lossEpochLostPackets) /
+                                                     static_cast<double>(lossEpochTxPackets)
+                                               : 0.0;
 
         totalThroughputDl += throughputDl;
         totalThroughputUl += throughputUl;
         totalDelayMs += delayMs;
-        totalLossRate += lossRate;
+        totalLossRate += lossRateSincePolicy;
         activeFlows++;
 
         if (!firstFlow)
@@ -2870,7 +2939,7 @@ EmitSnapshot(SnapshotContext* context)
              << Quote("5qi") << ":" << fiveQi << ","
              << Quote("delay_ms") << ":" << delayMs << ","
              << Quote("jitter_ms") << ":" << jitterMs << ","
-             << Quote("loss_rate") << ":" << lossRate << ","
+             << Quote("loss_rate") << ":" << lossRateSincePolicy << ","
              << Quote("throughput_ul_mbps") << ":" << throughputUl << ","
              << Quote("throughput_dl_mbps") << ":" << throughputDl << ","
              << Quote("queue_bytes") << ":" << static_cast<uint64_t>(flowQueueBytes) << ","
@@ -2908,9 +2977,15 @@ EmitSnapshot(SnapshotContext* context)
              << Quote("guaranteed_bandwidth_dl") << ":" << guaranteedBandwidthDlMbps << ","
              << Quote("guaranteed_bandwidth_ul") << ":" << guaranteedBandwidthUlMbps << "},"
              << Quote("telemetry") << ":{" << Quote("latency") << ":" << delayMs << ","
-             << Quote("jitter") << ":" << jitterMs << "," << Quote("loss_rate") << ":" << lossRate << ","
+             << Quote("jitter") << ":" << jitterMs << "," << Quote("loss_rate") << ":"
+             << lossRateSincePolicy << "," << Quote("loss_rate_cumulative") << ":" << lossRateCumulative << ","
              << Quote("packet_sent") << ":" << txPackets << "," << Quote("packet_received") << ":"
-             << rxPackets << "," << Quote("throughput_dl") << ":" << throughputDl << ","
+             << rxPackets << "," << Quote("packet_lost") << ":" << confirmedLostPackets << ","
+             << Quote("packet_in_flight") << ":" << inFlightPackets << ","
+             << Quote("sla_epoch_start_tick") << ":" << lossEpochStartTick << ","
+             << Quote("sla_epoch_packet_sent") << ":" << lossEpochTxPackets << ","
+             << Quote("sla_epoch_packet_lost") << ":" << lossEpochLostPackets << ","
+             << Quote("throughput_dl") << ":" << throughputDl << ","
              << Quote("throughput_ul") << ":" << throughputUl << ","
              << Quote("tick_delta_packet_sent") << ":" << tickDeltaPacketSent << ","
              << Quote("tick_delta_packet_received") << ":" << tickDeltaPacketReceived << ","
@@ -2971,6 +3046,7 @@ EmitSnapshot(SnapshotContext* context)
             uint64_t rxPacketsForJitter = 0;
             uint64_t txPackets = 0;
             uint64_t rxPackets = 0;
+            uint64_t lostPackets = 0;
             double throughputUl = 0.0;
             double throughputDl = 0.0;
             bool sawDownlink = false;
@@ -3046,6 +3122,7 @@ EmitSnapshot(SnapshotContext* context)
             aggregate.rxPacketsForJitter += flow.rxPackets;
             aggregate.txPackets += flow.txPackets;
             aggregate.rxPackets += flow.rxPackets;
+            aggregate.lostPackets += flow.lostPackets;
             if (downlink)
             {
                 aggregate.sawDownlink = true;
@@ -3094,6 +3171,7 @@ EmitSnapshot(SnapshotContext* context)
                                0.0,
                                0,
                                0,
+                               0,
                                "bidirectional",
                                "ns3_remote_host",
                                "ue_pdu_ip",
@@ -3108,8 +3186,12 @@ EmitSnapshot(SnapshotContext* context)
             const double jitterMs = aggregate.rxPacketsForJitter > 0
                                         ? aggregate.jitterSumMs / static_cast<double>(aggregate.rxPacketsForJitter)
                                         : 0.0;
+            // FlowMonitor only places packets in lostPackets after MaxPerHopDelay.
+            // txPackets - rxPackets also includes packets still queued or in flight and
+            // must not be used as a packet-loss SLA violation.
+            const uint64_t confirmedLostPackets = std::min(aggregate.lostPackets, aggregate.txPackets);
             const double lossRate = aggregate.txPackets > 0
-                                        ? static_cast<double>(aggregate.txPackets - aggregate.rxPackets) /
+                                        ? static_cast<double>(confirmedLostPackets) /
                                               static_cast<double>(aggregate.txPackets)
                                         : 0.0;
             appendFlow(aggregate.runtime,
@@ -3127,6 +3209,7 @@ EmitSnapshot(SnapshotContext* context)
                        aggregate.throughputDl,
                        aggregate.txPackets,
                        aggregate.rxPackets,
+                       confirmedLostPackets,
                        "bidirectional",
                        "ns3_remote_host",
                        "ue_pdu_ip",

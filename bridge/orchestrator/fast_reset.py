@@ -26,13 +26,12 @@ _COLD_START_COMMANDS = {
     "compose-up-gnb",
     "compose-up-smf",
     "wait-for-pfcp-ready",
-    "compose-up-ue",
+    "wait-for-ue-ready",
     "ns3-build",
 }
 _BASELINE_RESTORE_COMMANDS = (
     "bootstrap-subscribers",
     "bootstrap-app-data",
-    "wait-for-pfcp-ready",
 )
 _RUNTIME_ORDER = (
     "writer-follow-free5gc",
@@ -43,6 +42,9 @@ _RUNTIME_ORDER = (
     "split-results",
     "ns3-run",
 )
+_EARLY_RUNTIME_START_AFTER = {
+    "compose-up-smf": ("writer-follow-free5gc",),
+}
 
 
 class ResetBusyError(RuntimeError):
@@ -202,6 +204,7 @@ class FastResetController:
         supervisor: ProcessSupervisor | Any | None = None,
         command_runner: Callable[..., Any] = subprocess.run,
         monotonic: Callable[[], float] = time.monotonic,
+        event_logger: Callable[[str], None] | None = None,
     ) -> None:
         self.manifest_path = manifest_path.expanduser().resolve()
         payload = json.loads(self.manifest_path.read_text(encoding="utf-8"))
@@ -221,6 +224,9 @@ class FastResetController:
         self._runner = command_runner
         self._monotonic = monotonic
         self._lock = threading.Lock()
+        self._progress_lock = threading.Lock()
+        self._reset_progress: dict[str, Any] = {"active": False}
+        self._event_logger = event_logger or (lambda message: print(message, flush=True))
         self.supervisor = supervisor or ProcessSupervisor(
             self.registry_file,
             run_id=self.run_id,
@@ -231,32 +237,93 @@ class FastResetController:
         if not self._lock.acquire(blocking=False):
             raise ResetBusyError("a scenario reset is already in progress")
         started = self._monotonic()
+        generation = 0
+        mode = "cold" if cold else "fast"
         try:
             previous = self._load_state()
             cold_start = cold or not bool(previous.get("initialized"))
             generation = int(previous.get("generation", 0)) + 1
-            self.supervisor.stop_all()
-            self._reset_artifacts()
+            mode = "cold" if cold_start else "fast"
+            self._begin_reset_progress(generation=generation, mode=mode)
+            self._emit_reset_event("reset_start", generation=generation, mode=mode)
+            self._run_reset_phase("stop_managed_processes", self.supervisor.stop_all)
+            if cold_start:
+                # A cold start is also the recovery path after an unclean process
+                # termination: remove any project-owned containers and networks
+                # before recreating the topology.
+                self._run_reset_phase("reclaim_compose", self.reclaim_compose)
+            self._run_reset_phase("reset_artifacts", self._reset_artifacts)
             restarted_services: tuple[str, ...] = ()
             if cold_start:
-                self._cold_start()
+                early_processes = self._run_reset_phase(
+                    "cold_start",
+                    lambda: self._cold_start(generation),
+                )
             else:
-                restarted_services = self._restart_control_plane()
-                self._restore_baseline()
-            processes = self._start_runtime(generation)
+                # A fast reset deliberately preserves Compose containers and their
+                # fixed network addresses. Its fresh writer database cannot require
+                # new PFCP or UE-ready events because those are emitted only when
+                # the persistent services first start; waiting for them would make
+                # fast reset depend on incidental historical log replay.
+                early_processes: tuple[ManagedProcess, ...] = ()
+                self._run_reset_phase("restore_baseline", self._restore_baseline)
+            processes = self._run_reset_phase(
+                "start_runtime",
+                lambda: (
+                    *early_processes,
+                    *self._start_runtime(
+                        generation,
+                        skip_names={process.name for process in early_processes},
+                    ),
+                ),
+            )
             result = ResetResult(
                 run_id=self.run_id,
                 generation=generation,
-                mode="cold" if cold_start else "fast",
+                mode=mode,
                 duration_ms=max(0, round((self._monotonic() - started) * 1000)),
                 restarted_services=restarted_services,
                 processes=processes,
             )
-            self._save_state(result, initialized=True)
+            self._run_reset_phase(
+                "persist_success_state",
+                lambda: self._save_state(result, initialized=True),
+            )
+            self._complete_reset_progress(generation=generation, mode=mode, duration_ms=result.duration_ms)
+            self._emit_reset_event(
+                "reset_complete",
+                generation=generation,
+                mode=mode,
+                duration_ms=result.duration_ms,
+            )
             return result
-        except BaseException:
-            self.supervisor.stop_all()
-            self._save_failure_state()
+        except BaseException as exc:
+            self._fail_reset_progress(generation=generation, mode=mode, error=exc)
+            self._emit_reset_event(
+                "reset_failed",
+                generation=generation,
+                mode=mode,
+                duration_ms=max(0, round((self._monotonic() - started) * 1000)),
+                error=exc,
+            )
+            try:
+                self._run_reset_phase("failure_cleanup", self.supervisor.stop_all)
+            except BaseException as cleanup_error:
+                self._emit_reset_event(
+                    "failure_cleanup_failed",
+                    generation=generation,
+                    mode=mode,
+                    error=cleanup_error,
+                )
+            try:
+                self._run_reset_phase("persist_failure_state", self._save_failure_state)
+            except BaseException as state_error:
+                self._emit_reset_event(
+                    "persist_failure_state_failed",
+                    generation=generation,
+                    mode=mode,
+                    error=state_error,
+                )
             raise
         finally:
             self._lock.release()
@@ -277,45 +344,148 @@ class FastResetController:
             and "ns3-run" in running_names
             and not state["missing_processes"]
         )
+        with self._progress_lock:
+            state["reset_progress"] = dict(self._reset_progress)
         return state
 
     def shutdown(self) -> None:
         self.supervisor.stop_all()
 
-    def _cold_start(self) -> None:
+    def reclaim_compose(self) -> None:
+        """Best-effort removal of this manifest's Compose project resources."""
+        command = self.command_by_name.get("compose-down")
+        if command is None:
+            self._emit_reset_event("compose_reclaim_skipped", reason="manifest_has_no_compose_down")
+            return
+        env = os.environ.copy()
+        env.update({str(key): str(value) for key, value in (command.get("env") or {}).items()})
+        self._emit_reset_event("compose_reclaim_start")
+        try:
+            self._runner(
+                [str(item) for item in command["argv"]],
+                cwd=str(command["cwd"]),
+                env=env,
+                check=False,
+                text=True,
+            )
+        except BaseException as exc:
+            # Cleanup must not hide the original startup or shutdown failure.
+            self._emit_reset_event("compose_reclaim_failed", error=exc)
+            return
+        self._emit_reset_event("compose_reclaim_complete")
+
+    def _begin_reset_progress(self, *, generation: int, mode: str) -> None:
+        with self._progress_lock:
+            self._reset_progress = {
+                "active": True,
+                "run_id": self.run_id,
+                "generation": generation,
+                "mode": mode,
+                "phase": "starting",
+                "phase_started_at": time.time(),
+                "last_error": "",
+            }
+
+    def _run_reset_phase(self, phase: str, action: Callable[[], Any]) -> Any:
+        # Keep phase observability independent from the injectable reset timer so
+        # adding logs cannot change the controller's externally reported duration.
+        started = time.monotonic()
+        with self._progress_lock:
+            self._reset_progress.update(
+                {
+                    "active": True,
+                    "phase": phase,
+                    "phase_started_at": time.time(),
+                    "last_error": "",
+                }
+            )
+            generation = int(self._reset_progress.get("generation", 0))
+            mode = str(self._reset_progress.get("mode", ""))
+        self._emit_reset_event("phase_start", generation=generation, mode=mode, phase=phase)
+        try:
+            result = action()
+        except BaseException as exc:
+            duration_ms = max(0, round((time.monotonic() - started) * 1000))
+            with self._progress_lock:
+                self._reset_progress.update(
+                    {
+                        "phase": phase,
+                        "phase_duration_ms": duration_ms,
+                        "last_error": str(exc),
+                    }
+                )
+            self._emit_reset_event(
+                "phase_failed",
+                generation=generation,
+                mode=mode,
+                phase=phase,
+                duration_ms=duration_ms,
+                error=exc,
+            )
+            raise
+        duration_ms = max(0, round((time.monotonic() - started) * 1000))
+        with self._progress_lock:
+            self._reset_progress.update({"phase": phase, "phase_duration_ms": duration_ms})
+        self._emit_reset_event(
+            "phase_complete",
+            generation=generation,
+            mode=mode,
+            phase=phase,
+            duration_ms=duration_ms,
+        )
+        return result
+
+    def _complete_reset_progress(self, *, generation: int, mode: str, duration_ms: int) -> None:
+        with self._progress_lock:
+            self._reset_progress.update(
+                {
+                    "active": False,
+                    "generation": generation,
+                    "mode": mode,
+                    "phase": "completed",
+                    "phase_duration_ms": duration_ms,
+                    "completed_at": time.time(),
+                    "last_error": "",
+                }
+            )
+
+    def _fail_reset_progress(self, *, generation: int, mode: str, error: BaseException) -> None:
+        with self._progress_lock:
+            self._reset_progress.update(
+                {
+                    "active": False,
+                    "generation": generation,
+                    "mode": mode,
+                    "failed_at": time.time(),
+                    "last_error": str(error),
+                }
+            )
+
+    def _emit_reset_event(self, event: str, **fields: Any) -> None:
+        details = [f"event={event}", f"run_id={self.run_id}"]
+        for key, value in fields.items():
+            if value in (None, ""):
+                continue
+            if key == "error":
+                details.append(f"{key}={json.dumps(str(value), ensure_ascii=False)}")
+            else:
+                details.append(f"{key}={value}")
+        self._event_logger("[reset] " + " ".join(details))
+
+    def _cold_start(self, generation: int) -> tuple[ManagedProcess, ...]:
+        early_processes: list[ManagedProcess] = []
         for command in self.manifest.get("commands", []):
             if isinstance(command, dict) and command.get("name") in _COLD_START_COMMANDS:
                 self._run_command(command)
-
-    def _restart_control_plane(self) -> tuple[str, ...]:
-        services = tuple(
-            dict.fromkeys(
-                str(service)
-                for service in [
-                    *self.manifest.get("core_services", []),
-                    *self.manifest.get("ran_services", []),
-                ]
-                if str(service)
-            )
-        )
-        if not services:
-            raise ValueError("manifest does not define control-plane services")
-        argv = [
-            "docker",
-            "compose",
-            "-p",
-            str(self.manifest["compose_project_name"]),
-            "-f",
-            str(self.manifest["compose_file"]),
-            "restart",
-            "--timeout",
-            "0",
-            *services,
-        ]
-        compose_command = self.command_by_name.get("compose-up-core")
-        compose_cwd = str(compose_command["cwd"]) if compose_command is not None else str(self.run_dir)
-        self._runner(argv, cwd=compose_cwd, check=True, text=True)
-        return services
+                command_name = str(command["name"])
+                for writer_name in _EARLY_RUNTIME_START_AFTER.get(command_name, ()):
+                    # The readiness gate immediately following this command reads
+                    # writer events. Start the writer only after all of its target
+                    # containers exist; `--tail all` then replays their startup logs.
+                    early_processes.extend(
+                        self._start_runtime_commands(generation, (writer_name,))
+                    )
+        return tuple(early_processes)
 
     def _restore_baseline(self) -> None:
         for name in _BASELINE_RESTORE_COMMANDS:
@@ -323,10 +493,34 @@ class FastResetController:
             if command is not None:
                 self._run_command(command)
 
-    def _start_runtime(self, generation: int) -> tuple[ManagedProcess, ...]:
+    def _start_runtime_commands(
+        self,
+        generation: int,
+        names: tuple[str, ...],
+    ) -> tuple[ManagedProcess, ...]:
         log_dir = self.run_dir / "logs" / f"generation-{generation:06d}"
         started: list[ManagedProcess] = []
+        for name in names:
+            command = self.command_by_name.get(name)
+            if command is None:
+                continue
+            started.append(
+                self.supervisor.start(command, generation=generation, log_dir=log_dir)
+            )
+        return tuple(started)
+
+    def _start_runtime(
+        self,
+        generation: int,
+        *,
+        skip_names: set[str] | None = None,
+    ) -> tuple[ManagedProcess, ...]:
+        log_dir = self.run_dir / "logs" / f"generation-{generation:06d}"
+        started: list[ManagedProcess] = []
+        skipped = skip_names or set()
         for name in _RUNTIME_ORDER:
+            if name in skipped:
+                continue
             command = self.command_by_name.get(name)
             if command is None:
                 continue
@@ -340,12 +534,16 @@ class FastResetController:
     def _run_command(self, command: dict[str, Any]) -> None:
         env = os.environ.copy()
         env.update({str(key): str(value) for key, value in (command.get("env") or {}).items()})
-        self._runner(
-            [str(item) for item in command["argv"]],
-            cwd=str(command["cwd"]),
-            env=env,
-            check=True,
-            text=True,
+        command_name = str(command.get("name") or "unnamed")
+        self._run_reset_phase(
+            f"command:{command_name}",
+            lambda: self._runner(
+                [str(item) for item in command["argv"]],
+                cwd=str(command["cwd"]),
+                env=env,
+                check=True,
+                text=True,
+            ),
         )
 
     def _reset_artifacts(self) -> None:
@@ -504,15 +702,29 @@ def _serve(args: argparse.Namespace) -> int:
     if args.host not in {"127.0.0.1", "::1", "localhost"} and not args.token:
         raise ValueError("a bearer token is required when reset API is not bound to loopback")
     controller = FastResetController(Path(args.manifest))
-    if args.initialize != "none":
-        controller.reset(cold=args.initialize == "cold")
-    server = ResetApiServer((args.host, args.port), controller, token=args.token)
+    server: ResetApiServer | None = None
+    previous_signal_handlers: dict[int, Any] = {}
+
+    def request_shutdown(signum: int, _frame: Any) -> None:
+        raise KeyboardInterrupt(f"received signal {signum}")
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous_signal_handlers[signum] = signal.getsignal(signum)
+        signal.signal(signum, request_shutdown)
     try:
+        if args.initialize != "none":
+            controller.reset(cold=args.initialize == "cold")
+        server = ResetApiServer((args.host, args.port), controller, token=args.token)
         server.serve_forever(poll_interval=0.1)
+    except KeyboardInterrupt:
+        return 130
     finally:
-        server.server_close()
-        if not args.keep_running:
-            controller.shutdown()
+        if server is not None:
+            server.server_close()
+        controller.shutdown()
+        controller.reclaim_compose()
+        for signum, handler in previous_signal_handlers.items():
+            signal.signal(signum, handler)
     return 0
 
 
@@ -546,7 +758,11 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--port", type=int, default=18081)
     serve.add_argument("--token")
     serve.add_argument("--initialize", choices=("auto", "cold", "none"), default="auto")
-    serve.add_argument("--keep-running", action="store_true")
+    serve.add_argument(
+        "--keep-running",
+        action="store_true",
+        help="deprecated; Compose resources are always reclaimed when the server exits",
+    )
     serve.set_defaults(handler=_serve)
 
     for name, is_reset in (("reset", True), ("status", False)):
