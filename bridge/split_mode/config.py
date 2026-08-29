@@ -71,7 +71,9 @@ class SplitRuntimeConfig:
 
 @dataclass(slots=True, frozen=True)
 class SplitRadioConfig:
-    scheduler_type: str = "pf"
+    # QoS is required for the native 5QI/PDB/GBR bearer mapping to affect
+    # actual MAC scheduling rather than only post-run SLA classification.
+    scheduler_type: str = "qos"
     tdd_pattern: str = "ul_friendly"
     gnb_tx_power_dbm: float = 43.0
     ue_tx_power_dbm: float = 23.0

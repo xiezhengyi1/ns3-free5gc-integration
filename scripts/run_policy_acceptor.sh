@@ -16,9 +16,11 @@ PCF_PORT="8000"
 PCF_HOST="10.100.200.20"
 DEFAULT_TIMEOUT_MS="10000"
 FLOW_PROFILE_FILE=""
+FLOW_PROFILE_BASELINE_FILE=""
 LATEST_SNAPSHOT_FILE=""
 STATE_FILE=""
 INSTANCE_ID=""
+COLD_RESET_URL=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -34,6 +36,10 @@ while [[ $# -gt 0 ]]; do
       FLOW_PROFILE_FILE="$2"
       shift 2
       ;;
+    --flow-profile-baseline-file)
+      FLOW_PROFILE_BASELINE_FILE="$2"
+      shift 2
+      ;;
     --latest-snapshot-file)
       LATEST_SNAPSHOT_FILE="$2"
       shift 2
@@ -44,6 +50,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --instance-id)
       INSTANCE_ID="$2"
+      shift 2
+      ;;
+    --cold-reset-url)
+      COLD_RESET_URL="$2"
       shift 2
       ;;
     --upstream-pcf-container)
@@ -89,7 +99,9 @@ exec "${PYTHON_BIN}" -m bridge.policy_acceptor \
   --port "${PORT}" \
   --instance-id "${INSTANCE_ID}" \
   --flow-profile-file "${FLOW_PROFILE_FILE}" \
+  --flow-profile-baseline-file "${FLOW_PROFILE_BASELINE_FILE}" \
   --latest-snapshot-file "${LATEST_SNAPSHOT_FILE}" \
   --state-file "${STATE_FILE}" \
+  --cold-reset-url "${COLD_RESET_URL}" \
   --upstream-pcf-base-url "http://${PCF_HOST}:${PCF_PORT}" \
   --default-timeout-ms "${DEFAULT_TIMEOUT_MS}"

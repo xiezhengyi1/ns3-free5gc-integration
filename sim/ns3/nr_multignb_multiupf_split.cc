@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -722,6 +723,11 @@ NormalizeSchedulerType(const std::string& schedulerType)
     {
         return "ns3::NrMacSchedulerOfdmaPF";
     }
+    if (normalized == "qos" || normalized == "ofdma_qos" ||
+        normalized == "ns3::nrmacschedulerofdmaqos")
+    {
+        return "ns3::NrMacSchedulerOfdmaQos";
+    }
     if (normalized == "rr")
     {
         return "ns3::NrMacSchedulerOfdmaRR";
@@ -816,11 +822,21 @@ struct SnapshotContext
         uint64_t lossEpochBaselineLostPackets = 0;
         uint32_t lossEpochStartTick = 0;
         bool resetLossEpoch = true;
+        // FlowMonitor histograms are cumulative. Preserve a policy-epoch
+        // baseline so p95/p99 validate the control action, not old traffic.
+        std::map<double, uint64_t> latencyEpochBaselineBins;
+        bool latencyEpochActive = false;
+        bool resetLatencyEpoch = false;
+        // QFI returned by ActivateDedicatedQosFlow. A non-zero value means
+        // this IP 5-tuple is mapped to a real NR data radio bearer.
+        uint8_t nativeQosFlowId = 0;
+        uint32_t nativeFiveQi = 0;
+        bool nativeQosReloadWarningEmitted = false;
     };
 
     struct RadioConfig
     {
-        std::string schedulerType = "pf";
+        std::string schedulerType = "qos";
         std::string tddPattern = "DL|UL|UL|F|DL|UL|UL|F|";
         double gnbTxPowerDbm = 43.0;
         double ueTxPowerDbm = 23.0;
@@ -865,6 +881,7 @@ struct SnapshotContext
 
     std::string runId;
     std::string scenarioId;
+    uint32_t resetGeneration = 0;
     std::string outputFile;
     std::string clockFile;
     std::string flowProfileFile;
@@ -903,6 +920,11 @@ struct SnapshotContext
     uint64_t unmatchedIpv4DecisionLogs = 0;
     std::map<std::string, SliceResourceProfile> sliceResources;
     std::map<std::string, SliceRuntimeTelemetry> sliceTelemetry;
+    // A policy reload can replace an active QoS flow, so retain the NR
+    // objects that own the bearer lifecycle in the shared runtime context.
+    Ptr<NrHelper> nrHelper;
+    NetDeviceContainer ueNetDevices;
+    NetDeviceContainer gnbNetDevices;
     Ptr<FlowMonitor> monitor;
     Ptr<Ipv4FlowClassifier> classifier;
     Time appStartTime;
@@ -1087,14 +1109,12 @@ SplitFlowUdpApp::ResolveInterval() const
     {
         return Seconds(1.0);
     }
+    // Keep the configured arrival process as the offered load.  The previous
+    // implementation overwrote it with ``allocated_bandwidth_*`` and thereby
+    // removed the very RLC/MAC contention that a QoS scheduler must resolve.
+    // Allocation is now a policy/admission signal; actual service order and
+    // queueing delay are determined by the native NR QoS flow/DRB.
     double ratePps = ResolveArrivalRatePps(m_runtime->profile, m_downlink);
-    const double packetSizeBytes = ResolvePacketSizeBytes(m_runtime->profile, m_downlink);
-    const double allocatedBandwidthMbps =
-        m_downlink ? m_runtime->profile.allocatedBandwidthDlMbps : m_runtime->profile.allocatedBandwidthUlMbps;
-    if (allocatedBandwidthMbps > 0.0 && packetSizeBytes > 0.0)
-    {
-        ratePps = allocatedBandwidthMbps * 1e6 / 8.0 / packetSizeBytes;
-    }
     ratePps = std::max(1.0, ratePps);
     return Seconds(1.0 / ratePps);
 }
@@ -1883,6 +1903,186 @@ PriorityWeight(const FlowProfile& profile)
     return 1.0 / static_cast<double>(std::max<uint32_t>(1, profile.priority == 0 ? 1 : profile.priority));
 }
 
+bool
+IsSupportedNativeFiveQi(uint32_t fiveQi)
+{
+    switch (fiveQi)
+    {
+    case 1:
+    case 2:
+    case 3:
+    case 4:
+    case 5:
+    case 6:
+    case 7:
+    case 8:
+    case 9:
+    case 65:
+    case 66:
+    case 67:
+    case 69:
+    case 70:
+    case 71:
+    case 72:
+    case 73:
+    case 74:
+    case 75:
+    case 76:
+    case 79:
+    case 80:
+    case 82:
+    case 83:
+    case 84:
+    case 85:
+    case 86:
+    case 87:
+    case 88:
+    case 89:
+    case 90:
+        return true;
+    default:
+        return false;
+    }
+}
+
+NrQosFlow::FiveQi
+ResolveNativeFiveQi(const FlowProfile& profile)
+{
+    if (!IsSupportedNativeFiveQi(profile.fiveQi))
+    {
+        NS_LOG_WARN("flow " << profile.flowId << " has unsupported 5QI " << profile.fiveQi
+                              << "; using non-GBR default 5QI 9");
+        return NrQosFlow::NGBR_VIDEO_TCP_DEFAULT;
+    }
+    return static_cast<NrQosFlow::FiveQi>(profile.fiveQi);
+}
+
+uint64_t
+MbpsToBitsPerSecond(double value)
+{
+    return static_cast<uint64_t>(std::llround(std::max(0.0, value) * 1e6));
+}
+
+double
+HistogramPercentileMs(const std::map<double, uint64_t>& bins, double percentile)
+{
+    uint64_t sampleCount = 0;
+    for (const auto& [binEndSeconds, count] : bins)
+    {
+        sampleCount += count;
+    }
+    if (sampleCount == 0)
+    {
+        return 0.0;
+    }
+    const uint64_t rank = static_cast<uint64_t>(std::ceil(percentile * sampleCount));
+    uint64_t cumulative = 0;
+    for (const auto& [binEndSeconds, count] : bins)
+    {
+        cumulative += count;
+        if (cumulative >= rank)
+        {
+            // FlowMonitor reports seconds; a bin end is a conservative
+            // percentile estimate at the configured 1 ms bin resolution.
+            return 1000.0 * binEndSeconds;
+        }
+    }
+    return 1000.0 * bins.rbegin()->first;
+}
+
+NrQosFlow
+BuildNativeQosFlow(const FlowProfile& profile)
+{
+    NrGbrQosInformation gbr;
+    gbr.gbrDl = MbpsToBitsPerSecond(GuaranteedBandwidthDlMbps(profile));
+    gbr.gbrUl = MbpsToBitsPerSecond(GuaranteedBandwidthUlMbps(profile));
+    gbr.mbrDl = MbpsToBitsPerSecond(RequestedBandwidthDlMbps(profile));
+    gbr.mbrUl = MbpsToBitsPerSecond(RequestedBandwidthUlMbps(profile));
+
+    NrQosFlow flow(ResolveNativeFiveQi(profile), gbr);
+    // The standardized 5QI drives MAC scheduling priority and PDB. ARP is
+    // retained as the policy's admission/pre-emption intent.
+    flow.arp.priorityLevel = static_cast<uint8_t>(std::clamp<uint32_t>(
+        profile.priority == 0 ? 15 : profile.priority, 1, 15));
+    flow.arp.preemptionCapability = flow.arp.priorityLevel <= 4;
+    flow.arp.preemptionVulnerability = flow.arp.priorityLevel > 4;
+    return flow;
+}
+
+Ptr<NrQosRule>
+BuildNativeQosRule(const SnapshotContext* context,
+                   const SnapshotContext::FlowRuntimeState& runtime)
+{
+    const auto& profile = runtime.profile;
+    Ptr<NrQosRule> rule = Create<NrQosRule>();
+    rule->SetPrecedence(static_cast<uint8_t>(std::clamp<uint32_t>(profile.precedence, 1, 255)));
+
+    const Ipv4Mask hostMask("255.255.255.255");
+    const Ipv4Address ueAddress = context->ueIps.at(runtime.ueIndex);
+
+    NrQosRule::PacketFilter downlink;
+    downlink.direction = NrQosRule::DOWNLINK;
+    downlink.remoteAddress = context->remoteHostAddress;
+    downlink.remoteMask = hostMask;
+    downlink.localAddress = ueAddress;
+    downlink.localMask = hostMask;
+    downlink.remotePortStart = runtime.downlinkSourcePort;
+    downlink.remotePortEnd = runtime.downlinkSourcePort;
+    downlink.localPortStart = runtime.port;
+    downlink.localPortEnd = runtime.port;
+    rule->Add(downlink);
+
+    NrQosRule::PacketFilter uplink;
+    uplink.direction = NrQosRule::UPLINK;
+    uplink.remoteAddress = context->remoteHostAddress;
+    uplink.remoteMask = hostMask;
+    uplink.localAddress = ueAddress;
+    uplink.localMask = hostMask;
+    uplink.remotePortStart = runtime.uplinkPort;
+    uplink.remotePortEnd = runtime.uplinkPort;
+    uplink.localPortStart = runtime.uplinkSourcePort;
+    uplink.localPortEnd = runtime.uplinkSourcePort;
+    rule->Add(uplink);
+    return rule;
+}
+
+void
+ReplaceNativeQosFlow(SnapshotContext* context, SnapshotContext::FlowRuntimeState* runtime)
+{
+    NS_ASSERT(context != nullptr);
+    NS_ASSERT(runtime != nullptr);
+    if (context->nrHelper == nullptr || runtime->ueIndex >= context->ueNetDevices.GetN() ||
+        runtime->ueIndex >= context->ueToGnb.size())
+    {
+        NS_FATAL_ERROR("native QoS runtime is not initialized for flow " << runtime->profile.flowId);
+    }
+
+    const Ptr<NetDevice> ueDevice = context->ueNetDevices.Get(runtime->ueIndex);
+    const uint32_t gnbIndex = context->ueToGnb.at(runtime->ueIndex);
+    if (gnbIndex >= context->gnbNetDevices.GetN())
+    {
+        NS_FATAL_ERROR("flow " << runtime->profile.flowId << " has invalid serving gNB index");
+    }
+    const Ptr<NetDevice> gnbDevice = context->gnbNetDevices.Get(gnbIndex);
+    if (runtime->nativeQosFlowId != 0)
+    {
+        context->nrHelper->DeActivateDedicatedQosFlow(ueDevice, gnbDevice, runtime->nativeQosFlowId);
+    }
+
+    const NrQosFlow flow = BuildNativeQosFlow(runtime->profile);
+    runtime->nativeQosFlowId =
+        context->nrHelper->ActivateDedicatedQosFlow(ueDevice, flow, BuildNativeQosRule(context, *runtime));
+    runtime->nativeFiveQi = static_cast<uint32_t>(flow.fiveQi);
+    std::cerr << "[split-ns3] native-qos-flow"
+              << " action=" << (runtime->nativeQosFlowId == 0 ? "failed" : "activated")
+              << " flow_id=" << runtime->profile.flowId
+              << " qfi=" << static_cast<uint32_t>(runtime->nativeQosFlowId)
+              << " five_qi=" << runtime->nativeFiveQi
+              << " pdb_ms=" << flow.GetPacketDelayBudgetMs()
+              << " scheduler=" << context->radioConfig.schedulerType
+              << std::endl;
+}
+
 std::pair<double, double>
 ResolveTddFractions(const std::string& tddPattern)
 {
@@ -2176,6 +2376,7 @@ ReloadFlowProfiles(SnapshotContext* context)
             previousProfile.sliceRef != runtime.profile.sliceRef ||
             previousProfile.sliceSnssai != runtime.profile.sliceSnssai ||
             previousProfile.upfName != runtime.profile.upfName ||
+            previousProfile.fiveQi != runtime.profile.fiveQi ||
             previousProfile.latencyMs != runtime.profile.latencyMs ||
             previousProfile.jitterMs != runtime.profile.jitterMs ||
             previousProfile.lossRate != runtime.profile.lossRate ||
@@ -2187,9 +2388,37 @@ ReloadFlowProfiles(SnapshotContext* context)
             previousProfile.precedence != runtime.profile.precedence ||
             previousProfile.qosRef != runtime.profile.qosRef ||
             previousProfile.policyFilter != runtime.profile.policyFilter;
+        const bool nativeQosChangeRequested =
+            previousProfile.fiveQi != runtime.profile.fiveQi ||
+            previousProfile.bandwidthDlMbps != runtime.profile.bandwidthDlMbps ||
+            previousProfile.bandwidthUlMbps != runtime.profile.bandwidthUlMbps ||
+            previousProfile.guaranteedBandwidthDlMbps != runtime.profile.guaranteedBandwidthDlMbps ||
+            previousProfile.guaranteedBandwidthUlMbps != runtime.profile.guaranteedBandwidthUlMbps ||
+            previousProfile.priority != runtime.profile.priority ||
+            previousProfile.precedence != runtime.profile.precedence;
+        if (nativeQosChangeRequested && !runtime.nativeQosReloadWarningEmitted)
+        {
+            // 5G-LENA 4.2 only permits ActivateDedicatedQosFlow during the
+            // initial UE context setup.  Calling it after attach aborts in
+            // NrEpcUeNas::ActivateQosFlow because NAS modification signalling
+            // is intentionally not implemented.  Retain the initial native
+            // QFI/DRB and apply live policy only to admission/allocation and
+            // SLA measurement. A changed 5QI/GBR requires a cold restart with
+            // the revised profile available before simulation startup.
+            std::cerr << "[split-ns3] native-qos-flow action=reload-deferred"
+                      << " flow_id=" << runtime.profile.flowId
+                      << " active_qfi=" << static_cast<uint32_t>(runtime.nativeQosFlowId)
+                      << " active_five_qi=" << runtime.nativeFiveQi
+                      << " requested_five_qi=" << runtime.profile.fiveQi
+                      << " reason=5g-lena-post-attach-qos-modification-unsupported"
+                      << std::endl;
+            runtime.nativeQosReloadWarningEmitted = true;
+        }
         // policy_acceptor replaces the TSV atomically even for a semantic no-op.
         // A replacement therefore starts a new post-dispatch SLA measurement epoch.
         runtime.resetLossEpoch = runtime.resetLossEpoch || qosPolicyChanged || profileFileReplaced;
+        runtime.latencyEpochActive = runtime.latencyEpochActive || qosPolicyChanged || profileFileReplaced;
+        runtime.resetLatencyEpoch = runtime.resetLatencyEpoch || qosPolicyChanged || profileFileReplaced;
     }
 
     // Rebuild UE slice membership from the latest live flow profiles so AM policies
@@ -2484,6 +2713,7 @@ WriteClockState(const SnapshotContext* context)
     std::ofstream output(tempPath, std::ios::trunc);
     output << "{" << Quote("run_id") << ":" << Quote(context->runId) << ","
            << Quote("scenario_id") << ":" << Quote(context->scenarioId) << ","
+           << Quote("reset_generation") << ":" << context->resetGeneration << ","
            << Quote("tick_index") << ":" << context->tickIndex << ","
            << Quote("sim_time_ms") << ":" << Simulator::Now().GetMilliSeconds() << ","
            << Quote("flows") << ":[";
@@ -2597,6 +2827,7 @@ EmitSnapshot(SnapshotContext* context)
     json << "{";
     json << Quote("run_id") << ":" << Quote(context->runId) << ",";
     json << Quote("scenario_id") << ":" << Quote(context->scenarioId) << ",";
+    json << Quote("reset_generation") << ":" << context->resetGeneration << ",";
     json << Quote("tick_index") << ":" << context->tickIndex << ",";
     json << Quote("sim_time_ms") << ":" << Simulator::Now().GetMilliSeconds() << ",";
 
@@ -2782,6 +3013,8 @@ EmitSnapshot(SnapshotContext* context)
                           const std::string& destinationIp,
                           uint32_t destinationPort,
                           double delayMs,
+                          double delayP95Ms,
+                          double delayP99Ms,
                           double jitterMs,
                           double lossRate,
                           double throughputUl,
@@ -2938,6 +3171,8 @@ EmitSnapshot(SnapshotContext* context)
              << Quote("slice_id") << ":" << Quote(sliceId) << ","
              << Quote("5qi") << ":" << fiveQi << ","
              << Quote("delay_ms") << ":" << delayMs << ","
+             << Quote("delay_p95_ms") << ":" << delayP95Ms << ","
+             << Quote("delay_p99_ms") << ":" << delayP99Ms << ","
              << Quote("jitter_ms") << ":" << jitterMs << ","
              << Quote("loss_rate") << ":" << lossRateSincePolicy << ","
              << Quote("throughput_ul_mbps") << ":" << throughputUl << ","
@@ -2977,6 +3212,11 @@ EmitSnapshot(SnapshotContext* context)
              << Quote("guaranteed_bandwidth_dl") << ":" << guaranteedBandwidthDlMbps << ","
              << Quote("guaranteed_bandwidth_ul") << ":" << guaranteedBandwidthUlMbps << "},"
              << Quote("telemetry") << ":{" << Quote("latency") << ":" << delayMs << ","
+             << Quote("latency_p95") << ":" << delayP95Ms << ","
+             << Quote("latency_p99") << ":" << delayP99Ms << ","
+             << Quote("latency_percentile_scope") << ":"
+             << Quote(runtimeState != nullptr && runtimeState->latencyEpochActive ? "policy_epoch" : "cumulative")
+             << ","
              << Quote("jitter") << ":" << jitterMs << "," << Quote("loss_rate") << ":"
              << lossRateSincePolicy << "," << Quote("loss_rate_cumulative") << ":" << lossRateCumulative << ","
              << Quote("packet_sent") << ":" << txPackets << "," << Quote("packet_received") << ":"
@@ -3015,6 +3255,12 @@ EmitSnapshot(SnapshotContext* context)
              << Quote("allocation") << ":{" << Quote("optimize_requested") << ":"
              << (optimizeRequested ? "true" : "false") << ","
              << Quote("qos_ref") << ":" << qosRef << ","
+             << Quote("native_qfi") << ":"
+             << (runtimeState != nullptr ? static_cast<uint32_t>(runtimeState->nativeQosFlowId) : 0) << ","
+             << Quote("native_five_qi") << ":"
+             << (runtimeState != nullptr ? runtimeState->nativeFiveQi : fiveQi) << ","
+             << Quote("native_qos_active") << ":"
+             << (runtimeState != nullptr && runtimeState->nativeQosFlowId != 0 ? "true" : "false") << ","
              << Quote("current_slice_snssai") << ":" << Quote(sliceSnssai) << ","
              << Quote("requested_bandwidth_dl") << ":" << targetBandwidthDlMbps << ","
              << Quote("requested_bandwidth_ul") << ":" << targetBandwidthUlMbps << ","
@@ -3042,6 +3288,7 @@ EmitSnapshot(SnapshotContext* context)
             uint32_t destinationPort = 0;
             double delaySumMs = 0.0;
             double jitterSumMs = 0.0;
+            std::map<double, uint64_t> delayHistogramBins;
             uint64_t rxPacketsForDelay = 0;
             uint64_t rxPacketsForJitter = 0;
             uint64_t txPackets = 0;
@@ -3118,6 +3365,14 @@ EmitSnapshot(SnapshotContext* context)
             }
             aggregate.delaySumMs += 1000.0 * flow.delaySum.GetSeconds();
             aggregate.jitterSumMs += 1000.0 * flow.jitterSum.GetSeconds();
+            for (uint32_t bin = 0; bin < flow.delayHistogram.GetNBins(); ++bin)
+            {
+                const uint64_t count = flow.delayHistogram.GetBinCount(bin);
+                if (count > 0)
+                {
+                    aggregate.delayHistogramBins[flow.delayHistogram.GetBinEnd(bin)] += count;
+                }
+            }
             aggregate.rxPacketsForDelay += flow.rxPackets;
             aggregate.rxPacketsForJitter += flow.rxPackets;
             aggregate.txPackets += flow.txPackets;
@@ -3169,6 +3424,8 @@ EmitSnapshot(SnapshotContext* context)
                                0.0,
                                0.0,
                                0.0,
+                               0.0,
+                               0.0,
                                0,
                                0,
                                0,
@@ -3186,6 +3443,30 @@ EmitSnapshot(SnapshotContext* context)
             const double jitterMs = aggregate.rxPacketsForJitter > 0
                                         ? aggregate.jitterSumMs / static_cast<double>(aggregate.rxPacketsForJitter)
                                         : 0.0;
+            std::map<double, uint64_t> latencyHistogramForEpoch = aggregate.delayHistogramBins;
+            if (aggregate.runtime != nullptr && aggregate.runtime->latencyEpochActive)
+            {
+                if (aggregate.runtime->resetLatencyEpoch)
+                {
+                    aggregate.runtime->latencyEpochBaselineBins = aggregate.delayHistogramBins;
+                    aggregate.runtime->resetLatencyEpoch = false;
+                    latencyHistogramForEpoch.clear();
+                }
+                else
+                {
+                    for (auto& [binEndSeconds, count] : latencyHistogramForEpoch)
+                    {
+                        const auto baselineIt =
+                            aggregate.runtime->latencyEpochBaselineBins.find(binEndSeconds);
+                        const uint64_t baseline = baselineIt != aggregate.runtime->latencyEpochBaselineBins.end()
+                                                      ? baselineIt->second
+                                                      : 0;
+                        count = count > baseline ? count - baseline : 0;
+                    }
+                }
+            }
+            const double delayP95Ms = HistogramPercentileMs(latencyHistogramForEpoch, 0.95);
+            const double delayP99Ms = HistogramPercentileMs(latencyHistogramForEpoch, 0.99);
             // FlowMonitor only places packets in lostPackets after MaxPerHopDelay.
             // txPackets - rxPackets also includes packets still queued or in flight and
             // must not be used as a packet-loss SLA violation.
@@ -3203,6 +3484,8 @@ EmitSnapshot(SnapshotContext* context)
                        aggregate.destinationIp,
                        aggregate.destinationPort,
                        delayMs,
+                       delayP95Ms,
+                       delayP99Ms,
                        jitterMs,
                        lossRate,
                        aggregate.throughputUl,
@@ -3310,6 +3593,7 @@ main(int argc, char* argv[])
     uint16_t ueNumPerGnb = 1;
     uint32_t tickMs = 1000;
     uint32_t simTimeMs = 30000;
+    uint32_t resetGeneration = 0;
     std::string runId = "run-local";
     std::string scenarioId = "scenario-local";
     std::string simulator = "RealtimeSimulatorImpl";
@@ -3329,7 +3613,7 @@ main(int argc, char* argv[])
     double centralFrequency = 3.5e9;
     double bandwidth = 100e6;
     double totalTxPower = 43.0;
-    std::string schedulerType = "pf";
+    std::string schedulerType = "qos";
     std::string tddPattern = "DL|UL|UL|F|DL|UL|UL|F|";
     double ueTxPowerDb = 23.0;
     double gnbNoiseFigureDb = 5.0;
@@ -3371,12 +3655,18 @@ main(int argc, char* argv[])
                  enableUplinkPowerControl);
     cmd.Parse(argc, argv);
 
+    if (const char* generation = std::getenv("SCENARIO_RESET_GENERATION"))
+    {
+        resetGeneration = static_cast<uint32_t>(std::strtoul(generation, nullptr, 10));
+    }
+
     schedulerType = NormalizeSchedulerType(schedulerType);
     tddPattern = NormalizeTddPattern(tddPattern);
 
     std::cerr << "[split-ns3] start"
               << " run_id=" << runId
               << " scenario_id=" << scenarioId
+              << " reset_generation=" << resetGeneration
               << " tick_ms=" << tickMs
               << " sim_time_ms=" << simTimeMs
               << " nr_numerology=" << numerology
@@ -3717,6 +4007,7 @@ main(int argc, char* argv[])
 
     context.runId = runId;
     context.scenarioId = scenarioId;
+    context.resetGeneration = resetGeneration;
     context.outputFile = outputFile;
     context.clockFile = clockFile;
     context.flowProfileFile = flowProfileFile;
@@ -3742,6 +4033,9 @@ main(int argc, char* argv[])
     context.ueSliceIds = ueSliceIds;
     context.remoteHostAddress = remoteHostAddress;
     context.n3Links = n3Links;
+    context.nrHelper = nrHelper;
+    context.ueNetDevices = ueNetDev;
+    context.gnbNetDevices = gnbNetDev;
     context.monitor = monitor;
     context.classifier = classifier;
     context.appStartTime = appStartTime;
@@ -3757,6 +4051,14 @@ main(int argc, char* argv[])
     for (uint32_t index = 0; index < gNbNum; ++index)
     {
         context.gnbPositions.push_back(gridScenario.GetBaseStations().Get(index)->GetObject<MobilityModel>()->GetPosition());
+    }
+
+    // Install one native QoS flow/DRB per configured IP 5-tuple.  The QoS
+    // scheduler can now use 5QI priority, GBR/MBR and PDB against actual RLC
+    // head-of-line delay; this is deliberately separate from SLA reporting.
+    for (auto& [port, runtime] : context.flowRuntimeByPort)
+    {
+        ReplaceNativeQosFlow(&context, &runtime);
     }
 
     ApplySlaDrivenAllocations(&context);

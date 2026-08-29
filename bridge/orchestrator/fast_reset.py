@@ -236,7 +236,7 @@ class FastResetController:
             run_dir=self.run_dir,
         )
 
-    def reset(self, *, cold: bool = False) -> ResetResult:
+    def reset(self, *, cold: bool = False, preserve_policy_state: bool = False) -> ResetResult:
         if not self._lock.acquire(blocking=False):
             raise ResetBusyError("a scenario reset is already in progress")
         started = self._monotonic()
@@ -255,7 +255,10 @@ class FastResetController:
                 # termination: remove any project-owned containers and networks
                 # before recreating the topology.
                 self._run_reset_phase("reclaim_compose", self.reclaim_compose)
-            self._run_reset_phase("reset_artifacts", self._reset_artifacts)
+            self._run_reset_phase(
+                "reset_artifacts",
+                lambda: self._reset_artifacts(preserve_policy_state=preserve_policy_state),
+            )
             self._run_reset_phase("restore_flow_profile_baseline", self._restore_flow_profile_baseline)
             restarted_services: tuple[str, ...] = ()
             if cold_start:
@@ -551,15 +554,16 @@ class FastResetController:
             ),
         )
 
-    def _reset_artifacts(self) -> None:
+    def _reset_artifacts(self, *, preserve_policy_state: bool = False) -> None:
         files = [
             self.manifest.get("snapshot_file"),
             self.manifest.get("clock_file"),
             self.manifest.get("state_db"),
             self.manifest.get("runtime_state_file"),
             self.manifest.get("result_file"),
-            str(self.state_dir / "policy-acceptor-state.json"),
         ]
+        if not preserve_policy_state:
+            files.append(str(self.state_dir / "policy-acceptor-state.json"))
         state_db = Path(str(self.manifest.get("state_db") or ""))
         if str(state_db):
             files.extend((str(state_db) + "-wal", str(state_db) + "-shm"))
@@ -740,8 +744,14 @@ class ResetRequestHandler(BaseHTTPRequestHandler):
         if "cold" in payload and not isinstance(payload["cold"], bool):
             self._send_json(400, {"error": "cold must be a boolean"})
             return
+        if "preserve_policy_state" in payload and not isinstance(payload["preserve_policy_state"], bool):
+            self._send_json(400, {"error": "preserve_policy_state must be a boolean"})
+            return
         try:
-            result = self.server.controller.reset(cold=bool(payload.get("cold", False)))
+            reset_options: dict[str, bool] = {"cold": bool(payload.get("cold", False))}
+            if bool(payload.get("preserve_policy_state", False)):
+                reset_options["preserve_policy_state"] = True
+            result = self.server.controller.reset(**reset_options)
         except ResetBusyError as exc:
             self._send_json(409, {"error": str(exc)})
             return
@@ -765,11 +775,16 @@ class ResetRequestHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, status: int, payload: dict[str, Any]) -> None:
         body = json.dumps(payload, sort_keys=True).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # A synchronous cold reset can outlive an impatient local client.
+            # The reset itself has completed; suppress the harmless socket noise.
+            return
 
 
 def _serve(args: argparse.Namespace) -> int:
@@ -777,6 +792,8 @@ def _serve(args: argparse.Namespace) -> int:
         raise ValueError("a bearer token is required when reset API is not bound to loopback")
     controller = FastResetController(Path(args.manifest))
     server: ResetApiServer | None = None
+    watchdog: subprocess.Popen[str] | None = None
+    watchdog_log = None
     previous_signal_handlers: dict[int, Any] = {}
 
     def request_shutdown(signum: int, _frame: Any) -> None:
@@ -786,6 +803,19 @@ def _serve(args: argparse.Namespace) -> int:
         previous_signal_handlers[signum] = signal.getsignal(signum)
         signal.signal(signum, request_shutdown)
     try:
+        watchdog_argv = controller.manifest.get("fast_reset", {}).get("policy_watchdog_argv")
+        if isinstance(watchdog_argv, list) and watchdog_argv:
+            log_path = controller.run_dir / "logs" / "policy-watchdog.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            watchdog_log = log_path.open("a", encoding="utf-8")
+            watchdog = subprocess.Popen(
+                [str(item) for item in watchdog_argv],
+                cwd=str(controller.run_dir),
+                stdout=watchdog_log,
+                stderr=subprocess.STDOUT,
+                text=True,
+                start_new_session=True,
+            )
         if args.initialize != "none":
             controller.reset(cold=args.initialize == "cold")
         server = ResetApiServer((args.host, args.port), controller, token=args.token)
@@ -797,6 +827,13 @@ def _serve(args: argparse.Namespace) -> int:
             server.server_close()
         controller.shutdown()
         controller.reclaim_compose()
+        if watchdog is not None and watchdog.poll() is None:
+            try:
+                os.killpg(watchdog.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        if watchdog_log is not None:
+            watchdog_log.close()
         for signum, handler in previous_signal_handlers.items():
             signal.signal(signum, handler)
     return 0

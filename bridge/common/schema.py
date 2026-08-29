@@ -197,6 +197,7 @@ class TickSnapshot:
     slices: list[SliceRecord]
     kpis: dict[str, float]
     reward_inputs: dict[str, float]
+    reset_generation: int = 0
     external_trace: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -217,6 +218,7 @@ class TickSnapshot:
                 key: float(value)
                 for key, value in _require(payload, "reward_inputs").items()
             },
+            reset_generation=int(payload.get("reset_generation", 0) or 0),
             external_trace=dict(payload.get("external_trace", {})),
         )
         snapshot.validate()
@@ -265,6 +267,7 @@ class TickSnapshot:
             "slices": [asdict(item) for item in self.slices],
             "kpis": dict(self.kpis),
             "reward_inputs": dict(self.reward_inputs),
+            "reset_generation": self.reset_generation,
             "external_trace": dict(self.external_trace),
         }
 

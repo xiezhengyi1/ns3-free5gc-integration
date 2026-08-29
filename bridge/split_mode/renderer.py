@@ -418,6 +418,9 @@ def render_split_run(
         shutil.rmtree(run_dir)
     if gateway_port <= 0 or gateway_port > 65535 or reset_port <= 0 or reset_port > 65535:
         raise ValueError("gateway_port and reset_port must be valid TCP ports")
+    policy_backend_port = gateway_port + 1000
+    if policy_backend_port > 65535:
+        raise ValueError("gateway_port leaves no safe internal policy acceptor port")
     if graph_db_url:
         config = replace(
             config,
@@ -752,13 +755,15 @@ def render_split_run(
                     "bash",
                     str(project_root / "scripts" / "run_policy_acceptor.sh"),
                     "--host",
-                    "0.0.0.0",
+                    "127.0.0.1",
                     "--port",
-                    str(gateway_port),
+                    str(policy_backend_port),
                     "--instance-id",
                     f"slot-{instance_slot}" if instance_slot else "default",
                     "--flow-profile-file",
                     str(flow_profile_file),
+                    "--flow-profile-baseline-file",
+                    str(flow_profile_baseline_file),
                     "--latest-snapshot-file",
                     str(Path(base_manifest.archive_dir) / resolved_run_id / "latest.json"),
                     "--state-file",
@@ -769,6 +774,8 @@ def render_split_run(
                     "8000",
                     "--default-timeout-ms",
                     "30000",
+                    "--cold-reset-url",
+                    f"http://127.0.0.1:{reset_port}",
                 ],
                 background=True,
             ),
@@ -944,6 +951,7 @@ def render_split_run(
         service_map=service_map,
         fast_reset={
             "api_url": f"http://127.0.0.1:{reset_port}",
+            "policy_gateway_url": f"http://127.0.0.1:{gateway_port}",
             "state_file": str(run_dir / "state" / "fast-reset-state.json"),
             "process_registry": str(run_dir / "state" / "fast-reset-processes.json"),
             "serve_argv": [
@@ -954,6 +962,19 @@ def render_split_run(
                 str(run_dir / "run-manifest.split.json"),
                 "--port",
                 str(reset_port),
+            ],
+            "policy_watchdog_argv": [
+                python_command,
+                "-m",
+                "bridge.orchestrator.policy_watchdog",
+                "--port",
+                str(gateway_port),
+                "--backend-port",
+                str(policy_backend_port),
+                "--queue-file",
+                str(run_dir / "state" / "policy-watchdog-queue.json"),
+                "--recovery-grace-seconds",
+                "30",
             ],
         },
         commands=commands,

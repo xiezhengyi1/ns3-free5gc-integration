@@ -15,7 +15,7 @@ runtime:
   state_poll_ms: 200
 
 radio:
-  scheduler_type: pf
+  scheduler_type: qos
   tdd_pattern: ul_friendly
   gnb_tx_power_dbm: 43
   ue_tx_power_dbm: 23

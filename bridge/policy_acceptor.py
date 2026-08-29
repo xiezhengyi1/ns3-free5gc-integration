@@ -27,6 +27,37 @@ HEALTHCHECK_PATH = f"{EXECUTION_PATH}/launch-healthcheck"
 AM_POLICY_TYPE = "PcfAmPolicyControlPolicyAssociation"
 URSP_POLICY_TYPE = "UrspRuleRequest"
 QOS_TOLERANCE_RATIO = 0.10
+COLD_RESET_REQUEST_TIMEOUT_SECONDS = 90.0
+_NS3_SUPPORTED_5QIS = frozenset(
+    {1, 2, 3, 4, 5, 6, 7, 8, 9, 65, 66, 67, 69, 70, 71, 72, 73, 74, 75, 76, 79, 80,
+     82, 83, 84, 85, 86, 87, 88, 89, 90}
+)
+
+
+def _select_native_5qi(*, pdb_ms: int, priority_level: int | None, has_gbr: bool) -> int:
+    """Choose a standardized 5QI when PCF supplied PDB but omitted 5QI.
+
+    NR's QoS scheduler consumes the standardized 5QI characteristics (priority,
+    PDB and resource type), not an arbitrary ``latency_ms`` profile field.  The
+    chosen class is therefore the strictest available standardized class that
+    does not exceed the requested PDB where this model provides one.
+    """
+    priority = priority_level if priority_level is not None else 15
+    if pdb_ms <= 10:
+        return 82 if has_gbr else 80
+    if pdb_ms <= 50:
+        return 3 if has_gbr else 80
+    if pdb_ms <= 60:
+        return 1 if has_gbr else 69
+    if pdb_ms <= 100:
+        return 1 if has_gbr else (5 if priority <= 4 else 7)
+    if pdb_ms <= 150:
+        return 2 if has_gbr else 7
+    if pdb_ms <= 200:
+        return 4 if has_gbr else 70
+    if pdb_ms <= 300:
+        return 4 if has_gbr else (6 if priority <= 8 else 8)
+    return 4 if has_gbr else 9
 
 
 def _emit_policy_event(event: str, *, policy_id: str, policy_type: str, detail: str) -> None:
@@ -472,6 +503,9 @@ def _build_sm_mutation(payload: dict[str, Any], rows: list[dict[str, str]]) -> d
     jitter_ms = _to_float(qos_payload.get("jitterReq"))
     loss_rate = _to_float(qos_payload.get("packetErrorRate"))
     priority = _to_int(qos_payload.get("priorityLevel"))
+    five_qi = _to_int(qos_payload.get("5qi"))
+    if five_qi is None:
+        five_qi = _to_int(qos_payload.get("fiveQi"))
     precedence = _to_int(pcc_payload.get("precedence")) if isinstance(pcc_payload, dict) else None
     qos_ref = _resolve_qos_ref(qos_payload, qos_keys, target_row)
 
@@ -487,6 +521,20 @@ def _build_sm_mutation(payload: dict[str, Any], rows: list[dict[str, str]]) -> d
     if priority is not None:
         updates["priority"] = str(priority)
         requested_state["priority"] = priority
+    if five_qi is None and latency_ms is not None:
+        five_qi = _select_native_5qi(
+            pdb_ms=latency_ms,
+            priority_level=priority,
+            has_gbr=guaranteed_dl is not None or guaranteed_ul is not None,
+        )
+    if five_qi is not None:
+        if five_qi not in _NS3_SUPPORTED_5QIS:
+            raise PolicyError(
+                f"5qi {five_qi} is not supported by the installed ns-3 NR QoS model",
+                status_code=422,
+            )
+        updates["five_qi"] = str(five_qi)
+        requested_state["five_qi"] = five_qi
     if precedence is not None:
         updates["precedence"] = str(precedence)
         requested_state["precedence"] = precedence
@@ -568,15 +616,57 @@ def _apply_mutation(rows: list[dict[str, str]], mutation: dict[str, Any]) -> lis
     return updated_rows
 
 
+def _cold_restart_reason(rows: list[dict[str, str]], mutation: dict[str, Any]) -> str:
+    """Return the reason a mutation must be applied before UE attachment.
+
+    5G-LENA 4.2 has no post-attach NAS QoS-flow modification signalling.  SLA
+    thresholds remain hot-reloadable, but changes to a native DRB/QFI input or
+    UE slice association need a fresh initial context.
+    """
+    current_by_flow = {_coerce_optional(row.get("flow_id")): row for row in rows}
+    updates_by_flow_id = mutation.get("updates_by_flow_id")
+    if not isinstance(updates_by_flow_id, dict):
+        return ""
+    native_fields = {
+        "five_qi",
+        "bandwidth_dl_mbps",
+        "bandwidth_ul_mbps",
+        "guaranteed_bandwidth_dl_mbps",
+        "guaranteed_bandwidth_ul_mbps",
+        "priority",
+        "precedence",
+    }
+    for flow_id, raw_updates in updates_by_flow_id.items():
+        if not isinstance(raw_updates, dict):
+            continue
+        current = current_by_flow.get(_coerce_optional(flow_id), {})
+        if (
+            mutation.get("policy_scope") == "ue"
+            and "slice_snssai" in raw_updates
+            and _coerce_optional(current.get("slice_snssai")).lower()
+            != _coerce_optional(raw_updates.get("slice_snssai")).lower()
+        ):
+            return "am-slice-association-change"
+        for field_name in native_fields:
+            if field_name in raw_updates and _coerce_optional(current.get(field_name)) != _coerce_optional(raw_updates[field_name]):
+                return f"native-qos-field:{field_name}"
+    return ""
+
+
 def _monitoring_payload(
     record: dict[str, Any],
     snapshot: dict[str, Any] | None,
     monitoring_data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    monitoring = {"baseline_tick": record.get("baseline_tick", -1)}
+    monitoring = {
+        "assurance_contract_version": 1,
+        "baseline_tick": record.get("baseline_tick", -1),
+        "reset_generation": record.get("expected_generation", 0),
+    }
     if snapshot is not None:
         monitoring["latest_tick"] = snapshot.get("tick_index")
         monitoring["run_id"] = snapshot.get("run_id")
+        monitoring["reset_generation"] = snapshot.get("reset_generation", 0)
     if monitoring_data:
         monitoring.update(monitoring_data)
     return monitoring
@@ -815,10 +905,8 @@ def _evaluate_sm_record(
     telemetry = flow.get("telemetry") if isinstance(flow.get("telemetry"), dict) else {}
     baseline_tick = _to_int(record.get("baseline_tick"))
     sla_epoch_start_tick = _to_int(telemetry.get("sla_epoch_start_tick"))
-    if (
-        baseline_tick is not None
-        and sla_epoch_start_tick is not None
-        and sla_epoch_start_tick <= baseline_tick
+    if sla_epoch_start_tick is None or (
+        baseline_tick is not None and sla_epoch_start_tick <= baseline_tick
     ):
         return (
             "PENDING",
@@ -960,11 +1048,14 @@ class PolicyRuntime:
     instance_id: str = ""
     latest_snapshot_file: Path | None = None
     state_file: Path | None = None
+    flow_profile_baseline_file: Path | None = None
+    cold_reset_url: str = ""
     upstream_dispatcher: UpstreamPcfDispatcher | None = None
     default_timeout_ms: int = 10000
     poll_interval_ms: int = 200
     _lock: threading.RLock = field(init=False, repr=False)
     _execution_cache: dict[str, dict[str, Any]] = field(init=False, repr=False)
+    _reset_generation: int = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.flow_profile_file = Path(self.flow_profile_file).expanduser().resolve()
@@ -974,6 +1065,13 @@ class PolicyRuntime:
             else None
         )
         self.state_file = Path(self.state_file).expanduser().resolve() if self.state_file is not None else None
+        self.flow_profile_baseline_file = (
+            Path(self.flow_profile_baseline_file).expanduser().resolve()
+            if self.flow_profile_baseline_file is not None
+            else None
+        )
+        self.cold_reset_url = str(self.cold_reset_url or "").rstrip("/")
+        self._reset_generation = max(0, _to_int(os.environ.get("SCENARIO_RESET_GENERATION")) or 0)
         self._lock = threading.RLock()
         self._execution_cache = self._load_state()
         self._resume_pending_executions()
@@ -997,8 +1095,16 @@ class PolicyRuntime:
                     raise PolicyError("flow profile file is empty", status_code=409, phase="ns3_apply")
                 baseline_snapshot = self._load_latest_snapshot()
                 baseline_tick = int(baseline_snapshot.get("tick_index", -1)) if baseline_snapshot else -1
+                expected_run_id = str((baseline_snapshot or {}).get("run_id") or "").strip()
                 mutation = _build_mutation(payload, rows)
-                record = self._new_record(payload, mutation, baseline_tick, operation_id)
+                record = self._new_record(
+                    payload,
+                    mutation,
+                    baseline_tick,
+                    self._reset_generation,
+                    expected_run_id,
+                    operation_id,
+                )
                 self._execution_cache[operation_id] = record
                 self._save_state()
         except PolicyError as exc:
@@ -1073,10 +1179,21 @@ class PolicyRuntime:
 
     def _resume_pending_executions(self) -> None:
         for operation_id, record in list(self._execution_cache.items()):
-            if record.get("status") != "pending" or record.get("phase") == "waiting_for_ns3":
+            if record.get("status") != "pending":
                 continue
-            mutation = record.get("mutation")
-            if not isinstance(mutation, dict):
+            resumed_after_cold_restart = False
+            if record.get("phase") == "cold_restart_requested":
+                # The reset controller preserved this state specifically for a
+                # policy-triggered cold restart. The upstream PCF was already
+                # called and the new profile is now the reset baseline; do not
+                # dispatch the policy twice.
+                record["phase"] = "waiting_for_ns3"
+                record["baseline_tick"] = -1
+                record["expected_generation"] = self._reset_generation
+                record["updated_at"] = time.time()
+                self._save_state()
+                resumed_after_cold_restart = True
+            if record.get("phase") == "waiting_for_ns3" and not resumed_after_cold_restart:
                 continue
             payload = {
                 "request_id": record.get("request_id", ""),
@@ -1090,7 +1207,35 @@ class PolicyRuntime:
                 "supi": record.get("supi", ""),
                 "timeout_ms": record.get("timeout_ms", self.default_timeout_ms),
             }
-            self._start_execution_worker(operation_id, payload, mutation)
+            if resumed_after_cold_restart:
+                # The profile and upstream PCF state were committed before the
+                # reset.  Resuming through _run_execution_worker would rewrite
+                # that profile and re-enter dispatch logic; only observe the
+                # first post-restart ns-3 epoch.
+                self._start_wait_worker(operation_id, payload)
+                continue
+            mutation = record.get("mutation")
+            if isinstance(mutation, dict):
+                self._start_execution_worker(operation_id, payload, mutation)
+
+    def _start_wait_worker(self, operation_id: str, payload: dict[str, Any]) -> None:
+        def wait_for_result() -> None:
+            final_record = self._wait_for_ns3(operation_id)
+            _emit_policy_event(
+                "result",
+                policy_id=payload["policy_id"],
+                policy_type=payload["policy_type"],
+                detail=(
+                    f"status={final_record['status']} phase={final_record['phase']} "
+                    f"status_code={final_record['status_code']}"
+                ),
+            )
+
+        threading.Thread(
+            target=wait_for_result,
+            name=f"policy-observer-{operation_id[-12:]}",
+            daemon=True,
+        ).start()
 
     def _run_execution_worker(
         self,
@@ -1129,18 +1274,37 @@ class PolicyRuntime:
                 if record is None or record.get("status") != "pending":
                     return
                 rows, fieldnames = _read_flow_profiles(self.flow_profile_file)
-                _write_flow_profiles(self.flow_profile_file, fieldnames, _apply_mutation(rows, mutation))
+                cold_restart_reason = _cold_restart_reason(rows, mutation)
+                updated_rows = _apply_mutation(rows, mutation)
+                _write_flow_profiles(self.flow_profile_file, fieldnames, updated_rows)
+                if cold_restart_reason:
+                    self._commit_profile_baseline()
                 record["upstream"] = upstream_result
                 record["mutation_summary"] = {
                     "policy_scope": mutation["policy_scope"],
                     "target_flow_ids": mutation["target_flow_ids"],
                     "requested_state": mutation["requested_state"],
                 }
-                record["phase"] = "waiting_for_ns3"
+                record["phase"] = "cold_restart_requested" if cold_restart_reason else "waiting_for_ns3"
+                record["cold_restart_reason"] = cold_restart_reason
                 record["updated_at"] = time.time()
                 self._save_state()
         except PolicyError as exc:
             self._fail_operation(operation_id, payload, exc.phase, str(exc), exc.status_code, upstream_result)
+            return
+
+        if cold_restart_reason:
+            try:
+                self._request_cold_restart(cold_restart_reason)
+            except PolicyError as exc:
+                self._fail_operation(operation_id, payload, exc.phase, str(exc), exc.status_code, upstream_result)
+                return
+            _emit_policy_event(
+                "cold_restart_requested",
+                policy_id=payload["policy_id"],
+                policy_type=payload["policy_type"],
+                detail=f"reason={cold_restart_reason}",
+            )
             return
 
         final_record = self._wait_for_ns3(operation_id)
@@ -1182,6 +1346,34 @@ class PolicyRuntime:
         if self.upstream_dispatcher is None:
             raise PolicyError("upstream dispatcher is not configured", status_code=500, phase="upstream_pcf")
         return self.upstream_dispatcher.dispatch(payload)
+
+    def _commit_profile_baseline(self) -> None:
+        if self.flow_profile_baseline_file is None:
+            raise PolicyError("cold restart requires a flow profile baseline file", status_code=500, phase="cold_restart")
+        rows, fieldnames = _read_flow_profiles(self.flow_profile_file)
+        _write_flow_profiles(self.flow_profile_baseline_file, fieldnames, rows)
+
+    def _request_cold_restart(self, reason: str) -> None:
+        if not self.cold_reset_url:
+            raise PolicyError(
+                "policy changes native QoS or UE slice association, but cold reset is not configured",
+                status_code=409,
+                phase="cold_restart",
+            )
+        try:
+            response = requests.post(
+                f"{self.cold_reset_url}/v1/reset",
+                json={"cold": True, "preserve_policy_state": True, "reason": reason},
+                timeout=COLD_RESET_REQUEST_TIMEOUT_SECONDS,
+            )
+        except requests.RequestException as exc:
+            raise PolicyError(f"cold reset request failed: {exc}", status_code=502, phase="cold_restart") from exc
+        if not response.ok:
+            raise PolicyError(
+                f"cold reset rejected: {response.text.strip() or response.status_code}",
+                status_code=502,
+                phase="cold_restart",
+            )
 
     def _wait_for_ns3(self, operation_id: str) -> dict[str, Any]:
         deadline = time.monotonic() + float(self.default_timeout_ms) / 1000.0
@@ -1227,6 +1419,13 @@ class PolicyRuntime:
         if latest_snapshot is None:
             return
         latest_tick = int(latest_snapshot.get("tick_index", -1))
+        expected_generation = _to_int(record.get("expected_generation"))
+        latest_generation = _to_int(latest_snapshot.get("reset_generation")) or 0
+        if latest_generation != (expected_generation if expected_generation is not None else 0):
+            return
+        expected_run_id = str(record.get("expected_run_id") or "").strip()
+        if expected_run_id and str(latest_snapshot.get("run_id") or "").strip() != expected_run_id:
+            return
         if latest_tick <= int(record.get("baseline_tick", -1)):
             return
         execution_status, compliance_status, monitoring_data = _evaluate_record(record, latest_snapshot)
@@ -1252,6 +1451,8 @@ class PolicyRuntime:
         payload: dict[str, Any],
         mutation: dict[str, Any],
         baseline_tick: int,
+        expected_generation: int,
+        expected_run_id: str,
         operation_id: str,
     ) -> dict[str, Any]:
         return {
@@ -1270,10 +1471,16 @@ class PolicyRuntime:
             "timeout_ms": payload["timeout_ms"],
             "policy_details": payload["policy_details"],
             "baseline_tick": baseline_tick,
+            "expected_generation": expected_generation,
+            "expected_run_id": expected_run_id,
             "applied_tick": None,
             "execution_status": "PENDING",
             "compliance_status": "PENDING",
-            "monitoring_data": {"baseline_tick": baseline_tick},
+            "monitoring_data": {
+                "assurance_contract_version": 1,
+                "baseline_tick": baseline_tick,
+                "reset_generation": expected_generation,
+            },
             "error": "",
             "mutation": mutation,
             "mutation_summary": {},
@@ -1446,8 +1653,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=18080)
     parser.add_argument("--instance-id", default="", help="worker instance identity required by parallel launchers")
     parser.add_argument("--flow-profile-file", required=True)
+    parser.add_argument("--flow-profile-baseline-file")
     parser.add_argument("--latest-snapshot-file")
     parser.add_argument("--state-file")
+    parser.add_argument("--cold-reset-url", default="")
     parser.add_argument("--upstream-pcf-base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--upstream-timeout-sec", type=float, default=5.0)
     parser.add_argument("--upstream-retry-count", type=int, default=3)
@@ -1575,6 +1784,10 @@ def run_server(args: argparse.Namespace) -> None:
         instance_id=str(args.instance_id or "").strip(),
         latest_snapshot_file=Path(args.latest_snapshot_file) if args.latest_snapshot_file else None,
         state_file=Path(args.state_file) if args.state_file else None,
+        flow_profile_baseline_file=(
+            Path(args.flow_profile_baseline_file) if args.flow_profile_baseline_file else None
+        ),
+        cold_reset_url=args.cold_reset_url,
         upstream_dispatcher=RequestsUpstreamPcfDispatcher(
             base_url=args.upstream_pcf_base_url,
             request_timeout_sec=args.upstream_timeout_sec,

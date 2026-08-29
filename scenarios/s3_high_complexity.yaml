@@ -14,8 +14,9 @@ slices:
       guaranteed_ul_mbps: 42.0
       priority: 1
     qos:
-      latency_ms: 8.0
-      jitter_ms: 4.0
+      # Critical control / URLLC: only Factory Robot has the strict 15 ms target.
+      latency_ms: 15.0
+      jitter_ms: 3.0
       loss_rate: 0.001
       processing_delay_ms: 0.5
   - sst: 1
@@ -28,10 +29,11 @@ slices:
       guaranteed_ul_mbps: 13.0
       priority: 2
     qos:
-      latency_ms: 18.0
-      jitter_ms: 6.0
-      loss_rate: 0.0015
-      processing_delay_ms: 1.0
+      # eMBB video and interactive media.
+      latency_ms: 50.0
+      jitter_ms: 10.0
+      loss_rate: 0.003
+      processing_delay_ms: 2.0
   - sst: 2
     sd: "000001"
     label: slice-2-000001
@@ -42,10 +44,11 @@ slices:
       guaranteed_ul_mbps: 8.0
       priority: 2
     qos:
-      latency_ms: 3.0
-      jitter_ms: 1.5
-      loss_rate: 0.0005
-      processing_delay_ms: 0.5
+      # Metering / elastic cloud traffic; not a low-latency slice.
+      latency_ms: 100.0
+      jitter_ms: 25.0
+      loss_rate: 0.02
+      processing_delay_ms: 4.0
   - sst: 2
     sd: "000002"
     label: slice-2-000002
@@ -56,10 +59,11 @@ slices:
       guaranteed_ul_mbps: 8.0
       priority: 3
     qos:
-      latency_ms: 6.0
-      jitter_ms: 2.5
-      loss_rate: 0.0008
-      processing_delay_ms: 0.8
+      # Interactive control and telemedicine.
+      latency_ms: 20.0
+      jitter_ms: 5.0
+      loss_rate: 0.002
+      processing_delay_ms: 1.0
   - sst: 3
     sd: "000001"
     label: slice-3-000001
@@ -70,10 +74,11 @@ slices:
       guaranteed_ul_mbps: 24.0
       priority: 1
     qos:
-      latency_ms: 60.0
-      jitter_ms: 20.0
-      loss_rate: 0.02
-      processing_delay_ms: 3.0
+      # Best-effort / massive IoT.
+      latency_ms: 150.0
+      jitter_ms: 50.0
+      loss_rate: 0.05
+      processing_delay_ms: 6.0
 
 upfs:
   - name: i-upf-a
@@ -152,7 +157,7 @@ ues:
         session_ref: imsi-208930000000001:app-3982:slice-1-000001:internet
         apn: internet
         type: IPv4
-        five_qi: 9
+        five_qi: 82
         app_id: app-3982
   - name: ue2
     supi: imsi-208930000000002
@@ -177,7 +182,7 @@ ues:
         session_ref: imsi-208930000000002:app-5788:slice-1-000002:internet
         apn: internet
         type: IPv4
-        five_qi: 9
+        five_qi: 3
         app_id: app-5788
   - name: ue3
     supi: imsi-208930000000003
@@ -221,7 +226,7 @@ ues:
         session_ref: imsi-208930000000004:app-0879:slice-3-000001:internet
         apn: internet
         type: IPv4
-        five_qi: 6
+        five_qi: 9
         app_id: app-0879
       - slice_ref: slice-2-000002
         session_ref: imsi-208930000000004:app-0879:slice-2-000002:internet
@@ -246,13 +251,13 @@ ues:
         session_ref: imsi-208930000000005:app-5977:slice-3-000001:internet
         apn: internet
         type: IPv4
-        five_qi: 6
+        five_qi: 9
         app_id: app-5977
       - slice_ref: slice-2-000002
         session_ref: imsi-208930000000005:app-5977:slice-2-000002:internet
         apn: internet
         type: IPv4
-        five_qi: 7
+        five_qi: 82
         app_id: app-5977
   - name: ue6
     supi: imsi-208930000000006
@@ -271,7 +276,7 @@ ues:
         session_ref: imsi-208930000000006:app-3496:slice-1-000001:internet
         apn: internet
         type: IPv4
-        five_qi: 9
+        five_qi: 82
         app_id: app-3496
   - name: ue7
     supi: imsi-208930000000007
@@ -290,7 +295,7 @@ ues:
         session_ref: imsi-208930000000007:app-1999:slice-2-000001:internet
         apn: internet
         type: IPv4
-        five_qi: 7
+        five_qi: 9
         app_id: app-1999
   - name: ue8
     supi: imsi-208930000000008
@@ -309,7 +314,7 @@ ues:
         session_ref: imsi-208930000000008:app-9231:slice-2-000002:internet
         apn: internet
         type: IPv4
-        five_qi: 7
+        five_qi: 3
         app_id: app-9231
   - name: ue9
     supi: imsi-208930000000009
@@ -328,7 +333,7 @@ ues:
         session_ref: imsi-208930000000009:app-8058:slice-1-000002:internet
         apn: internet
         type: IPv4
-        five_qi: 9
+        five_qi: 7
         app_id: app-8058
   - name: ue10
     supi: imsi-208930000000010
@@ -432,7 +437,7 @@ flows:
     session_ref: imsi-208930000000001:app-3982:slice-1-000001:internet
     ue_name: ue1
     app_name: Remote_Drive
-    five_qi: 9
+    five_qi: 82
     service_type: eMBB
     service_type_id: 1
     packet_size_bytes: 1000.0
@@ -446,8 +451,8 @@ flows:
     allocated_bandwidth_ul_mbps: 3.8
     optimize_requested: false
     sla_target:
-      latency_ms: 12.0
-      jitter_ms: 4.0
+      latency_ms: 20.0
+      jitter_ms: 3.0
       loss_rate: 0.001
       bandwidth_dl_mbps: 3.0
       bandwidth_ul_mbps: 3.8
@@ -476,9 +481,9 @@ flows:
     allocated_bandwidth_ul_mbps: 0.1
     optimize_requested: false
     sla_target:
-      latency_ms: 25.0
-      jitter_ms: 6.0
-      loss_rate: 0.0015
+      latency_ms: 100.0
+      jitter_ms: 25.0
+      loss_rate: 0.02
       bandwidth_dl_mbps: 0.2
       bandwidth_ul_mbps: 0.1
       guaranteed_bandwidth_dl_mbps: 0.1
@@ -492,7 +497,7 @@ flows:
     session_ref: imsi-208930000000002:app-5788:slice-1-000002:internet
     ue_name: ue2
     app_name: 4K_Video
-    five_qi: 9
+    five_qi: 3
     service_type: eMBB
     service_type_id: 1
     packet_size_bytes: 1250.0
@@ -506,8 +511,8 @@ flows:
     allocated_bandwidth_ul_mbps: 0.2
     optimize_requested: false
     sla_target:
-      latency_ms: 35.0
-      jitter_ms: 12.0
+      latency_ms: 50.0
+      jitter_ms: 10.0
       loss_rate: 0.003
       bandwidth_dl_mbps: 25.0
       bandwidth_ul_mbps: 0.2
@@ -582,7 +587,7 @@ flows:
     session_ref: imsi-208930000000004:app-0879:slice-3-000001:internet
     ue_name: ue4
     app_name: Web_Browse
-    five_qi: 6
+    five_qi: 9
     service_type: mMTC
     service_type_id: 3
     packet_size_bytes: 1000.0
@@ -596,9 +601,9 @@ flows:
     allocated_bandwidth_ul_mbps: 0.1
     optimize_requested: false
     sla_target:
-      latency_ms: 110.0
-      jitter_ms: 45.0
-      loss_rate: 0.04
+      latency_ms: 150.0
+      jitter_ms: 50.0
+      loss_rate: 0.05
       bandwidth_dl_mbps: 0.8
       bandwidth_ul_mbps: 0.1
       guaranteed_bandwidth_dl_mbps: 0.5
@@ -642,7 +647,7 @@ flows:
     session_ref: imsi-208930000000005:app-5977:slice-3-000001:internet
     ue_name: ue5
     app_name: AR_Gaming
-    five_qi: 6
+    five_qi: 9
     service_type: mMTC
     service_type_id: 3
     packet_size_bytes: 1250.0
@@ -656,9 +661,9 @@ flows:
     allocated_bandwidth_ul_mbps: 0.5
     optimize_requested: true
     sla_target:
-      latency_ms: 60.0
-      jitter_ms: 20.0
-      loss_rate: 0.02
+      latency_ms: 150.0
+      jitter_ms: 50.0
+      loss_rate: 0.05
       bandwidth_dl_mbps: 15.0
       bandwidth_ul_mbps: 0.5
       guaranteed_bandwidth_dl_mbps: 12.0
@@ -672,7 +677,7 @@ flows:
     session_ref: imsi-208930000000005:app-5977:slice-2-000002:internet
     ue_name: ue5
     app_name: AR_Gaming
-    five_qi: 7
+    five_qi: 82
     service_type: URLLC
     service_type_id: 2
     packet_size_bytes: 250.0
@@ -686,9 +691,9 @@ flows:
     allocated_bandwidth_ul_mbps: 0.15
     optimize_requested: false
     sla_target:
-      latency_ms: 8.0
-      jitter_ms: 2.5
-      loss_rate: 0.0008
+      latency_ms: 20.0
+      jitter_ms: 5.0
+      loss_rate: 0.002
       bandwidth_dl_mbps: 0.25
       bandwidth_ul_mbps: 0.15
       guaranteed_bandwidth_dl_mbps: 0.18
@@ -702,7 +707,7 @@ flows:
     session_ref: imsi-208930000000006:app-3496:slice-1-000001:internet
     ue_name: ue6
     app_name: Factory_Robot
-    five_qi: 9
+    five_qi: 82
     service_type: eMBB
     service_type_id: 1
     packet_size_bytes: 1000.0
@@ -716,8 +721,8 @@ flows:
     allocated_bandwidth_ul_mbps: 3.8
     optimize_requested: false
     sla_target:
-      latency_ms: 10.0
-      jitter_ms: 4.0
+      latency_ms: 15.0
+      jitter_ms: 3.0
       loss_rate: 0.001
       bandwidth_dl_mbps: 3.0
       bandwidth_ul_mbps: 3.8
@@ -732,7 +737,7 @@ flows:
     session_ref: imsi-208930000000007:app-1999:slice-2-000001:internet
     ue_name: ue7
     app_name: Smart_Meter
-    five_qi: 7
+    five_qi: 9
     service_type: URLLC
     service_type_id: 2
     packet_size_bytes: 100.0
@@ -762,7 +767,7 @@ flows:
     session_ref: imsi-208930000000008:app-9231:slice-2-000002:internet
     ue_name: ue8
     app_name: Telemedicine
-    five_qi: 7
+    five_qi: 3
     service_type: URLLC
     service_type_id: 2
     packet_size_bytes: 1000.0
@@ -776,9 +781,9 @@ flows:
     allocated_bandwidth_ul_mbps: 3.8
     optimize_requested: false
     sla_target:
-      latency_ms: 15.0
-      jitter_ms: 2.5
-      loss_rate: 0.0008
+      latency_ms: 30.0
+      jitter_ms: 8.0
+      loss_rate: 0.003
       bandwidth_dl_mbps: 3.0
       bandwidth_ul_mbps: 3.8
       guaranteed_bandwidth_dl_mbps: 2.4
@@ -792,7 +797,7 @@ flows:
     session_ref: imsi-208930000000009:app-8058:slice-1-000002:internet
     ue_name: ue9
     app_name: Drone_Control
-    five_qi: 9
+    five_qi: 7
     service_type: eMBB
     service_type_id: 1
     packet_size_bytes: 250.0
@@ -806,9 +811,9 @@ flows:
     allocated_bandwidth_ul_mbps: 8.0
     optimize_requested: false
     sla_target:
-      latency_ms: 20.0
-      jitter_ms: 6.0
-      loss_rate: 0.0015
+      latency_ms: 80.0
+      jitter_ms: 20.0
+      loss_rate: 0.005
       bandwidth_dl_mbps: 0.5
       bandwidth_ul_mbps: 8.0
       guaranteed_bandwidth_dl_mbps: 0.3
@@ -866,9 +871,9 @@ flows:
     allocated_bandwidth_ul_mbps: 0.5
     optimize_requested: false
     sla_target:
-      latency_ms: 12.0
-      jitter_ms: 6.0
-      loss_rate: 0.002
+      latency_ms: 100.0
+      jitter_ms: 25.0
+      loss_rate: 0.02
       bandwidth_dl_mbps: 25.0
       bandwidth_ul_mbps: 0.5
       guaranteed_bandwidth_dl_mbps: 20.0
@@ -883,11 +888,13 @@ free5gc:
   project_name: nrint-graph-snapshot-387-ulcl-4upf
 
 ns3:
-  ns3_root: /home/yyx/6gcore/ns-allinone-3.46.1/ns-3.46.1
+  # The split-mode renderer passes this value explicitly to the reset service;
+  # it therefore takes precedence over the interactive shell's NS3_ROOT.
+  ns3_root: /home/yyx/6gcore/ns3-qos/ns-3.47
   scratch_name: nr_multignb_multiupf_split
   output_subdir: ns3
   simulator: RealtimeSimulatorImpl
-  sim_time_ms: 1000000
+  sim_time_ms: 2000000
   slice_isolation: true
 
 writer:

@@ -67,6 +67,7 @@ nodes:
       backhaul_upfs: [i-upf-1]
       slices:
         - slice_ref: slice-1-000001
+        - slice_ref: slice-2-000001
         - slice_ref: slice-3-000001
       position:
         x: 150
@@ -230,6 +231,11 @@ links:
 
   - source: ran-node-2
     target: slice-node-2
+    type: serves_slice
+    attributes: {}
+
+  - source: ran-node-2
+    target: slice-node-1
     type: serves_slice
     attributes: {}
 
